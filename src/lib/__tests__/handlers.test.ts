@@ -166,6 +166,35 @@ describe("search handler (mocked upstream)", () => {
     expect(w2.data.map((d: { id: string }) => d.id)).toEqual(["shared-3"]);
   });
 
+  test("miss-then-consume-then-hit: second user still gets page 2", async () => {
+    // limit=1 leaves a buffered item, so consuming the miss cursor walks the
+    // buffered branch. The miss serves a fork, so the stored source stays
+    // pristine and a later hit forks from offset 1 — serving the raw source
+    // instead would advance it to 2 and skip an item for the second user.
+    const url = "http://x/api/v1/search?q=latejoin&limit=1";
+    const b1 = await (await handleSearch(req(url), deps)).json();
+    expect(b1.meta.cached).toBe(false);
+    expect(b1.data.map((d: { id: string }) => d.id)).toEqual(["latejoin-1"]);
+    const w1 = await (
+      await handleSearch(
+        req(`http://x/api/v1/search?cursor=${b1.page.next}&limit=1`),
+        deps,
+      )
+    ).json();
+    expect(w1.data.map((d: { id: string }) => d.id)).toEqual(["latejoin-2"]);
+
+    const b2 = await (await handleSearch(req(url), deps)).json();
+    expect(b2.meta.cached).toBe(true);
+    expect(b2.page.next).not.toBe(b1.page.next);
+    const w2 = await (
+      await handleSearch(
+        req(`http://x/api/v1/search?cursor=${b2.page.next}&limit=1`),
+        deps,
+      )
+    ).json();
+    expect(w2.data.map((d: { id: string }) => d.id)).toEqual(["latejoin-2"]);
+  });
+
   test("default type is all and maps to an unfiltered upstream search", async () => {
     expect(toUpstreamSearchFilters("all")).toEqual({});
     expect(toUpstreamSearchFilters("video")).toEqual({ type: "video" });

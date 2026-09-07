@@ -90,7 +90,10 @@ export function hasMoreResults(entry: ContinuationEntry): boolean {
  * but owns its own entry (offset + advancement) — serveContinuation advances
  * entries copy-on-write (a fetched page is stored under a NEW cursor, the
  * source entry is never mutated), so concurrent users of one cached query
- * never share mutable pagination state. Returns null when the source is
+ * never share mutable pagination state. Callers must fork for EVERY serve
+ * (including the miss that stored the source) and never serve the source
+ * cursor itself — serving a cursor advances its entry offset in the buffered
+ * branch, which would corrupt later forks. Returns null when the source is
  * gone/expired/exhausted; callers degrade to next: null, never a dangle.
  */
 export function forkContinuation(cursor: string | null): string | null {

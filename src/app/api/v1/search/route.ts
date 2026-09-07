@@ -99,11 +99,12 @@ export async function handleSearch(
   const cacheKey = `search:v1:${region}:${lang}:${type}:${limit}:${q.toLowerCase()}`;
 
   try {
-    // L0 caches page-1 ITEMS plus the fork-source cursor string only — never
-    // a served cursor object. Misses serve the stored cursor directly; every
-    // HIT mints a FRESH cursor via forkContinuation (own snapshot entry), so
-    // concurrent users of one hot query never share mutable entry state. An
-    // evicted/expired fork source degrades to next: null instead of dangling.
+    // L0 caches page-1 ITEMS plus the fork-source cursor string only. The
+    // stored source is NEVER served directly — every caller (miss or hit)
+    // gets a FRESH cursor via forkContinuation (own snapshot entry), so the
+    // source stays pristine and concurrent users never share mutable entry
+    // state (serving a cursor advances its entry offset in the buffered
+    // branch). An evicted/expired fork source degrades to next: null.
     const result = await cached<{
       items: SearchResultDTO[];
       forkFrom: string | null;
@@ -116,9 +117,8 @@ export async function handleSearch(
       const forkFrom = storeContinuation(search, limit);
       return { items, forkFrom };
     });
-    const next = result.hit
-      ? forkContinuation(result.value.forkFrom)
-      : resolveNext(result.value.forkFrom);
+    // The source stays pristine: always fork, even on the miss that stored it.
+    const next = forkContinuation(result.value.forkFrom);
     return successResponse(result.value.items, {
       requestId,
       next,

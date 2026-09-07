@@ -71,6 +71,8 @@ export function successResponse(
     },
     warnings,
   };
+  // Accepted: CDN s-maxage copies replay the origin requestId — the contract
+  // requires presence of X-Request-Id/meta.requestId, not per-viewer uniqueness.
   const headers = baseHeaders(opts.requestId);
   headers.set("Content-Type", "application/json");
   if (opts.cacheControl) {

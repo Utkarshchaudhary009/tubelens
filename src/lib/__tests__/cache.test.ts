@@ -50,4 +50,46 @@ describe("L0 cache", () => {
     await new Promise((r) => setTimeout(r, 5));
     expect(cacheGet("k5")).toBeUndefined();
   });
+
+  test("concurrent cold misses share one in-flight fetch", async () => {
+    let calls = 0;
+    let release!: (v: string) => void;
+    const gate = new Promise<string>((resolve) => {
+      release = resolve;
+    });
+    const fetcher = async () => {
+      calls += 1;
+      return gate;
+    };
+    const pending = [
+      cached("k6", 60_000, fetcher),
+      cached("k6", 60_000, fetcher),
+      cached("k6", 60_000, fetcher),
+    ];
+    await new Promise((r) => setTimeout(r, 5));
+    expect(calls).toBe(1);
+    release("shared");
+    const results = await Promise.all(pending);
+    for (const res of results) {
+      expect(res).toMatchObject({ value: "shared", stale: false });
+    }
+    expect(calls).toBe(1);
+    expect(cacheGet("k6")).toMatchObject({ value: "shared" });
+  });
+
+  test("failed fetch clears the in-flight slot so the next call retries", async () => {
+    let calls = 0;
+    await expect(
+      cached("k7", 60_000, async () => {
+        calls += 1;
+        throw new Error("boom");
+      }),
+    ).rejects.toThrow("boom");
+    const res = await cached("k7", 60_000, async () => {
+      calls += 1;
+      return "recovered";
+    });
+    expect(res).toMatchObject({ value: "recovered", hit: false });
+    expect(calls).toBe(2);
+  });
 });
