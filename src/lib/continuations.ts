@@ -32,6 +32,9 @@ export interface ContinuationEntry {
   search: ContinuationSearch;
   returned: number;
   expiresAt: number;
+  /** Owning scope (video id for watch feeds). Cursors presented under a
+   * different scope yield an empty page, never another video's items. */
+  scope?: string;
 }
 
 export const CONTINUATION_TTL_MS = 5 * 60 * 1000;
@@ -47,6 +50,7 @@ function mintCursor(): string {
 export function storeContinuation(
   search: ContinuationSearch,
   returned: number,
+  scope?: string,
 ): string | null {
   // Store while there is anything left to serve: an upstream continuation OR
   // unconsumed buffered items (a fetched page may hold more items than one
@@ -65,6 +69,7 @@ export function storeContinuation(
     search,
     returned,
     expiresAt: Date.now() + CONTINUATION_TTL_MS,
+    ...(scope !== undefined ? { scope } : {}),
   });
   return cursor;
 }
@@ -107,12 +112,24 @@ export function hasMoreResults(entry: ContinuationEntry): boolean {
  * branch, which would corrupt later forks. Returns null when the source is
  * gone/expired/exhausted; callers degrade to next: null, never a dangle.
  */
-export function forkContinuation(cursor: string | null): string | null {
+export function forkContinuation(
+  cursor: string | null,
+  scope?: string,
+): string | null {
   if (!cursor) {
     return null;
   }
   const entry = takeContinuation(cursor);
   if (!entry || !hasMoreResults(entry)) {
+    return null;
+  }
+  // A scoped cursor is only forkable under its own scope — cross-video reuse
+  // degrades to next: null, never another video's items.
+  if (
+    scope !== undefined &&
+    entry.scope !== undefined &&
+    entry.scope !== scope
+  ) {
     return null;
   }
   const source = entry.search;
@@ -121,7 +138,7 @@ export function forkContinuation(cursor: string | null): string | null {
     has_continuation: source.has_continuation,
     getContinuation: () => source.getContinuation(),
   };
-  return storeContinuation(fork, entry.returned);
+  return storeContinuation(fork, entry.returned, entry.scope ?? scope);
 }
 
 export function dropContinuation(cursor: string): void {

@@ -21,12 +21,16 @@ export interface CaptionsDeps {
 const defaultDeps: CaptionsDeps = {
   async fetchCaptions(id) {
     const { getInnertube, withTimeout } = await import("@/lib/youtube");
-    const innertube = await withTimeout(() => getInnertube(), 8000);
-    // getInfo (not getBasicInfo): caption tracks ride on the player response.
-    const info = await withTimeout(() => innertube.getInfo(id), 8000);
-    return mapCaptionList(
-      (info as unknown as Record<string, unknown>).captions,
-    );
+    // Single 8s budget for the whole fetch (session + info), so the worst
+    // case stays ~8s instead of stacking per-call timeouts.
+    return withTimeout(async () => {
+      const innertube = await getInnertube();
+      // getInfo (not getBasicInfo): caption tracks ride on the player response.
+      const info = await innertube.getInfo(id);
+      return mapCaptionList(
+        (info as unknown as Record<string, unknown>).captions,
+      );
+    }, 8000);
   },
 };
 
@@ -66,10 +70,20 @@ export async function handleCaptions(
     const result = await cached<CaptionTrackDTO[]>(
       cacheKey,
       60 * 60 * 1000, // L0 fresh window; L1 CDN carries the 3600s TTL.
-      () => deps.fetchCaptions(id),
+      async () => {
+        // Throw on empty so disabled-caption lists never populate the cache;
+        // classifyCaptionsError maps the marker to 404 captions_disabled.
+        const tracks = await deps.fetchCaptions(id);
+        if (tracks.length === 0) {
+          throw new Error("captions_disabled: no caption tracks");
+        }
+        return tracks;
+      },
       24 * 60 * 60 * 1000, // stale window backs serve-stale-on-error.
     );
-    if (result.value.length === 0 && !result.stale) {
+    // A stale-empty copy (seeded before this guard) is still a 404 — an
+    // empty track list is never served as 200.
+    if (result.value.length === 0) {
       return errorResponse(requestId, {
         code: "captions_disabled",
         message: "No caption tracks are available for this video.",

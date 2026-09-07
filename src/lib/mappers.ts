@@ -606,8 +606,20 @@ export function classifyVideoError(err: unknown): ClassifiedVideoError {
  * Related/comments feeds ride on a video id, so feed failures classify like
  * video failures: unknown/private/deleted -> 404 video_not_found; timeouts
  * -> 504 upstream_timeout; everything else -> 502 upstream_degraded.
+ * Comments-disabled upstreams get their own 404 so callers can hide the
+ * panel instead of reporting a missing video.
  */
 export function classifyFeedError(err: unknown): ClassifiedVideoError {
+  const raw =
+    err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+  if (/comments? (disabled|turned off|unavailable)/i.test(raw)) {
+    return {
+      code: "comments_disabled",
+      message: "Comments are disabled for this video.",
+      hint: "This video has comments disabled; hide the comments panel or fall back to the description.",
+      status: 404,
+    };
+  }
   return classifyVideoError(err);
 }
 
