@@ -616,14 +616,17 @@ export function classifyFeedError(err: unknown): ClassifiedVideoError {
 }
 
 /**
- * Empty/undefined caption tracks -> 404 captions_disabled (never 500);
- * timeouts -> 504 upstream_timeout; everything else -> 502 upstream_degraded.
+ * Only caption-specific signals -> 404 captions_disabled (never 500).
+ * Everything else (private/deleted video, transient failures, timeouts)
+ * delegates to classifyVideoError, so callers get video_not_found (404),
+ * upstream_timeout (504), or upstream_degraded (502) instead of a
+ * misleading captions_disabled.
  */
 export function classifyCaptionsError(err: unknown): ClassifiedVideoError {
   const raw =
     err instanceof Error ? `${err.name}: ${err.message}` : String(err);
   if (
-    /captions?_disabled|captions? disabled|no captions?|empty|not_found|not found|\b404\b|unavailable|private|deleted|removed/i.test(
+    /captions?_disabled|captions?\s+(disabled|unavailable|not available|not found)|no captions?/i.test(
       raw,
     )
   ) {
@@ -634,33 +637,22 @@ export function classifyCaptionsError(err: unknown): ClassifiedVideoError {
       status: 404,
     };
   }
-  if (/timeout|timed out|abort|TimeoutError|AbortError/i.test(raw)) {
-    return {
-      code: "upstream_timeout",
-      message: "Upstream request timed out.",
-      hint: "Retry the request; include X-Request-Id in bug reports if it persists.",
-      status: 504,
-    };
-  }
-  return {
-    code: "upstream_degraded",
-    message: "Caption lookup failed upstream.",
-    hint: "Retry shortly; include X-Request-Id in bug reports.",
-    status: 502,
-  };
+  return classifyVideoError(err);
 }
 
 /**
- * youtubei getTranscript() throws when the engagement/transcript panel is
- * missing (engagement panels not found, transcript panel/continuation not
- * found, captions disabled) -> 404 transcript_unavailable with a hint telling
- * callers to hide the panel; timeouts -> 504; else -> 502.
+ * Only transcript-specific signals (missing engagement/transcript panel,
+ * transcript continuation, or disabled captions) -> 404
+ * transcript_unavailable with a hint telling callers to hide the panel.
+ * Everything else delegates to classifyVideoError, so private/deleted videos
+ * report video_not_found and transient failures report 502/504 instead of a
+ * misleading transcript_unavailable.
  */
 export function classifyTranscriptError(err: unknown): ClassifiedVideoError {
   const raw =
     err instanceof Error ? `${err.name}: ${err.message}` : String(err);
   if (
-    /transcript_unavailable|engagement panels?|transcript (panel|continuation|not found|unavailable)|no transcript|captions? disabled|captions?_disabled|not_found|not found|\b404\b|unavailable|private|deleted|removed/i.test(
+    /transcript_unavailable|transcript\s+(panel|continuation|not found|unavailable|not available)|no transcript|engagement panels?|captions?_disabled|captions?\s+disabled/i.test(
       raw,
     )
   ) {
@@ -671,18 +663,5 @@ export function classifyTranscriptError(err: unknown): ClassifiedVideoError {
       status: 404,
     };
   }
-  if (/timeout|timed out|abort|TimeoutError|AbortError/i.test(raw)) {
-    return {
-      code: "upstream_timeout",
-      message: "Upstream request timed out.",
-      hint: "Retry the request; include X-Request-Id in bug reports if it persists.",
-      status: 504,
-    };
-  }
-  return {
-    code: "upstream_degraded",
-    message: "Transcript lookup failed upstream.",
-    hint: "Retry shortly; include X-Request-Id in bug reports.",
-    status: 502,
-  };
+  return classifyVideoError(err);
 }

@@ -66,6 +66,13 @@ export async function GET(req: NextRequest) {
   return handleSearch(req);
 }
 
+// Continuation-store scope for search cursors. Watch feeds scope by video
+// id; search has no video id, so it scopes by endpoint tag — a cursor minted
+// by one endpoint presented to another yields an empty page, never foreign
+// items (see the scope guards in serveContinuation here and in
+// videos/[id]/related|comments).
+const SEARCH_SCOPE = "search";
+
 export async function handleSearch(
   req: NextRequest,
   deps: SearchDeps = defaultDeps,
@@ -114,11 +121,11 @@ export async function handleSearch(
         .slice(0, limit)
         .map(mapSearchItem)
         .filter((d): d is SearchResultDTO => d !== null);
-      const forkFrom = storeContinuation(search, limit);
+      const forkFrom = storeContinuation(search, limit, SEARCH_SCOPE);
       return { items, forkFrom };
     });
     // The source stays pristine: always fork, even on the miss that stored it.
-    const next = forkContinuation(result.value.forkFrom);
+    const next = forkContinuation(result.value.forkFrom, SEARCH_SCOPE);
     return successResponse(result.value.items, {
       requestId,
       next,
@@ -167,6 +174,18 @@ async function serveContinuation(
       cacheControl: CACHE_CONTROL.search,
     });
   }
+  // A cursor minted by another endpoint (e.g. a video-scoped watch cursor)
+  // is rejected the same way — the foreign cursor is left untouched so it
+  // still works under its own endpoint.
+  if (entry.scope !== undefined && entry.scope !== SEARCH_SCOPE) {
+    return successResponse([], {
+      requestId,
+      next: null,
+      region,
+      lang,
+      cacheControl: CACHE_CONTROL.search,
+    });
+  }
   // Buffered items remain on this page object: serve from this entry's own
   // offset (per-cursor state — forks own their entry) and keep the cursor.
   if (entry.returned < entry.search.results.length) {
@@ -197,7 +216,9 @@ async function serveContinuation(
       .slice(0, pageSize)
       .map(mapSearchItem)
       .filter((d): d is SearchResultDTO => d !== null);
-    const next = resolveNext(storeContinuation(nextPage, pageSize));
+    const next = resolveNext(
+      storeContinuation(nextPage, pageSize, SEARCH_SCOPE),
+    );
     return successResponse(items, {
       requestId,
       next,

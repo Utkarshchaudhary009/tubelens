@@ -32,8 +32,9 @@ export interface ContinuationEntry {
   search: ContinuationSearch;
   returned: number;
   expiresAt: number;
-  /** Owning scope (video id for watch feeds). Cursors presented under a
-   * different scope yield an empty page, never another video's items. */
+  /** Owning scope (video id for watch feeds, "search" for /search).
+   * Cursors presented under a different scope yield an empty page, never
+   * another endpoint's items. */
   scope?: string;
 }
 
