@@ -21,14 +21,18 @@ export interface TranscriptDeps {
 const defaultDeps: TranscriptDeps = {
   async fetchTranscript(id) {
     const { getInnertube, withTimeout } = await import("@/lib/youtube");
-    const innertube = await withTimeout(() => getInnertube(), 8000);
-    // MUST use getInfo: getTranscript() throws on getBasicInfo payloads
-    // ("Cannot get transcript from basic video info") because the engagement
-    // panels only ride on the full watch-next response. Auto-captioned videos
-    // work the same way — no track-kind filtering here.
-    const info = await withTimeout(() => innertube.getInfo(id), 8000);
-    const transcript = await withTimeout(() => info.getTranscript(), 8000);
-    return mapTranscriptInfo(transcript);
+    // Single 8s budget for the whole fetch (session + info + transcript), so
+    // the worst case stays ~8s instead of stacking per-call timeouts.
+    return withTimeout(async () => {
+      const innertube = await getInnertube();
+      // MUST use getInfo: getTranscript() throws on getBasicInfo payloads
+      // ("Cannot get transcript from basic video info") because the engagement
+      // panels only ride on the full watch-next response. Auto-captioned videos
+      // work the same way — no track-kind filtering here.
+      const info = await innertube.getInfo(id);
+      const transcript = await info.getTranscript();
+      return mapTranscriptInfo(transcript);
+    }, 8000);
   },
 };
 
@@ -72,6 +76,17 @@ export async function handleTranscript(
       () => deps.fetchTranscript(id),
       24 * 60 * 60 * 1000, // stale window backs serve-stale-on-error.
     );
+    // An upstream success with zero usable segments means no transcript —
+    // 404 like the missing-panel throw, except a stale serve still returns
+    // its cached copy with warnings (serve-stale-on-error wins).
+    if (result.value.length === 0 && !result.stale) {
+      return errorResponse(requestId, {
+        code: "transcript_unavailable",
+        message: "No transcript is available for this video.",
+        hint: "Captions may be disabled for this video; hide the transcript panel or try a video with manual or auto captions.",
+        status: 404,
+      });
+    }
     return successResponse(result.value, {
       requestId,
       region,

@@ -56,11 +56,15 @@ function adaptComments(comments: {
 const defaultDeps: CommentsDeps = {
   async fetchFirstPage(id) {
     const { getInnertube, withTimeout } = await import("@/lib/youtube");
-    const innertube = await withTimeout(() => getInnertube(), 8000);
-    const comments = await withTimeout(() => innertube.getComments(id), 8000);
-    return adaptComments(
-      comments as unknown as Parameters<typeof adaptComments>[0],
-    );
+    // Single 8s budget for the whole first-page fetch (session + comments),
+    // so the worst case stays ~8s instead of stacking per-call timeouts.
+    return withTimeout(async () => {
+      const innertube = await getInnertube();
+      const comments = await innertube.getComments(id);
+      return adaptComments(
+        comments as unknown as Parameters<typeof adaptComments>[0],
+      );
+    }, 8000);
   },
   async continueFeed(page) {
     const { withTimeout } = await import("@/lib/youtube");
@@ -117,7 +121,7 @@ export async function handleComments(
   // Unknown/expired cursors yield [] + next: null, never an error.
   const cursor = params.get("cursor");
   if (cursor) {
-    return serveContinuation(requestId, region, lang, cursor, limit, deps);
+    return serveContinuation(requestId, region, lang, id, cursor, limit, deps);
   }
 
   const cacheKey = `comments:v1:${id}:${limit}`;
@@ -139,13 +143,13 @@ export async function handleComments(
           .slice(0, limit)
           .map(mapComment)
           .filter((d): d is CommentDTO => d !== null);
-        const forkFrom = storeContinuation(page, limit);
+        const forkFrom = storeContinuation(page, limit, id);
         return { items, forkFrom };
       },
       30 * 60 * 1000, // stale window backs serve-stale-on-error.
     );
     // The source stays pristine: always fork, even on the miss that stored it.
-    const next = forkContinuation(result.value.forkFrom);
+    const next = forkContinuation(result.value.forkFrom, id);
     return successResponse(result.value.items, {
       requestId,
       next,
@@ -171,16 +175,28 @@ async function serveContinuation(
   requestId: string,
   region: string,
   lang: string,
+  videoId: string,
   cursor: string,
   pageSize: number = DEFAULT_LIMIT,
   deps: CommentsDeps = defaultDeps,
 ) {
   const entry = takeContinuation(cursor);
   // Best-effort: unknown/expired/exhausted cursor -> empty page, never error.
+  // A cursor minted for another video is rejected the same way (the foreign
+  // cursor is left untouched so it still works under its own video id).
   if (!entry || !hasMoreResults(entry)) {
     if (entry) {
       dropContinuation(cursor);
     }
+    return successResponse([], {
+      requestId,
+      next: null,
+      region,
+      lang,
+      cacheControl: CACHE_CONTROL.comments,
+    });
+  }
+  if (entry.scope !== undefined && entry.scope !== videoId) {
     return successResponse([], {
       requestId,
       next: null,
@@ -219,7 +235,7 @@ async function serveContinuation(
       .slice(0, pageSize)
       .map(mapComment)
       .filter((d): d is CommentDTO => d !== null);
-    const next = resolveNext(storeContinuation(nextPage, pageSize));
+    const next = resolveNext(storeContinuation(nextPage, pageSize, videoId));
     return successResponse(items, {
       requestId,
       next,
