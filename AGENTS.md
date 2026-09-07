@@ -18,7 +18,7 @@ API-first YouTube data API: **Next.js App Router Route Handlers + youtubei.ts on
 - `src/lib/youtube.ts` — youtubei.ts **singleton, `import "server-only"`**; never instantiate per request.
 - `src/lib/{envelope,cache,errors}.ts` — shared envelope, cache headers, typed errors.
 - `plans/API_ROADMAP.md` — **owner-only single source of truth** (10 phases, 38 endpoints); `plans/DX_PRINCIPLES.md` (envelope, cursor, error+hint); `plans/CACHING.md` (L0/L1/L2 ladder + TTLs).
-- `docs/*.mdx` — **public developer docs** (Fumadocs/MDX); docs bot owns `docs/**`, never `plans/`.
+- `docs/*.mdx` — **public developer docs** (Fumadocs/MDX); docs agent owns `docs/**`, never `plans/`.
 
 ## Commands
 
@@ -51,6 +51,8 @@ The scheduled GitHub Action invokes the phase agent with one instruction: **adva
 
 Validation and E2E workflows are intentionally different: they run on branch pushes, use no GitHub API token, do not comment on PRs, and publish their reports only to the Action run summary. The phase runner must use their check/run results and summaries as verification evidence.
 
+The docs-sync workflow is intentionally different: it runs on **every push to `main`**, including PR merge commits and direct pushes. It owns documentation synchronization for that main-branch change, may update only `docs/**`, and publishes its result to its Action run summary. It must not depend on a `pull_request.closed` event or PR comments.
+
 ## Code style rules
 
 Simple over clever; small abstractions; no paid infra; `limit` default 20/max 50, `region` US, `lang` en; cursor pagination (`?cursor=&limit=`), opaque cursors, empty page = `data: []` + `next: null` (never 404); every response carries `X-Request-Id` (+ `meta.requestId`) and `X-RateLimit-*`; 429s include `Retry-After` + `code: rate_limited`.
@@ -81,6 +83,7 @@ One branch per phase → PR → Vercel preview → validation + e2e → up to 3 
 2. `bun run build` passes before merge.
 3. `openapi.json` lists the new endpoints and lints clean.
 4. Route e2e is owned by the GitHub Action e2e agent on the branch/preview (see `AGENTS.E2E.md`) and its report is published to the Action run summary — do not substitute local dev-server curl.
+5. Docs synchronization runs automatically on every push to `main`; inspect the docs-sync Action summary when documentation synchronization details are needed.
 
 ## Core rule
 
