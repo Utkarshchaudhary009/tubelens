@@ -3,6 +3,8 @@ import { cached } from "@/lib/cache";
 import {
   type ContinuationSearch,
   dropContinuation,
+  forkContinuation,
+  hasMoreResults,
   resolveNext,
   storeContinuation,
   takeContinuation,
@@ -26,21 +28,37 @@ export const runtime = "nodejs";
 // Tests inject mocks here and never touch src/lib/youtube.
 export interface SearchDeps {
   runSearch: (q: string, type: SearchType) => Promise<ContinuationSearch>;
-  continueSearch: (search: ContinuationSearch) => Promise<void>;
+  continueSearch: (search: ContinuationSearch) => Promise<ContinuationSearch>;
+}
+
+/**
+ * Maps our public `type` filter to youtubei.js SearchFilters. youtubei's
+ * SearchType enum has NO "all" key (unfiltered = ANY_TYPE, i.e. the ABSENCE
+ * of a filter), so passing "all" through would rely on an undefined enum
+ * lookup — omit the filter explicitly so default search never 502s.
+ */
+export function toUpstreamSearchFilters(type: SearchType): {
+  type?: "video" | "channel" | "playlist";
+} {
+  return type === "all" ? {} : { type };
 }
 
 const defaultDeps: SearchDeps = {
   async runSearch(q, type) {
     const { getInnertube, withTimeout } = await import("@/lib/youtube");
     const innertube = await withTimeout(() => getInnertube(), 8000);
+    const filters = toUpstreamSearchFilters(type);
     return (await withTimeout(
-      () => innertube.search(q, { type }),
+      () => innertube.search(q, filters),
       8000,
     )) as unknown as ContinuationSearch;
   },
   async continueSearch(search) {
     const { withTimeout } = await import("@/lib/youtube");
-    await withTimeout(() => search.getContinuation() as Promise<unknown>, 8000);
+    return (await withTimeout(
+      () => search.getContinuation(),
+      8000,
+    )) as ContinuationSearch;
   },
 };
 
@@ -81,24 +99,29 @@ export async function handleSearch(
   const cacheKey = `search:v1:${region}:${lang}:${type}:${limit}:${q.toLowerCase()}`;
 
   try {
-    // L0 caches items only; the served cursor is re-validated via
-    // resolveNext so an evicted/expired entry degrades to next: null
-    // instead of dangling.
+    // L0 caches page-1 ITEMS plus the fork-source cursor string only — never
+    // a served cursor object. Misses serve the stored cursor directly; every
+    // HIT mints a FRESH cursor via forkContinuation (own snapshot entry), so
+    // concurrent users of one hot query never share mutable entry state. An
+    // evicted/expired fork source degrades to next: null instead of dangling.
     const result = await cached<{
       items: SearchResultDTO[];
-      next: string | null;
+      forkFrom: string | null;
     }>(cacheKey, 60_000, async () => {
       const search = await deps.runSearch(q, type);
       const items = search.results
         .slice(0, limit)
         .map(mapSearchItem)
         .filter((d): d is SearchResultDTO => d !== null);
-      const next = storeContinuation(search, limit);
-      return { items, next };
+      const forkFrom = storeContinuation(search, limit);
+      return { items, forkFrom };
     });
+    const next = result.hit
+      ? forkContinuation(result.value.forkFrom)
+      : resolveNext(result.value.forkFrom);
     return successResponse(result.value.items, {
       requestId,
-      next: resolveNext(result.value.next),
+      next,
       region,
       lang,
       cached: result.hit,
@@ -131,8 +154,8 @@ async function serveContinuation(
   deps: SearchDeps = defaultDeps,
 ) {
   const entry = takeContinuation(cursor);
-  // Best-effort: unknown/expired cursor -> empty page, never an error.
-  if (!entry || !entry.search.has_continuation) {
+  // Best-effort: unknown/expired/exhausted cursor -> empty page, never error.
+  if (!entry || !hasMoreResults(entry)) {
     if (entry) {
       dropContinuation(cursor);
     }
@@ -144,17 +167,37 @@ async function serveContinuation(
       cacheControl: CACHE_CONTROL.search,
     });
   }
-  try {
-    await deps.continueSearch(entry.search);
+  // Buffered items remain on this page object: serve from this entry's own
+  // offset (per-cursor state — forks own their entry) and keep the cursor.
+  if (entry.returned < entry.search.results.length) {
     const items = entry.search.results
       .slice(entry.returned, entry.returned + pageSize)
       .map(mapSearchItem)
       .filter((d): d is SearchResultDTO => d !== null);
     entry.returned += pageSize;
-    const next = entry.search.has_continuation ? cursor : null;
+    const more = hasMoreResults(entry);
+    const next = more ? cursor : null;
     if (next === null) {
       dropContinuation(cursor);
     }
+    return successResponse(items, {
+      requestId,
+      next,
+      region,
+      lang,
+      cacheControl: CACHE_CONTROL.search,
+    });
+  }
+  // Buffer exhausted but upstream has more: fetch the next immutable page and
+  // store it under a NEW cursor. This entry is left untouched, so fork-source
+  // cursors (and repeat uses of this one) stay stable.
+  try {
+    const nextPage = await deps.continueSearch(entry.search);
+    const items = nextPage.results
+      .slice(0, pageSize)
+      .map(mapSearchItem)
+      .filter((d): d is SearchResultDTO => d !== null);
+    const next = resolveNext(storeContinuation(nextPage, pageSize));
     return successResponse(items, {
       requestId,
       next,

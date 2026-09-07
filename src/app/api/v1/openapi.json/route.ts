@@ -13,7 +13,9 @@ export function buildOpenApiDocument() {
     openapi: "3.1.0",
     info: {
       title: "TubeLens API",
-      version: "1.0.0",
+      // Single service version: keep in sync with /health data.version and
+      // package.json (0.1.0 until the v1 API is declared stable).
+      version: "0.1.0",
       description:
         "API-first YouTube data API. Phase 1 ships health, search, video details, URL resolving, and this spec.",
     },
@@ -82,6 +84,21 @@ export function buildOpenApiDocument() {
               description: "missing_query, invalid_type, or invalid_limit.",
               content: { "application/json": { schema: { $ref: errorRef } } },
             },
+            429: {
+              description:
+                "rate_limited; retry after the Retry-After seconds. X-RateLimit-* headers are present on every response.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            502: {
+              description:
+                "upstream_degraded; YouTube Innertube call failed. Retry shortly.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            504: {
+              description:
+                "upstream_timeout; the 8s fail-fast fired. Retry shortly.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
           },
         },
       },
@@ -122,6 +139,21 @@ export function buildOpenApiDocument() {
               description: "video_not_found.",
               content: { "application/json": { schema: { $ref: errorRef } } },
             },
+            429: {
+              description:
+                "rate_limited; retry after the Retry-After seconds. X-RateLimit-* headers are present on every response.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            502: {
+              description:
+                "upstream_degraded; YouTube Innertube call failed (e.g. bot-guard). Retry shortly.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            504: {
+              description:
+                "upstream_timeout; the 8s fail-fast fired. Retry shortly.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
           },
         },
       },
@@ -146,6 +178,16 @@ export function buildOpenApiDocument() {
             },
             400: {
               description: "missing_url or unresolvable_url.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: {
+              description:
+                "rate_limited; retry after the Retry-After seconds. X-RateLimit-* headers are present on every response.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            502: {
+              description:
+                "upstream_degraded; URL resolution failed. Retry shortly.",
               content: { "application/json": { schema: { $ref: errorRef } } },
             },
           },
@@ -214,6 +256,8 @@ export async function GET(req: NextRequest) {
   const requestId = getRequestId(req);
   // Served RAW (not inside the success envelope) so OpenAPI tooling can
   // consume the URL directly. Tracing/rate-limit/cache headers still apply.
+  // X-Request-Id-only exception: with no envelope there is no meta.requestId,
+  // so correlate via the X-Request-Id response header (echoed or minted).
   const headers = baseHeaders(requestId);
   headers.set("Content-Type", "application/json");
   headers.set("Cache-Control", CACHE_CONTROL.openapi);
