@@ -78,6 +78,7 @@ Follow every mandatory lifecycle rule in `AGENTS.md`, including:
 - fix every genuine finding before considering merge;
 - merge only when the mandatory merge gate is satisfied;
 - **only after a successful merge**, update `plans/API_ROADMAP.md` on `main` to mark the merged phase `[x]` and its Status as done, then commit and push that roadmap update;
+- confirm that the `docs-sync` workflow has run for the resulting `main` push and inspect its Action summary when documentation synchronization details matter;
 - perform the required post-merge production verification;
 - only then allow the next scheduled run to advance the next phase.
 
@@ -87,11 +88,19 @@ Never mark a roadmap phase complete before its merge. Never merge merely because
 
 Do not expect `validate` or `e2e` to post comments on the PR. Both workflows are intentionally tokenless and publish their reports to the GitHub Actions run summary.
 
+The docs-sync workflow is separate. It runs on every push to `main`, including PR merge commits and direct pushes, synchronizes only `docs/**`, and publishes its result to its own Action run summary. Do not depend on a `pull_request.closed` event or PR comments for documentation synchronization.
+
 When validating a PR:
 1. Confirm the latest commit has the expected `validate` and `e2e` workflow runs.
 2. Confirm those checks succeeded and inspect their Action run summaries/logs when details are needed.
 3. Inspect separate automated review findings if the repository has any.
 4. Fix genuine findings, push, and let the workflows rerun before counting the round as clean.
+
+After a PR merges:
+1. Recognize the resulting push to `main` as the trigger for `docs-sync`.
+2. Confirm the docs-sync run starts for that main push.
+3. Inspect its summary when necessary to determine whether documentation changed or no docs update was required.
+4. Do not treat the docs-sync summary as a replacement for production verification.
 
 ## Execution style
 
@@ -103,6 +112,7 @@ At the end, report:
 - validation and review results;
 - PR and merge result;
 - roadmap update status;
+- docs-sync trigger/result status;
 - post-merge production verification status;
 - any remaining blocker that prevents completion.
 
