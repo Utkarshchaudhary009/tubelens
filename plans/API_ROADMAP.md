@@ -46,7 +46,7 @@ route only when the backend source or shape genuinely differs.
 **Goal:** Prove the product thesis with the smallest useful API: find anything,
 read anything, resolve any URL, and report service health.
 
-**Status:** `[x]` done — shipped and merged via PR #1 (`phase-1-core-validation`)
+**Status:** `[x]` done — shipped and merged via PR #1 (`phase-1-core-validation`); **pending:** no production deployment exists yet (repo not linked to Vercel), so prod endpoint checks + 7-day health/p95 observation still outstanding
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
