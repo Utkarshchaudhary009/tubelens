@@ -1,15 +1,17 @@
 name: e2e
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
 
 permissions:
   contents: read
   pull-requests: write
 
 concurrency:
-  group: e2e-${{ github.event.pull_request.number }}
+  group: e2e-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -18,8 +20,26 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: oven-sh/setup-bun@v2
+
+      - name: Find PR for branch
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_NUMBER="$(gh pr list --head "${GITHUB_REPOSITORY_OWNER}:${GITHUB_REF_NAME}" --state open --json number --jq '.[0].number')"
+          if [ -z "$PR_NUMBER" ]; then
+            PR_NUMBER="$(gh pr list --head "${GITHUB_REF_NAME}" --state open --json number --jq '.[0].number')"
+          fi
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          if [ -n "$PR_NUMBER" ]; then
+            echo "Found open PR #$PR_NUMBER for $GITHUB_REF_NAME"
+          else
+            echo "No open PR found for $GITHUB_REF_NAME. E2E will still run; there is nowhere to post a PR review."
+          fi
 
       - name: Install OpenCode
         run: curl -fsSL https://opencode.ai/install | bash
@@ -43,18 +63,18 @@ jobs:
         run: |
           export PATH="$HOME/.opencode/bin:$PATH"
           set -o pipefail
-          opencode run --model opencode/muse-spark-1.3-contributor-free "Read AGENTS.md and perform the E2E review for this PR. Inspect the diff, start the application yourself, start any supporting services you need, test the relevant APIs and flows, investigate failures, and return the final E2E report." \
+          opencode run --model opencode/muse-spark-1.3-contributor-free "Read AGENTS.md and perform the E2E review for the current branch push. Inspect the diff against its base branch, start the application yourself, start any supporting services you need, test the APIs and user flows relevant to the changes, investigate failures, and return the final E2E report." \
             | tee /tmp/e2e-result.md
 
-      - name: Post result to PR
-        if: always()
+      - name: Post review to PR
+        if: always() && steps.pr.outputs.number != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if [ -s /tmp/e2e-result.md ]; then
-            gh pr comment "${{ github.event.pull_request.number }}" --body-file /tmp/e2e-result.md
+            gh pr review "${{ steps.pr.outputs.number }}" --comment --body-file /tmp/e2e-result.md
           else
-            gh pr comment "${{ github.event.pull_request.number }}" --body "E2E agent did not produce a report. Check the workflow logs."
+            gh pr review "${{ steps.pr.outputs.number }}" --comment --body "E2E agent did not produce a report. Check the workflow logs."
           fi
 
       - name: Restore AGENTS.md
