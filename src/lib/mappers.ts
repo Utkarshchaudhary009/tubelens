@@ -602,7 +602,9 @@ export function classifyVideoError(err: unknown): ClassifiedVideoError {
 export function classifyFeedError(err: unknown): ClassifiedVideoError {
   const raw =
     err instanceof Error ? `${err.name}: ${err.message}` : String(err);
-  if (/comments? (disabled|turned off|unavailable)/i.test(raw)) {
+  if (
+    /comments?.*?(disabled|turned.?off|unavailable|not available)/i.test(raw)
+  ) {
     return {
       code: "comments_disabled",
       message: "Comments are disabled for this video.",
@@ -658,7 +660,7 @@ export function classifyTranscriptError(err: unknown): ClassifiedVideoError {
   const raw =
     err instanceof Error ? `${err.name}: ${err.message}` : String(err);
   if (
-    /engagement panels?|transcript (panel|continuation|not found|unavailable)|no transcript|captions? disabled|captions?_disabled|not_found|not found|\b404\b|unavailable|private|deleted|removed/i.test(
+    /transcript_unavailable|engagement panels?|transcript (panel|continuation|not found|unavailable)|no transcript|captions? disabled|captions?_disabled|not_found|not found|\b404\b|unavailable|private|deleted|removed/i.test(
       raw,
     )
   ) {
