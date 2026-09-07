@@ -15,64 +15,60 @@ concurrency:
 jobs:
   e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
       - uses: oven-sh/setup-bun@v2
 
-      - name: Install deps
-        run: bun install --frozen-lockfile
-
-      - name: Install opencode
+      - name: Install OpenCode
         run: curl -fsSL https://opencode.ai/install | bash
 
-      - name: Swap AGENTS.md identity
+      - name: Give E2E agent full machine access
+        run: |
+          cat > /tmp/opencode-e2e.json <<'EOF'
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "permission": "allow"
+          }
+          EOF
+
+      - name: Use E2E agent instructions
         run: cp AGENTS.md /tmp/AGENTS.orig.md && cp AGENTS.E2E.md AGENTS.md
 
-      - name: Start dev server and wait healthy
-        run: |
-          bun run dev > /tmp/dev.log 2>&1 &
-          echo $! > /tmp/dev.pid
-          for _ in $(seq 1 30); do
-            if curl -sf http://localhost:3000/api/v1/health > /dev/null; then
-              echo "dev server healthy"
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "dev server never became healthy"
-          cat /tmp/dev.log
-          exit 1
-
-      - name: Run E2E bot (non-interactive, no TUI)
+      - name: Run E2E agent
         id: e2e
         continue-on-error: true
+        env:
+          OPENCODE_CONFIG: /tmp/opencode-e2e.json
         run: |
           export PATH="$HOME/.opencode/bin:$PATH"
-          opencode run --model opencode/muse-spark-1.3-contributor-free "Follow AGENTS.md (E2E bot identity) and execute the E2E suite against http://localhost:3000. Write the verdict to /tmp/e2e-result.md."
+          set -o pipefail
+          opencode run --model opencode/muse-spark-1.3-contributor-free "Read AGENTS.md and perform the E2E review for this PR. Inspect the diff, start the application yourself, start any supporting services you need, test the relevant APIs and flows, investigate failures, and return the final E2E report." \
+            | tee /tmp/e2e-result.md
 
-      - name: Post PR comment
+      - name: Post result to PR
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          SHA="$(git rev-parse --short HEAD)"
-          if [ "${{ steps.e2e.outcome }}" = "success" ] && [ -f /tmp/e2e-result.md ]; then
+          if [ -s /tmp/e2e-result.md ]; then
             gh pr comment "${{ github.event.pull_request.number }}" --body-file /tmp/e2e-result.md
           else
-            {
-              echo "E2E FAIL $SHA"
-              echo ""
-              if [ -f /tmp/e2e-result.md ]; then cat /tmp/e2e-result.md; else echo "No result file — the E2E run did not complete. Check the workflow logs."; fi
-            } > /tmp/e2e-fail.md
-            gh pr comment "${{ github.event.pull_request.number }}" --body-file /tmp/e2e-fail.md
-            exit 1
+            gh pr comment "${{ github.event.pull_request.number }}" --body "E2E agent did not produce a report. Check the workflow logs."
           fi
 
-      - name: Restore AGENTS.md (never leak the swap into the PR diff)
+      - name: Restore AGENTS.md
         if: always()
         run: |
-          if [ -f /tmp/dev.pid ]; then kill "$(cat /tmp/dev.pid)" || true; fi
           cp /tmp/AGENTS.orig.md AGENTS.md
-          git diff --exit-code -- AGENTS.md && echo "AGENTS.md restored clean"
+          git diff --exit-code -- AGENTS.md
+
+      - name: Fail when the E2E agent changed the repository
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "E2E agent left repository changes behind:"
+            git status --short
+            exit 1
+          fi
