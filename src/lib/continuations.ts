@@ -1,10 +1,21 @@
-// Opaque pagination-cursor store for /api/v1/search.
-// youtubei Search continuations live on the Search object, which cannot
-// cross instances — so live Search objects are kept in this L0 map keyed by
-// an opaque cursor id (5-min TTL, capped at 100). A cursor that misses (cold
-// instance, eviction, expiry) resolves to null and callers serve an empty
-// page with next: null rather than an error, per the Phase 1 contract.
+// Opaque pagination-cursor store for paged watch feeds.
+// youtubei continuations live on their page object (Search, watch-next
+// VideoInfo, Comments), which cannot cross instances — so live page objects
+// are kept in this L0 map keyed by an opaque cursor id (5-min TTL, capped at
+// 100). One shared store serves /api/v1/search, /api/v1/videos/:id/related,
+// and /api/v1/videos/:id/comments: routes adapt their upstream page to the
+// ContinuationSearch shape below and share the same fork semantics, so cached
+// cursors never share mutable state (see forkContinuation). A cursor that
+// misses (cold instance, eviction, expiry) resolves to null and callers serve
+// an empty page with next: null rather than an error, per the contract.
 // Pure lib module (no server-only import) so it is unit-testable.
+
+/**
+ * Generic paged-feed shape. Mirrors youtubei.js Search (results +
+ * has_continuation + getContinuation returning a NEW page object per call);
+ * related adapts VideoInfo.watch_next_feed/wn_has_continuation and comments
+ * adapts Comments.contents/has_continuation to this interface.
+ */
 
 export interface ContinuationSearch {
   results: unknown[];

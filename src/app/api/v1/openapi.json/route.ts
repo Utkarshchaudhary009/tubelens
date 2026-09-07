@@ -3,7 +3,7 @@ import { baseHeaders, CACHE_CONTROL, getRequestId } from "@/lib/envelope";
 
 export const runtime = "nodejs";
 
-// OpenAPI 3.1 stub for Phase 1: documents exactly the 5 shipped endpoints.
+// OpenAPI 3.1 stub for Phase 2: documents exactly the 9 shipped endpoints.
 // Grows each phase; promoted to the full spec in Phase 10. Exported as a
 // pure builder so tests can validate it without HTTP.
 export function buildOpenApiDocument() {
@@ -17,7 +17,7 @@ export function buildOpenApiDocument() {
       // package.json (0.1.0 until the v1 API is declared stable).
       version: "0.1.0",
       description:
-        "API-first YouTube data API. Phase 1 ships health, search, video details, URL resolving, and this spec.",
+        "API-first YouTube data API. Phase 2 ships watch essentials: related rail, comments, captions, and transcript, plus Phase 1 health, search, video details, URL resolving, and this spec.",
     },
     servers: [{ url: "https://tubelens.vercel.app/api/v1" }],
     paths: {
@@ -147,6 +147,238 @@ export function buildOpenApiDocument() {
             502: {
               description:
                 "upstream_degraded; YouTube Innertube call failed (e.g. bot-guard). Retry shortly.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            504: {
+              description:
+                "upstream_timeout; the 8s fail-fast fired. Retry shortly.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+          },
+        },
+      },
+      "/videos/{id}/related": {
+        get: {
+          operationId: "getRelated",
+          summary: "Up-next / related videos rail",
+          parameters: [
+            {
+              name: "id",
+              in: "path",
+              required: true,
+              schema: { type: "string" },
+            },
+            {
+              name: "limit",
+              in: "query",
+              schema: { type: "integer", minimum: 1, maximum: 50, default: 20 },
+            },
+            { name: "cursor", in: "query", schema: { type: "string" } },
+            {
+              name: "region",
+              in: "query",
+              schema: { type: "string", default: "US" },
+            },
+            {
+              name: "lang",
+              in: "query",
+              schema: { type: "string", default: "en" },
+            },
+          ],
+          responses: {
+            200: {
+              description: "Paged related videos.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "invalid_video_id or invalid_limit.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            404: {
+              description: "video_not_found.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: {
+              description:
+                "rate_limited; retry after the Retry-After seconds. X-RateLimit-* headers are present on every response.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            502: {
+              description:
+                "upstream_degraded; YouTube Innertube call failed. Retry shortly.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            504: {
+              description:
+                "upstream_timeout; the 8s fail-fast fired. Retry shortly.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+          },
+        },
+      },
+      "/videos/{id}/comments": {
+        get: {
+          operationId: "getComments",
+          summary: "Top-level comments with continuation pagination",
+          parameters: [
+            {
+              name: "id",
+              in: "path",
+              required: true,
+              schema: { type: "string" },
+            },
+            {
+              name: "limit",
+              in: "query",
+              schema: { type: "integer", minimum: 1, maximum: 50, default: 20 },
+            },
+            { name: "cursor", in: "query", schema: { type: "string" } },
+            {
+              name: "region",
+              in: "query",
+              schema: { type: "string", default: "US" },
+            },
+            {
+              name: "lang",
+              in: "query",
+              schema: { type: "string", default: "en" },
+            },
+          ],
+          responses: {
+            200: {
+              description: "Paged top-level comments.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "invalid_video_id or invalid_limit.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            404: {
+              description: "video_not_found.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: {
+              description:
+                "rate_limited; retry after the Retry-After seconds. X-RateLimit-* headers are present on every response.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            502: {
+              description:
+                "upstream_degraded; YouTube Innertube call failed. Retry shortly.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            504: {
+              description:
+                "upstream_timeout; the 8s fail-fast fired. Retry shortly.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+          },
+        },
+      },
+      "/videos/{id}/captions": {
+        get: {
+          operationId: "getCaptions",
+          summary: "List available caption tracks and languages",
+          parameters: [
+            {
+              name: "id",
+              in: "path",
+              required: true,
+              schema: { type: "string" },
+            },
+            {
+              name: "region",
+              in: "query",
+              schema: { type: "string", default: "US" },
+            },
+            {
+              name: "lang",
+              in: "query",
+              schema: { type: "string", default: "en" },
+            },
+          ],
+          responses: {
+            200: {
+              description: "Caption track list.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "invalid_video_id.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            404: {
+              description: "captions_disabled or video_not_found.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: {
+              description:
+                "rate_limited; retry after the Retry-After seconds. X-RateLimit-* headers are present on every response.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            502: {
+              description:
+                "upstream_degraded; YouTube Innertube call failed. Retry shortly.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            504: {
+              description:
+                "upstream_timeout; the 8s fail-fast fired. Retry shortly.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+          },
+        },
+      },
+      "/videos/{id}/transcript": {
+        get: {
+          operationId: "getTranscript",
+          summary: "Timed transcript text for reading and search",
+          parameters: [
+            {
+              name: "id",
+              in: "path",
+              required: true,
+              schema: { type: "string" },
+            },
+            {
+              name: "region",
+              in: "query",
+              schema: { type: "string", default: "US" },
+            },
+            {
+              name: "lang",
+              in: "query",
+              schema: { type: "string", default: "en" },
+            },
+          ],
+          responses: {
+            200: {
+              description: "Timed transcript segments.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "invalid_video_id.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            404: {
+              description: "transcript_unavailable or video_not_found.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: {
+              description:
+                "rate_limited; retry after the Retry-After seconds. X-RateLimit-* headers are present on every response.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            502: {
+              description:
+                "upstream_degraded; YouTube Innertube call failed. Retry shortly.",
               content: { "application/json": { schema: { $ref: errorRef } } },
             },
             504: {
