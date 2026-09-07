@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 import { NextRequest } from "next/server";
+import { handleSearch } from "../../app/api/v1/search/route";
 import { handleCaptions } from "../../app/api/v1/videos/[id]/captions/route";
 import { handleComments } from "../../app/api/v1/videos/[id]/comments/route";
 import { handleRelated } from "../../app/api/v1/videos/[id]/related/route";
@@ -12,7 +13,11 @@ import {
   storeContinuation,
   takeContinuation,
 } from "../continuations";
-import { classifyFeedError, classifyTranscriptError } from "../mappers";
+import {
+  classifyCaptionsError,
+  classifyFeedError,
+  classifyTranscriptError,
+} from "../mappers";
 
 // ---------------------------------------------------------------------------
 // Finding 1 (HIGH): single 8s fail-fast budget. The default deps lazily import
@@ -401,5 +406,114 @@ describe("finding 5: empty caption lists never cached, always 404", () => {
     const body = await res.json();
     expect(body.data).toEqual(tracks);
     expect(body.warnings[0].code).toBe("stale_served");
+  });
+});
+
+describe("review: narrow captions/transcript classifiers", () => {
+  test("private/deleted/unknown videos -> video_not_found, not disabled", () => {
+    for (const msg of [
+      "This video is private",
+      "Video deleted or removed",
+      "NOT_FOUND: video",
+      "video unavailable",
+    ]) {
+      expect(classifyCaptionsError(new Error(msg))).toMatchObject({
+        code: "video_not_found",
+        status: 404,
+      });
+      expect(classifyTranscriptError(new Error(msg))).toMatchObject({
+        code: "video_not_found",
+        status: 404,
+      });
+    }
+  });
+
+  test("transient gibberish -> 502 upstream_degraded, timeouts -> 504", () => {
+    for (const msg of ["upstream down", "500 Internal Server Error"]) {
+      expect(classifyCaptionsError(new Error(msg))).toMatchObject({
+        code: "upstream_degraded",
+        status: 502,
+      });
+      expect(classifyTranscriptError(new Error(msg))).toMatchObject({
+        code: "upstream_degraded",
+        status: 502,
+      });
+    }
+    const timeout = new Error("Upstream timed out after 8000ms");
+    timeout.name = "TimeoutError";
+    expect(classifyCaptionsError(timeout).status).toBe(504);
+    expect(classifyTranscriptError(timeout).status).toBe(504);
+  });
+
+  test("caption/transcript-specific signals still 404 with their own code", () => {
+    expect(
+      classifyCaptionsError(new Error("caption unavailable")),
+    ).toMatchObject({ code: "captions_disabled", status: 404 });
+    expect(
+      classifyTranscriptError(new Error("captions disabled")),
+    ).toMatchObject({ code: "transcript_unavailable", status: 404 });
+  });
+});
+
+describe("review: cross-endpoint cursor isolation", () => {
+  test("search cursor on related -> [] + next: null, and vice versa", async () => {
+    const videoA = "AAAAAAAAAAA";
+    const searchDeps = {
+      runSearch: async () => fakeFeed([[vid("s1", "S1"), vid("s2", "S2")]]),
+      continueSearch: async (p: ContinuationSearch) => p.getContinuation(),
+    };
+    const relatedDeps = {
+      fetchFirstPage: async (_id: string) =>
+        fakeFeed([[vid("r1", "R1"), vid("r2", "R2")]]),
+      continueFeed: async (p: ContinuationSearch) => p.getContinuation(),
+    };
+
+    const sFirst = await (
+      await handleSearch(
+        req("http://x/api/v1/search?q=xscope&limit=1"),
+        searchDeps,
+      )
+    ).json();
+    expect(typeof sFirst.page.next).toBe("string");
+
+    // Search cursor presented to related: rejected, foreign cursor untouched.
+    const cross = await (
+      await handleRelated(
+        req(
+          `http://x/api/v1/videos/${videoA}/related?cursor=${sFirst.page.next}&limit=1`,
+        ),
+        videoA,
+        relatedDeps,
+      )
+    ).json();
+    expect(cross.data).toEqual([]);
+    expect(cross.page).toEqual({ next: null });
+
+    // The search cursor still works under search.
+    const own = await (
+      await handleSearch(
+        req(`http://x/api/v1/search?cursor=${sFirst.page.next}&limit=1`),
+        searchDeps,
+      )
+    ).json();
+    expect(own.data.map((d: { id: string }) => d.id)).toEqual(["s2"]);
+
+    // Related cursor presented to search: rejected, foreign cursor untouched.
+    const rFirst = await (
+      await handleRelated(
+        req(`http://x/api/v1/videos/${videoA}/related?limit=1`),
+        videoA,
+        relatedDeps,
+      )
+    ).json();
+    expect(typeof rFirst.page.next).toBe("string");
+    const back = await (
+      await handleSearch(
+        req(`http://x/api/v1/search?cursor=${rFirst.page.next}&limit=1`),
+        searchDeps,
+      )
+    ).json();
+    expect(back.data).toEqual([]);
+    expect(back.page).toEqual({ next: null });
   });
 });
