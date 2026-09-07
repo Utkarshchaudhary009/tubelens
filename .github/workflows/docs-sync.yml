@@ -1,13 +1,13 @@
 name: docs-sync
 
 on:
-  pull_request:
-    types: [closed]
-    branches: [main]
+  push:
+    branches:
+      - main
+  workflow_dispatch:
 
 permissions:
   contents: write
-  pull-requests: write
 
 concurrency:
   group: docs-sync-main
@@ -15,7 +15,6 @@ concurrency:
 
 jobs:
   docs-sync:
-    if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -35,11 +34,16 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         if: steps.skip.outputs.run == 'true'
 
-      - name: Capture merged PR diff
+      - name: Capture main push diff
         if: steps.skip.outputs.run == 'true'
         run: |
-          git diff "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" > /tmp/merge.diff
-          git diff "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" --name-only > /tmp/merge.files
+          if [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            git diff "${{ github.event.before }}...${{ github.sha }}" > /tmp/main.diff
+            git diff "${{ github.event.before }}...${{ github.sha }}" --name-only > /tmp/main.files
+          else
+            git diff-tree --no-commit-id --name-only -r "${{ github.sha }}" > /tmp/main.files
+            git show --format=fuller --stat --patch "${{ github.sha }}" > /tmp/main.diff
+          fi
 
       - name: Install OpenCode
         if: steps.skip.outputs.run == 'true'
@@ -93,7 +97,7 @@ jobs:
         run: |
           export PATH="$HOME/.opencode/bin:$PATH"
           set -o pipefail
-          opencode run --model opencode/muse-spark-1.3-contributor-free "Read AGENTS.md and perform the documentation review for this merged PR. Inspect /tmp/merge.diff and the repository, update only docs/** when documentation needs to change, then return the final docs-sync report." \
+          opencode run --model opencode/muse-spark-1.3-contributor-free "Read AGENTS.md and perform the documentation review for this push to main. Inspect /tmp/main.diff and the repository, update only docs/** when documentation needs to change, then return the final docs-sync report." \
             | tee /tmp/docs-result.md
 
       - name: Restore AGENTS.md
@@ -119,17 +123,15 @@ jobs:
           else
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git commit -m "docs: sync after PR #${{ github.event.pull_request.number }} [skip docs-sync]"
+            git commit -m "docs: sync from main push [skip docs-sync]"
             git push origin main
           fi
 
-      - name: Post result to PR
+      - name: Publish docs result
         if: always() && steps.skip.outputs.run == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          if [ -s /tmp/docs-result.md ]; then
-            gh pr comment "${{ github.event.pull_request.number }}" --body-file /tmp/docs-result.md
-          else
-            gh pr comment "${{ github.event.pull_request.number }}" --body "Docs agent did not produce a report. Check the workflow logs."
-          fi
+          {
+            echo '## Docs sync result'
+            echo
+            cat /tmp/docs-result.md 2>/dev/null || echo 'No docs report was produced. Check the workflow logs.'
+          } >> "$GITHUB_STEP_SUMMARY"
