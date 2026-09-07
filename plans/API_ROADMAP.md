@@ -46,7 +46,7 @@ route only when the backend source or shape genuinely differs.
 **Goal:** Prove the product thesis with the smallest useful API: find anything,
 read anything, resolve any URL, and report service health.
 
-**Status:** `[~]` in progress — implementation pushed on `phase-1-core-validation` (PR blocked: repo disallows Actions PR creation)
+**Status:** `[x]` done — shipped and merged via PR #1 (`phase-1-core-validation`)
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
