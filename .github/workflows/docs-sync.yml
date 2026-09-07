@@ -21,8 +21,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: true
 
-      - name: Skip check ([skip docs-sync] opt-out)
+      - name: Skip self-generated docs commit
         id: skip
         run: |
           if git log -1 --pretty=%B | grep -qF "[skip docs-sync]"; then
@@ -34,15 +35,18 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         if: steps.skip.outputs.run == 'true'
 
-      - name: Capture main push diff
+      - name: Capture changes introduced by this main push
         if: steps.skip.outputs.run == 'true'
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
         run: |
-          if [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
-            git diff "${{ github.event.before }}...${{ github.sha }}" > /tmp/main.diff
-            git diff "${{ github.event.before }}...${{ github.sha }}" --name-only > /tmp/main.files
+          if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            git diff-tree --root --no-commit-id --name-only -r "$AFTER_SHA" > /tmp/main.files
+            git show --format= --no-ext-diff "$AFTER_SHA" > /tmp/main.diff
           else
-            git diff-tree --no-commit-id --name-only -r "${{ github.sha }}" > /tmp/main.files
-            git show --format=fuller --stat --patch "${{ github.sha }}" > /tmp/main.diff
+            git diff "$BEFORE_SHA...$AFTER_SHA" > /tmp/main.diff
+            git diff "$BEFORE_SHA...$AFTER_SHA" --name-only > /tmp/main.files
           fi
 
       - name: Install OpenCode
@@ -90,15 +94,24 @@ jobs:
         run: cp AGENTS.md /tmp/AGENTS.orig.md && cp AGENTS.DOCS.md AGENTS.md
 
       - name: Run docs agent
-        id: docs
         if: steps.skip.outputs.run == 'true'
+        id: docs
         env:
           OPENCODE_CONFIG: /tmp/opencode-docs.json
         run: |
           export PATH="$HOME/.opencode/bin:$PATH"
           set -o pipefail
-          opencode run --model opencode/muse-spark-1.3-contributor-free "Read AGENTS.md and perform the documentation review for this push to main. Inspect /tmp/main.diff and the repository, update only docs/** when documentation needs to change, then return the final docs-sync report." \
+          opencode run --model opencode/muse-spark-1.3-contributor-free "Read AGENTS.md and perform the documentation sync for the latest push to main. Inspect /tmp/main.diff and /tmp/main.files to understand what changed, update only docs/** when public documentation needs to change, then return the final docs-sync report." \
             | tee /tmp/docs-result.md
+
+      - name: Publish docs-sync summary
+        if: always() && steps.skip.outputs.run == 'true'
+        run: |
+          {
+            echo '## Docs sync result'
+            echo
+            cat /tmp/docs-result.md 2>/dev/null || echo 'No docs-sync report was produced. Check the workflow logs.'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Restore AGENTS.md
         if: always() && steps.skip.outputs.run == 'true'
@@ -123,15 +136,6 @@ jobs:
           else
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git commit -m "docs: sync from main push [skip docs-sync]"
+            git commit -m "docs: sync after main push [skip docs-sync]"
             git push origin main
           fi
-
-      - name: Publish docs result
-        if: always() && steps.skip.outputs.run == 'true'
-        run: |
-          {
-            echo '## Docs sync result'
-            echo
-            cat /tmp/docs-result.md 2>/dev/null || echo 'No docs report was produced. Check the workflow logs.'
-          } >> "$GITHUB_STEP_SUMMARY"
