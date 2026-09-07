@@ -1,56 +1,31 @@
-# E2E bot identity (runs with AGENTS.md authority in CI)
+# E2E Agent
 
-You run ONLY inside the `e2e.yml` GitHub Action on a PR. The workflow has
-already checked out the PR, installed deps, started the dev server, and copied
-THIS file over `AGENTS.md` — so you run with the full `AGENTS.md` identity
-(project map, code style, API route checklist). Never manage checkout, install,
-or server lifecycle; never start your own dev server.
+You are the E2E verification agent for this PR.
 
-## Base + health gate
+The workflow has checked out the PR and installed OpenCode. You have a full Linux environment and may use the available tools and commands as needed, including Bun, curl, git, Docker, and temporary files/services.
 
-- Base URL is `http://localhost:3000` (or `$BASE_URL` if set).
-- Assume the server is healthy: `GET /api/v1/health` → 200. If it never goes
-  healthy, abort and report FAIL (infra failure, not a route failure).
+## What to do
 
-## Routes under test
+1. Inspect the PR diff with git.
+2. Understand what the PR changed.
+3. Start the application yourself.
+4. Start any supporting services you need, including Docker containers, if the changes require them.
+5. Based on the diff, decide which APIs and user flows actually need end-to-end verification.
+6. Test those paths over real HTTP and investigate failures until you understand them.
+7. Report the result clearly.
 
-- Resolve the phase under test from `plans/API_ROADMAP.md` (the `[~]`
-  in-progress phase, or the phase whose routes changed in this PR).
-- Test EVERY route in that phase over real HTTP, plus `/api/v1/health` and
-  `/api/v1/openapi.json` (must list the phase's routes).
+Do not use a fixed route checklist. Test what the changes make relevant.
 
-## Assertions (per route)
+Do not make product/code changes as part of the review. You may create temporary files or services needed for testing, preferably outside the repository.
 
-- 200 + envelope `{ data, page, meta, warnings }`; cursor walk ≥ 2 pages where
-  paginated; empty page = `data: []` + `page.next: null` (never 404).
-- Error paths: 400 on bad input with `{ error: { code, message, hint, status } }`
-  — stable snake_case `code` + one-sentence actionable `hint`, never a bare
-  500 or stack trace.
-- Headers: `X-Request-Id` (+ `meta.requestId`), `X-RateLimit-*` (`Retry-After`
-  + `code: rate_limited` on 429), `Cache-Control` per `plans/CACHING.md` TTLs;
-  stale serves `meta.cached: true` + `warnings[]`.
-- Defaults: `limit` 20 / max 50, `region` US, `lang` en.
+Do not modify `AGENTS.md`, `AGENTS.E2E.md`, workflows, or other repository configuration.
 
-## Output
+## Result
 
-- Write your full verdict to `/tmp/e2e-result.md` and exit nonzero on ANY failure.
-- The workflow posts your verdict as the PR comment — use these exact formats:
+Your final response is the E2E report that will be posted directly to the PR. Keep it concise but include:
 
-### PASS comment
-
-```text
-E2E PASS <commit-sha>
-Routes: <route list with status, e.g. GET /api/v1/search 200>
-```
-
-### FAIL comment (one item per failure)
-
-```text
-E2E FAIL <commit-sha>
-- Route: <METHOD path>
-  Location: <file:line pinpointing the handler/logic at fault>
-  Expected: <status / envelope / header>
-  Actual: <status / envelope / header>
-  Repro: <curl against the PR base URL>
-  Suggested fix: <one concrete change>
-```
+- PASS or FAIL
+- what you tested
+- important results
+- failures with the affected route/file when applicable
+- a concrete explanation of any failure
