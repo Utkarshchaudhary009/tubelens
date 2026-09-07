@@ -48,8 +48,11 @@ export async function GET(
 // The upstream session locale is fixed to en/US at singleton creation, so the
 // transcript is locale-independent and the cache key is just the video id.
 // The full segment list is returned in one page (page.next is always null).
-// Serve-stale-on-error: an upstream failure with a stale copy still returns
-// 200 with meta.cached + warnings; only a cold-miss failure is a typed error.
+// Empty-vs-stale contract (shared with captions): stale wins. An empty fresh
+// fetch never populates the cache (it throws, so `cached` falls back to any
+// stale copy); a stale non-empty copy is served as 200 + `stale_served`
+// regardless of the fresh outcome, and only a cold-miss empty is 404. A
+// legacy stale-empty copy is still 404 — empties are never served as 200.
 export async function handleTranscript(
   req: NextRequest,
   id: string,
@@ -73,13 +76,21 @@ export async function handleTranscript(
     const result = await cached<TranscriptSegmentDTO[]>(
       cacheKey,
       24 * 60 * 60 * 1000, // L0 fresh window; L1 CDN carries the 86400s TTL.
-      () => deps.fetchTranscript(id),
+      async () => {
+        // Throw on empty so empty transcript lists never populate the cache;
+        // classifyTranscriptError maps the marker to 404 transcript_unavailable,
+        // and `cached` falls back to any stale copy (stale wins).
+        const segments = await deps.fetchTranscript(id);
+        if (segments.length === 0) {
+          throw new Error("transcript_unavailable: no transcript segments");
+        }
+        return segments;
+      },
       24 * 60 * 60 * 1000, // stale window backs serve-stale-on-error.
     );
-    // An upstream success with zero usable segments means no transcript —
-    // 404 like the missing-panel throw, except a stale serve still returns
-    // its cached copy with warnings (serve-stale-on-error wins).
-    if (result.value.length === 0 && !result.stale) {
+    // A stale-empty copy (seeded before this guard) is still a 404 — an
+    // empty segment list is never served as 200.
+    if (result.value.length === 0) {
       return errorResponse(requestId, {
         code: "transcript_unavailable",
         message: "No transcript is available for this video.",

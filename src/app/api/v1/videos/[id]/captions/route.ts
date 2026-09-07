@@ -47,6 +47,10 @@ export async function GET(
 // track list is locale-independent and the cache key is just the video id.
 // Serve-stale-on-error: an upstream failure with a stale copy still returns
 // 200 with meta.cached + warnings; only a cold-miss failure is a typed error.
+// Empty-vs-stale contract (shared with transcript): stale wins. An empty fresh
+// fetch never populates the cache (it throws, so `cached` falls back to any
+// stale copy); a stale non-empty copy is served as 200 + `stale_served`
+// regardless of the fresh outcome, and only a cold-miss empty is 404.
 export async function handleCaptions(
   req: NextRequest,
   id: string,

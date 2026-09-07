@@ -12,7 +12,7 @@ import {
   storeContinuation,
   takeContinuation,
 } from "../continuations";
-import { classifyFeedError } from "../mappers";
+import { classifyFeedError, classifyTranscriptError } from "../mappers";
 
 // ---------------------------------------------------------------------------
 // Finding 1 (HIGH): single 8s fail-fast budget. The default deps lazily import
@@ -138,19 +138,62 @@ describe("finding 1: single 8s upstream budget (default deps)", () => {
 });
 
 describe("finding 2: empty transcript -> 404 transcript_unavailable", () => {
-  test("empty segments (fresh) -> 404 with actionable hint", async () => {
+  test("empty segments (fresh cold miss) -> 404 and caches nothing", async () => {
+    const id = "dQw4w9WgXcQ";
     const res = await handleTranscript(
-      req("http://x/api/v1/videos/dQw4w9WgXcQ/transcript"),
-      "dQw4w9WgXcQ",
+      req(`http://x/api/v1/videos/${id}/transcript`),
+      id,
       { fetchTranscript: async () => [] },
     );
     expect(res.status).toBe(404);
     const body = await res.json();
     expect(body.error.code).toBe("transcript_unavailable");
     expect(body.error.hint).toMatch(/hide the transcript panel/i);
+    expect(cacheGet(`transcript:v1:${id}`)).toBeUndefined();
   });
 
-  test("stale-empty serve still returns the cached copy (200 + warning)", async () => {
+  test("fresh-empty with stale copy -> stale wins (200 + warning)", async () => {
+    const id = "FFFFFFFFFFF";
+    const url = `http://x/api/v1/videos/${id}/transcript`;
+    const segments = [{ startSeconds: 0, text: "hi" }];
+    const primed = await (
+      await handleTranscript(req(url), id, {
+        fetchTranscript: async () => segments,
+      })
+    ).json();
+    expect(primed.data).toEqual(segments);
+    cacheSet(`transcript:v1:${id}`, primed.data, -1, 60 * 60 * 1000);
+    const res = await handleTranscript(req(url), id, {
+      fetchTranscript: async () => [],
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toEqual(segments);
+    expect(body.warnings[0].code).toBe("stale_served");
+  });
+
+  test("stale-empty copy -> 404, never 200", async () => {
+    const id = "GGGGGGGGGGG";
+    const url = `http://x/api/v1/videos/${id}/transcript`;
+    cacheSet(`transcript:v1:${id}`, [], -1, 60 * 60 * 1000);
+    const res = await handleTranscript(req(url), id, {
+      fetchTranscript: async () => {
+        throw new Error("429 Too Many Requests");
+      },
+    });
+    expect(res.status).toBe(404);
+    expect((await res.json()).error.code).toBe("transcript_unavailable");
+  });
+
+  test("empty-guard marker maps to 404 transcript_unavailable", () => {
+    expect(
+      classifyTranscriptError(
+        new Error("transcript_unavailable: no transcript segments"),
+      ),
+    ).toMatchObject({ code: "transcript_unavailable", status: 404 });
+  });
+
+  test("stale-nonempty on upstream failure -> 200 + warning", async () => {
     const id = "dQw4w9WgXcQ";
     const url = `http://x/api/v1/videos/${id}/transcript`;
     const segments = [{ startSeconds: 0, text: "hi" }];
@@ -269,6 +312,11 @@ describe("finding 4: comments_disabled", () => {
       "comments disabled for this video",
       "Comments turned off by the uploader",
       "comment unavailable for this video",
+      "Comments are turned off",
+      "Comments are disabled",
+      "Comments are unavailable for this video",
+      "Comments are not available",
+      "comments turned-off",
     ]) {
       expect(classifyFeedError(new Error(msg))).toMatchObject({
         code: "comments_disabled",
@@ -333,5 +381,25 @@ describe("finding 5: empty caption lists never cached, always 404", () => {
     });
     expect(res.status).toBe(404);
     expect((await res.json()).error.code).toBe("captions_disabled");
+  });
+
+  test("fresh-empty with stale copy -> stale wins (200 + warning)", async () => {
+    const id = "DDDDDDDDDDD";
+    const url = `http://x/api/v1/videos/${id}/captions`;
+    const tracks = [{ languageCode: "en", kind: "manual" as const }];
+    const primed = await (
+      await handleCaptions(req(url), id, {
+        fetchCaptions: async () => tracks,
+      })
+    ).json();
+    expect(primed.data).toEqual(tracks);
+    cacheSet(`captions:v1:${id}`, primed.data, -1, 60 * 60 * 1000);
+    const res = await handleCaptions(req(url), id, {
+      fetchCaptions: async () => [],
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toEqual(tracks);
+    expect(body.warnings[0].code).toBe("stale_served");
   });
 });
