@@ -1,36 +1,65 @@
 name: validate
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
-  group: validate-${{ github.event.pull_request.number }}
+  group: validate-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source without GitHub token
+        run: |
+          git clone --no-tags "https://github.com/${GITHUB_REPOSITORY}.git" .
+          git fetch --no-tags origin "${GITHUB_SHA}"
+          git checkout --detach "${GITHUB_SHA}"
 
       - uses: oven-sh/setup-bun@v2
 
       - name: Install deps
         run: bun install --frozen-lockfile
 
-      - name: Lint
-        run: bun run lint
+      - name: Run validation
+        id: validation
+        run: |
+          set +e
+          : > /tmp/validate-result.md
+          status=0
 
-      - name: Typecheck
-        run: bunx tsc --noEmit
+          run_check() {
+            label="$1"
+            shift
+            echo "### ${label}" | tee -a /tmp/validate-result.md
+            "$@" 2>&1 | tee -a /tmp/validate-result.md
+            code=${PIPESTATUS[0]}
+            echo "Exit code: ${code}" | tee -a /tmp/validate-result.md
+            echo | tee -a /tmp/validate-result.md
+            if [ "$code" -ne 0 ]; then
+              status=1
+            fi
+          }
 
-      - name: Unit tests
-        run: bun test
+          run_check "Lint" bun run lint
+          run_check "Typecheck" bunx tsc --noEmit
+          run_check "Unit tests" bun test
+          run_check "Build" bun run build
 
-      - name: Build
-        run: bun run build
+          exit "$status"
+
+      - name: Publish validation summary
+        if: always()
+        run: |
+          {
+            echo '## Validation result'
+            echo
+            cat /tmp/validate-result.md 2>/dev/null || echo 'No validation report was produced. Check the workflow logs.'
+          } >> "$GITHUB_STEP_SUMMARY"
