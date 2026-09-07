@@ -31,6 +31,7 @@ export async function handleHealth(
 ) {
   try {
     await deps.checkSession();
+    // Version mirrors package.json; keep in sync with openapi info.version.
     return successResponse(
       { ok: true, session: "ready", version: "0.1.0" },
       { requestId, cacheControl: CACHE_CONTROL.health },

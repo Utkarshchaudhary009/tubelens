@@ -9,7 +9,12 @@
 export interface ContinuationSearch {
   results: unknown[];
   has_continuation: boolean;
-  getContinuation: () => Promise<unknown>;
+  /**
+   * Returns the NEXT page as a new object; never mutates this one. Mirrors
+   * youtubei.js Search.getContinuation(), which returns a new Search built
+   * from the continuation response (results hold only the new items).
+   */
+  getContinuation: () => Promise<ContinuationSearch>;
 }
 
 export interface ContinuationEntry {
@@ -32,7 +37,10 @@ export function storeContinuation(
   search: ContinuationSearch,
   returned: number,
 ): string | null {
-  if (!search.has_continuation) {
+  // Store while there is anything left to serve: an upstream continuation OR
+  // unconsumed buffered items (a fetched page may hold more items than one
+  // response page serves). Otherwise there is nothing to page to -> null.
+  if (!search.has_continuation && returned >= search.results.length) {
     return null;
   }
   if (store.size >= MAX_CONTINUATIONS) {
@@ -66,6 +74,40 @@ export function takeContinuation(
 
 export function hasContinuation(cursor: string): boolean {
   return takeContinuation(cursor) !== undefined;
+}
+
+/** True while an entry still has buffered or upstream items to serve. */
+export function hasMoreResults(entry: ContinuationEntry): boolean {
+  return (
+    entry.returned < entry.search.results.length ||
+    entry.search.has_continuation
+  );
+}
+
+/**
+ * Forks a FRESH cursor from a live one for L0 cache hits. The fork snapshots
+ * the buffered results and delegates continuation to the same source page,
+ * but owns its own entry (offset + advancement) — serveContinuation advances
+ * entries copy-on-write (a fetched page is stored under a NEW cursor, the
+ * source entry is never mutated), so concurrent users of one cached query
+ * never share mutable pagination state. Returns null when the source is
+ * gone/expired/exhausted; callers degrade to next: null, never a dangle.
+ */
+export function forkContinuation(cursor: string | null): string | null {
+  if (!cursor) {
+    return null;
+  }
+  const entry = takeContinuation(cursor);
+  if (!entry || !hasMoreResults(entry)) {
+    return null;
+  }
+  const source = entry.search;
+  const fork: ContinuationSearch = {
+    results: [...source.results],
+    has_continuation: source.has_continuation,
+    getContinuation: () => source.getContinuation(),
+  };
+  return storeContinuation(fork, entry.returned);
 }
 
 export function dropContinuation(cursor: string): void {

@@ -1,7 +1,11 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { NextRequest } from "next/server";
 import { handleHealth } from "../../app/api/v1/health/route";
-import { handleSearch, type SearchDeps } from "../../app/api/v1/search/route";
+import {
+  handleSearch,
+  type SearchDeps,
+  toUpstreamSearchFilters,
+} from "../../app/api/v1/search/route";
 import { handleGetVideo } from "../../app/api/v1/videos/[id]/route";
 import { clearCache } from "../cache";
 import { type ContinuationSearch, clearContinuations } from "../continuations";
@@ -16,21 +20,17 @@ function req(url: string): NextRequest {
   return new NextRequest(url);
 }
 
-/** Fake youtubei Search over fixed node pages; continuation appends pages. */
+/** Fake youtubei Search over fixed immutable pages (mirrors the real
+ * Search.getContinuation, which returns a NEW page object per call). */
 function fakeSearch(
   pages: Array<Array<Record<string, unknown>>>,
 ): ContinuationSearch {
-  let idx = 0;
-  const search: ContinuationSearch = {
-    results: [...(pages[0] ?? [])],
-    has_continuation: pages.length > 1,
-    getContinuation: async () => {
-      idx += 1;
-      search.results = [...search.results, ...(pages[idx] ?? [])];
-      search.has_continuation = idx < pages.length - 1;
-    },
-  };
-  return search;
+  const page = (idx: number): ContinuationSearch => ({
+    results: [...(pages[idx] ?? [])],
+    has_continuation: idx < pages.length - 1,
+    getContinuation: async () => page(idx + 1),
+  });
+  return page(0);
 }
 
 const node = (id: string, title: string) => ({ type: "Video", id, title });
@@ -65,9 +65,7 @@ describe("search handler (mocked upstream)", () => {
         [node(`${q}-1`, "T1"), node(`${q}-2`, "T2")],
         [node(`${q}-3`, "T3")],
       ]),
-    continueSearch: async (s) => {
-      await s.getContinuation();
-    },
+    continueSearch: async (s) => s.getContinuation(),
   };
 
   test("missing q without cursor -> 400 missing_query, upstream untouched", async () => {
@@ -77,7 +75,9 @@ describe("search handler (mocked upstream)", () => {
         called = true;
         throw new Error("must not run");
       },
-      continueSearch: async () => {},
+      continueSearch: async () => {
+        throw new Error("must not continue");
+      },
     });
     expect(res.status).toBe(400);
     expect((await res.json()).error.code).toBe("missing_query");
@@ -138,12 +138,59 @@ describe("search handler (mocked upstream)", () => {
     expect(b2.page.next).toBeNull();
   });
 
+  test("two identical queries get independent cursors (no shared mutation)", async () => {
+    const url = "http://x/api/v1/search?q=shared&limit=2";
+    const b1 = await (await handleSearch(req(url), deps)).json();
+    const b2 = await (await handleSearch(req(url), deps)).json();
+    expect(b2.meta.cached).toBe(true);
+    expect(b2.data).toEqual(b1.data);
+    expect(typeof b1.page.next).toBe("string");
+    expect(typeof b2.page.next).toBe("string");
+    expect(b2.page.next).not.toBe(b1.page.next);
+
+    // Walking the first cursor to completion must not disturb the second:
+    // both independently yield page 2.
+    const w1 = await (
+      await handleSearch(
+        req(`http://x/api/v1/search?cursor=${b1.page.next}&limit=2`),
+        deps,
+      )
+    ).json();
+    expect(w1.data.map((d: { id: string }) => d.id)).toEqual(["shared-3"]);
+    const w2 = await (
+      await handleSearch(
+        req(`http://x/api/v1/search?cursor=${b2.page.next}&limit=2`),
+        deps,
+      )
+    ).json();
+    expect(w2.data.map((d: { id: string }) => d.id)).toEqual(["shared-3"]);
+  });
+
+  test("default type is all and maps to an unfiltered upstream search", async () => {
+    expect(toUpstreamSearchFilters("all")).toEqual({});
+    expect(toUpstreamSearchFilters("video")).toEqual({ type: "video" });
+    expect(toUpstreamSearchFilters("channel")).toEqual({ type: "channel" });
+    expect(toUpstreamSearchFilters("playlist")).toEqual({ type: "playlist" });
+
+    let seen: string | undefined;
+    await handleSearch(req("http://x/api/v1/search?q=deftype&limit=1"), {
+      runSearch: async (_q, type) => {
+        seen = type;
+        return fakeSearch([[node("x-1", "T")]]);
+      },
+      continueSearch: async (s) => s.getContinuation(),
+    });
+    expect(seen).toBe("all");
+  });
+
   test("upstream failure -> 502 upstream_degraded with hint", async () => {
     const res = await handleSearch(req("http://x/api/v1/search?q=boom"), {
       runSearch: async () => {
         throw new Error("upstream down");
       },
-      continueSearch: async () => {},
+      continueSearch: async () => {
+        throw new Error("must not continue");
+      },
     });
     expect(res.status).toBe(502);
     const body = await res.json();
