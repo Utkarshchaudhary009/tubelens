@@ -1,0 +1,16 @@
+---
+title: API Overview
+description: Base URL, auth, pagination, rate limits, and envelope conventions.
+---
+
+# API Overview
+
+- **Base URL:** `/api/v1` — full contract in `openapi.json` (served at `/api/v1/openapi.json` when published).
+- **Auth:** none for public read endpoints (future: API key via `Authorization: Bearer`).
+- **Envelope:** success `{ data, page: { next }, meta, warnings }`; errors `{ error: { code, message, hint, status } }`.
+- **Pagination:** opaque `cursor` + `limit`; empty page is `data: []` + `page.next: null` (never 404).
+- **Headers:** every response carries `X-Request-Id` (+ `meta.requestId`) and `X-RateLimit-*`; 429s add `Retry-After` + `code: rate_limited`.
+- **Rate limits:** per-endpoint budgets; back off on 429 using `Retry-After`.
+- **Caching:** `Cache-Control` per endpoint; stale serves `meta.cached: true` + `warnings[]`.
+
+See [Errors](/docs/errors) for codes and retry guidance.

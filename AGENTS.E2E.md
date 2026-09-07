@@ -14,7 +14,7 @@ or server lifecycle; never start your own dev server.
 
 ## Routes under test
 
-- Resolve the phase under test from `docs/API_ROADMAP.md` (the `[~]`
+- Resolve the phase under test from `plans/API_ROADMAP.md` (the `[~]`
   in-progress phase, or the phase whose routes changed in this PR).
 - Test EVERY route in that phase over real HTTP, plus `/api/v1/health` and
   `/api/v1/openapi.json` (must list the phase's routes).
@@ -27,7 +27,7 @@ or server lifecycle; never start your own dev server.
   — stable snake_case `code` + one-sentence actionable `hint`, never a bare
   500 or stack trace.
 - Headers: `X-Request-Id` (+ `meta.requestId`), `X-RateLimit-*` (`Retry-After`
-  + `code: rate_limited` on 429), `Cache-Control` per `docs/CACHING.md` TTLs;
+  + `code: rate_limited` on 429), `Cache-Control` per `plans/CACHING.md` TTLs;
   stale serves `meta.cached: true` + `warnings[]`.
 - Defaults: `limit` 20 / max 50, `region` US, `lang` en.
 

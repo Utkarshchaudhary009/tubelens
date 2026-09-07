@@ -17,7 +17,8 @@ API-first YouTube data API: **Next.js App Router Route Handlers + youtubei.ts on
 - `src/app/api/v1/` — all endpoints (Route Handlers only, no pages per phase).
 - `src/lib/youtube.ts` — youtubei.ts **singleton, `import "server-only"`**; never instantiate per request.
 - `src/lib/{envelope,cache,errors}.ts` — shared envelope, cache headers, typed errors.
-- `docs/API_ROADMAP.md` — **single source of truth** (10 phases, 38 endpoints); `docs/DX_PRINCIPLES.md` (envelope, cursor, error+hint); `docs/CACHING.md` (L0/L1/L2 ladder + TTLs).
+- `plans/API_ROADMAP.md` — **owner-only single source of truth** (10 phases, 38 endpoints); `plans/DX_PRINCIPLES.md` (envelope, cursor, error+hint); `plans/CACHING.md` (L0/L1/L2 ladder + TTLs).
+- `docs/*.mdx` — **public developer docs** (Fumadocs/MDX); docs bot owns `docs/**` + `openapi.json`, never `plans/`.
 
 ## Commands
 
@@ -26,14 +27,14 @@ API-first YouTube data API: **Next.js App Router Route Handlers + youtubei.ts on
 
 ## WORKFLOW (core)
 
-Every phase follows this lifecycle. `docs/API_ROADMAP.md` is the single source of truth — never start a phase until it accurately describes what is to be built; keep code, tests, and docs in sync.
+Every phase follows this lifecycle. `plans/API_ROADMAP.md` is the single source of truth — never start a phase until it accurately describes what is to be built; keep code, tests, and docs in sync.
 
-1. **Plan** — read the phase in `docs/API_ROADMAP.md`; update it first if unclear/outdated, then implement.
+1. **Plan** — read the phase in `plans/API_ROADMAP.md`; update it first if unclear/outdated, then implement.
 2. **Code** — implement only the current phase. Ship tests in the same change (core behavior, edge cases, error conditions, envelope, cursor, cache headers).
 3. **Validation gates** — `bun run lint` + `npx tsc --noEmit` + `bun test` must all pass.
 4. **Review subagents** — launch a review pass for bugs, incorrect behavior, missing edge cases, reliability, complexity, error handling (bare 500s, missing hints), envelope/cursor/header drift, missing tests, regressions.
 5. **Fix** — fix genuine issues only; judge each finding, keep fixes simple, re-run validation gates.
-6. **PR creation** — one branch per phase → commit implementation + tests → push → create PR (one coherent phase per PR).
+6. **PR creation** — ALWAYS load skill `commit-pr-writing` before any commit/PR/push, then: one branch per phase → commit implementation + tests → push → create PR (one coherent phase per PR).
 7. **Wait 10 minutes** for GitHub bots / automated reviewers (including the e2e bot) to comment.
 8. **Fix bot findings** — fix genuine issues, ignore incorrect/irrelevant feedback, keep it simple; re-run validation gates and let CI re-verify.
 
@@ -48,12 +49,12 @@ Simple over clever; small abstractions; no paid infra; `limit` default 20/max 50
 1. `export const runtime = "nodejs"` (Innertube needs Node, never edge).
 2. Validate query/path with zod; failures → 400 `{ error: { code, message, hint, status } }`.
 3. Upstream call wrapped in 8s fail-fast (`AbortSignal.timeout(8000)`).
-4. Set `Cache-Control` per `CACHING.md` TTL table; stale responses set `meta.cached: true` + `warnings[]`.
+4. Set `Cache-Control` per `plans/CACHING.md` TTL table; stale responses set `meta.cached: true` + `warnings[]`.
 5. Success shape `{ data, page: { next }, meta, warnings }`; errors use code + one-sentence `hint`, never stack traces.
 
 ## Quality gates (per phase)
 
-Validation gates clean → review pass → genuine fixes → PR (one branch per phase) → 10-min bot window → fix + re-verify. Never let code, tests, and `docs/` drift.
+Validation gates clean → review pass → genuine fixes → PR (one branch per phase) → 10-min bot window → fix + re-verify. Never let code, tests, `plans/`, and `docs/` drift.
 
 ### Review gate checklist
 

@@ -1,0 +1,16 @@
+---
+title: Quickstart
+description: Call your first TubeLens endpoint in under a minute.
+---
+
+# Quickstart
+
+```bash
+curl "http://localhost:3000/api/v1/health"
+curl "http://localhost:3000/api/v1/search?q=lofi&limit=20"
+```
+
+Defaults: `limit` 20 / max 50, `region` US, `lang` en. Paginate with `?cursor=&limit=`.
+
+Next: [API Overview](/docs/api/overview) · [Errors](/docs/errors).
+Full contract: future `/api/v1/openapi.json` + `openapi.json`.

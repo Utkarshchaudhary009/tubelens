@@ -1,0 +1,18 @@
+---
+title: Errors
+description: Error codes, hints, headers, and retry guidance.
+---
+
+# Errors
+
+Shape: `{ error: { code, message, hint, status } }` — stable snake_case `code`, one-sentence actionable `hint`, never stack traces.
+
+| Status | Code | Retry |
+| --- | --- | --- |
+| 400 | `invalid_params` | Fix query/path per `openapi.json`, do not retry as-is |
+| 404 | `not_found` | Only for missing resources (empty pages are 200) |
+| 429 | `rate_limited` | Honor `Retry-After`, back off exponentially |
+| 502 | `upstream_unavailable` | Retry with backoff; stale cache may serve `meta.cached: true` |
+| 500 | `internal_error` | Retry once with new `X-Request-Id`, then report |
+
+Always echo `X-Request-Id` when reporting failures.
