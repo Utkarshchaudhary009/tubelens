@@ -80,6 +80,25 @@ describe("openapi stub", () => {
     expect(errorBody.required).toContain("meta");
   });
 
+  test("404 descriptions document disabled/unavailable + not-found codes", () => {
+    const doc = buildOpenApiDocument();
+    type Paths = keyof typeof doc.paths;
+    const get404 = (path: Paths) =>
+      (
+        doc.paths[path].get.responses as Record<string, { description: string }>
+      )[404].description;
+    expect(get404("/videos/{id}/comments")).toContain("comments_disabled");
+    expect(get404("/videos/{id}/comments")).toContain("video_not_found");
+    expect(get404("/videos/{id}/captions")).toContain("captions_disabled");
+    expect(get404("/videos/{id}/captions")).toContain("video_not_found");
+    expect(get404("/videos/{id}/transcript")).toContain(
+      "transcript_unavailable",
+    );
+    expect(get404("/videos/{id}/transcript")).toContain("video_not_found");
+    expect(get404("/videos/{id}/related")).toContain("video_not_found");
+  });
+  });
+
   test("GET serves the raw spec (tooling-compatible) with headers", async () => {
     const res = await GET(
       new NextRequest("http://localhost/api/v1/openapi.json"),

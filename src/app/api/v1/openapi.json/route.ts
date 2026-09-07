@@ -263,7 +263,8 @@ export function buildOpenApiDocument() {
               content: { "application/json": { schema: { $ref: errorRef } } },
             },
             404: {
-              description: "video_not_found.",
+              description:
+                "comments_disabled or video_not_found; hide the comments panel when disabled.",
               content: { "application/json": { schema: { $ref: errorRef } } },
             },
             429: {
