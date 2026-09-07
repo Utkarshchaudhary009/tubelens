@@ -12,6 +12,9 @@ const store = new Map<string, Entry>();
 
 const MAX_SIZE = 500;
 
+/** In-flight fetches by key for cold-key request coalescing. */
+const inflight = new Map<string, Promise<unknown>>();
+
 function evictIfNeeded(): void {
   if (store.size <= MAX_SIZE) {
     return;
@@ -56,9 +59,10 @@ export function cacheSet(
   });
 }
 
-/** Test helper — clears the whole L0 store. */
+/** Test helper — clears the whole L0 store (plus in-flight coalescing). */
 export function clearCache(): void {
   store.clear();
+  inflight.clear();
 }
 
 export interface CachedResult<T> {
@@ -75,6 +79,9 @@ export interface CachedResult<T> {
  * upstream failure propagates to the caller; on failure with a stale copy
  * available, the stale copy is served so callers can set meta.cached +
  * warnings instead of returning a bare 500.
+ *
+ * Concurrent misses for one key share a single in-flight fetch (stored per
+ * key, removed on settle) so a cold-key burst costs one upstream call.
  */
 export async function cached<T>(
   key: string,
@@ -86,14 +93,28 @@ export async function cached<T>(
   if (found && !found.stale) {
     return { value: found.value, hit: true, stale: false };
   }
-  try {
-    const value = await fetcher();
-    cacheSet(key, value, ttlMs, staleMs);
-    return { value, hit: false, stale: false };
-  } catch (err) {
-    if (found) {
-      return { value: found.value, hit: true, stale: true };
-    }
-    throw err;
+  const ongoing = inflight.get(key);
+  if (ongoing) {
+    return (await ongoing) as CachedResult<T>;
   }
+  let task: Promise<CachedResult<T>> | undefined;
+  const runner = (async (): Promise<CachedResult<T>> => {
+    try {
+      const value = await fetcher();
+      cacheSet(key, value, ttlMs, staleMs);
+      return { value, hit: false, stale: false };
+    } catch (err) {
+      if (found) {
+        return { value: found.value, hit: true, stale: true };
+      }
+      throw err;
+    } finally {
+      if (task !== undefined && inflight.get(key) === task) {
+        inflight.delete(key);
+      }
+    }
+  })();
+  task = runner;
+  inflight.set(key, runner);
+  return runner;
 }
