@@ -46,7 +46,7 @@ route only when the backend source or shape genuinely differs.
 **Goal:** Prove the product thesis with the smallest useful API: find anything,
 read anything, resolve any URL, and report service health.
 
-**Status:** `[~]` in progress — implementation pushed on `phase-1-core-validation` (PR blocked: repo disallows Actions PR creation)
+**Status:** `[x]` done — shipped via PR #4 (merged 2026-09-08): health, search, videos/:id, resolve, openapi.json live with 143 unit tests + e2e PASS on live upstream. Note: 7-day production health/p95 tail validation runs post-merge before Phase 2 closes out.
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
