@@ -70,7 +70,7 @@ read anything, resolve any URL, and report service health.
 **Goal:** Power a complete watch page backend: what to watch next, what people
 say, and what is spoken.
 
-**Status:** `[ ]` not started
+**Status:** `[~]` in progress — implementation on `phase-2-watch-essentials`.
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
