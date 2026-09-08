@@ -135,7 +135,17 @@ export async function handleSearch(
         : [],
       cacheControl: CACHE_CONTROL.search,
     });
-  } catch {
+  } catch (err) {
+    // Timeouts/aborts surface as 504 upstream_timeout per the openapi spec
+    // (same signal as videos/[id]'s classifier); everything else is 502.
+    if (isUpstreamTimeout(err)) {
+      return errorResponse(requestId, {
+        code: "upstream_timeout",
+        message: "Search timed out upstream.",
+        hint: "Retry shortly; include X-Request-Id in bug reports.",
+        status: 504,
+      });
+    }
     return errorResponse(requestId, {
       code: "upstream_degraded",
       message: "Search failed upstream.",
@@ -143,6 +153,16 @@ export async function handleSearch(
       status: 502,
     });
   }
+}
+
+/**
+ * Timeout/abort signal matching videos/[id]'s classifier
+ * (classifyVideoError): the 8s fail-fast surfaces as TimeoutError/AbortError.
+ */
+function isUpstreamTimeout(err: unknown): boolean {
+  const raw =
+    err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+  return /timeout|timed out|abort|TimeoutError|AbortError/i.test(raw);
 }
 
 async function serveContinuation(

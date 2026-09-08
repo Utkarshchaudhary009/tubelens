@@ -95,7 +95,16 @@ export async function cached<T>(
   }
   const ongoing = inflight.get(key);
   if (ongoing) {
-    return (await ongoing) as CachedResult<T>;
+    try {
+      return (await ongoing) as CachedResult<T>;
+    } catch (err) {
+      // Joined a shared fetch that failed: serve our own stale copy when we
+      // hold one (cold-miss callers without stale still see the throw).
+      if (found) {
+        return { value: found.value, hit: true, stale: true };
+      }
+      throw err;
+    }
   }
   let task: Promise<CachedResult<T>> | undefined;
   const runner = (async (): Promise<CachedResult<T>> => {

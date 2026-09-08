@@ -77,6 +77,30 @@ describe("L0 cache", () => {
     expect(cacheGet("k6")).toMatchObject({ value: "shared" });
   });
 
+  test("stale holder awaiting a coalesced fetch is served stale on failure", async () => {
+    let reject!: (e: Error) => void;
+    const gate = new Promise<string>((_, rej) => {
+      reject = rej;
+    });
+    // Cold miss opens the shared in-flight fetch.
+    const first = cached<string>("k8", 60_000, () => gate);
+    await new Promise((r) => setTimeout(r, 5));
+    // A stale copy lands while the fetch is in flight; the second caller
+    // holds it and coalesces onto the same fetch.
+    cacheSet("k8", "stale-copy", 1, 60_000);
+    await new Promise((r) => setTimeout(r, 5));
+    const second = cached<string>("k8", 1, () => gate);
+    reject(new Error("upstream down"));
+    // Cold-miss opener has no stale: still throws.
+    await expect(first).rejects.toThrow("upstream down");
+    // Stale-holding joiner gets the stale copy instead of the throw.
+    await expect(second).resolves.toMatchObject({
+      value: "stale-copy",
+      hit: true,
+      stale: true,
+    });
+  });
+
   test("failed fetch clears the in-flight slot so the next call retries", async () => {
     let calls = 0;
     await expect(

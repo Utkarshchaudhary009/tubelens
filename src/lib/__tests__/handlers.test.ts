@@ -227,6 +227,23 @@ describe("search handler (mocked upstream)", () => {
     expect(typeof body.error.hint).toBe("string");
   });
 
+  test("upstream timeout -> 504 upstream_timeout with hint", async () => {
+    const err = new Error("The operation was aborted due to timeout");
+    err.name = "AbortError";
+    const res = await handleSearch(req("http://x/api/v1/search?q=slow"), {
+      runSearch: async () => {
+        throw err;
+      },
+      continueSearch: async () => {
+        throw new Error("must not continue");
+      },
+    });
+    expect(res.status).toBe(504);
+    const body = await res.json();
+    expect(body.error.code).toBe("upstream_timeout");
+    expect(typeof body.error.hint).toBe("string");
+  });
+
   test("continuation failure -> [] + next: null with warning", async () => {
     const b1 = await (
       await handleSearch(req("http://x/api/v1/search?q=failcont&limit=2"), deps)
