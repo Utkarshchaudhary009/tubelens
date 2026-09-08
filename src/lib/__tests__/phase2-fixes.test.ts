@@ -302,7 +302,7 @@ describe("finding 3: cursors bound to video id", () => {
     expect(takeContinuation(cursor)?.scope).toBe(videoA);
     expect(forkContinuation(cursor, videoB)).toBeNull();
     expect(forkContinuation(cursor, videoA)).not.toBeNull();
-    // Unscoped (legacy/search) entries still fork under any scope.
+    // Unscoped legacy entries still fork under any scope.
     const open = storeContinuation(fakeFeed([[vid("x", "X")]]), 0);
     if (open === null) {
       throw new Error("expected a cursor");
@@ -467,6 +467,18 @@ describe("review: narrow captions/transcript classifiers", () => {
       code: "transcript_unavailable",
       status: 404,
     });
+    // get_transcript 5xx/network failures are outages, not missing
+    // transcripts: they fall through to 502/504, never 404.
+    for (const msg of [
+      "Request to https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false failed with status code 503",
+      "Request to https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false failed with status code 500",
+      "get_transcript request failed: socket hang up",
+    ]) {
+      expect(classifyTranscriptError(new Error(msg))).toMatchObject({
+        code: "upstream_degraded",
+        status: 502,
+      });
+    }
     // getInfo-stage failures still report the video, not the transcript.
     expect(
       classifyTranscriptError(new Error("NOT_FOUND: video")),
@@ -730,5 +742,72 @@ describe("review: paginated cursor pages are private/no-store", () => {
       commentsDeps,
     );
     expect(res.headers.get("Cache-Control")).toBe("private, no-store");
+  });
+
+  test("search ?cursor= with foreign watch cursor -> [] + null, private no-store", async () => {
+    const video = "HHHHHHHHHHH";
+    const rFirst = await (
+      await handleRelated(
+        req(`http://x/api/v1/videos/${video}/related?limit=1`),
+        video,
+        relatedDeps,
+      )
+    ).json();
+    expect(typeof rFirst.page.next).toBe("string");
+    const searchDeps = {
+      runSearch: async () => fakeFeed([[vid("s1", "S1")]]),
+      continueSearch: async (p: ContinuationSearch) => p.getContinuation(),
+    };
+    const res = await handleSearch(
+      req(`http://x/api/v1/search?cursor=${rFirst.page.next}&limit=1`),
+      searchDeps,
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toEqual([]);
+    expect(body.page).toEqual({ next: null });
+    expect(res.headers.get("Cache-Control")).toBe("private, no-store");
+  });
+});
+
+describe("review: stale never served on video_not_found", () => {
+  test("captions stale + refresh proves video private -> 404 video_not_found", async () => {
+    const id = "DDDDDDDDDDD";
+    const url = `http://x/api/v1/videos/${id}/captions`;
+    const tracks = [{ languageCode: "en", kind: "manual" as const }];
+    const primed = await (
+      await handleCaptions(req(url), id, {
+        fetchCaptions: async () => tracks,
+      })
+    ).json();
+    expect(primed.data).toEqual(tracks);
+    cacheSet(`captions:v1:${id}`, primed.data, -1, 60 * 60 * 1000);
+    const res = await handleCaptions(req(url), id, {
+      fetchCaptions: async () => {
+        throw new Error("This video is private");
+      },
+    });
+    expect(res.status).toBe(404);
+    expect((await res.json()).error.code).toBe("video_not_found");
+  });
+
+  test("transcript stale + refresh proves video deleted -> 404 video_not_found", async () => {
+    const id = "EEEEEEEEEEE";
+    const url = `http://x/api/v1/videos/${id}/transcript`;
+    const segments = [{ startSeconds: 0, text: "hi" }];
+    const primed = await (
+      await handleTranscript(req(url), id, {
+        fetchTranscript: async () => segments,
+      })
+    ).json();
+    expect(primed.data).toEqual(segments);
+    cacheSet(`transcript:v1:${id}`, primed.data, -1, 60 * 60 * 1000);
+    const res = await handleTranscript(req(url), id, {
+      fetchTranscript: async () => {
+        throw new Error("Video deleted or removed");
+      },
+    });
+    expect(res.status).toBe(404);
+    expect((await res.json()).error.code).toBe("video_not_found");
   });
 });

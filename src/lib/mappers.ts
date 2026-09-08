@@ -423,7 +423,7 @@ export function mapComment(thread: unknown): CommentDTO | null {
   if (typeof c.is_pinned === "boolean") {
     dto.isPinned = c.is_pinned;
   } else if (
-    typeof t.is_pinned === "boolean" ||
+    t.is_pinned === true ||
     (t.rendering_priority as string) === "RENDERING_PRIORITY_PINNED_COMMENT"
   ) {
     dto.isPinned = true;
@@ -652,18 +652,18 @@ export function classifyCaptionsError(err: unknown): ClassifiedVideoError {
 
 /**
  * Only transcript-specific signals (missing engagement/transcript panel,
- * transcript continuation, a failed get_transcript fetch for an
+ * transcript continuation, a 4xx get_transcript fetch for an
  * already-resolved video, or disabled captions) -> 404
  * transcript_unavailable with a hint telling callers to hide the panel.
- * Everything else delegates to classifyVideoError, so private/deleted videos
- * report video_not_found and transient failures report 502/504 instead of a
- * misleading transcript_unavailable.
+ * get_transcript 5xx/network failures fall through (no 4xx status), so
+ * outages still report 502/504 via classifyVideoError, as do private/deleted
+ * videos (video_not_found) — never a misleading transcript_unavailable.
  */
 export function classifyTranscriptError(err: unknown): ClassifiedVideoError {
   const raw =
     err instanceof Error ? `${err.name}: ${err.message}` : String(err);
   if (
-    /transcript_unavailable|get_transcript|transcript\s+(panel|continuation|not found|unavailable|not available)|no transcript|engagement panels?|captions?_disabled|captions?\s+disabled/i.test(
+    /transcript_unavailable|get_transcript.*?status code 4\d\d|transcript\s+(panel|continuation|not found|unavailable|not available)|no transcript|engagement panels?|captions?_disabled|captions?\s+disabled/i.test(
       raw,
     )
   ) {

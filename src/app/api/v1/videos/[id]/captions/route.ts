@@ -84,6 +84,10 @@ export async function handleCaptions(
         return tracks;
       },
       24 * 60 * 60 * 1000, // stale window backs serve-stale-on-error.
+      // Definitive not-found errors must NOT serve stale — only transient
+      // failures (timeouts, 429s, 5xx) and disabled-track empties may.
+      // Mirrors the videos/:id predicate via this route's classifier.
+      (err) => classifyCaptionsError(err).code !== "video_not_found",
     );
     // A stale-empty copy (seeded before this guard) is still a 404 — an
     // empty track list is never served as 200.

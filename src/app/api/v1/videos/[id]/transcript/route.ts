@@ -87,6 +87,10 @@ export async function handleTranscript(
         return segments;
       },
       24 * 60 * 60 * 1000, // stale window backs serve-stale-on-error.
+      // Definitive not-found errors must NOT serve stale — only transient
+      // failures (timeouts, 429s, 5xx) and unavailable-transcript empties may.
+      // Mirrors the videos/:id predicate via this route's classifier.
+      (err) => classifyTranscriptError(err).code !== "video_not_found",
     );
     // A stale-empty copy (seeded before this guard) is still a 404 — an
     // empty segment list is never served as 200.

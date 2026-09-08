@@ -311,6 +311,30 @@ describe("comments handler (mocked upstream)", () => {
     });
     expect(body.meta.requestId).toBe("phase2");
   });
+
+  test("isPinned requires an explicit true (outer false never pins)", () => {
+    const bare = (outer: Record<string, unknown>) => ({
+      type: "CommentThread",
+      ...outer,
+      comment: { comment_id: "c1", content: { text: "hi" } },
+    });
+    // Outer explicitly not pinned + nested omits the field -> unset.
+    expect(mapComment(bare({ is_pinned: false }))?.isPinned).toBeUndefined();
+    // Outer explicitly pinned + nested omits the field -> pinned.
+    expect(mapComment(bare({ is_pinned: true }))?.isPinned).toBe(true);
+    // Nested explicit false wins over an outer true.
+    expect(
+      mapComment({
+        type: "CommentThread",
+        is_pinned: true,
+        comment: {
+          comment_id: "c1",
+          content: { text: "hi" },
+          is_pinned: false,
+        },
+      })?.isPinned,
+    ).toBe(false);
+  });
 });
 
 describe("captions handler (mocked upstream)", () => {

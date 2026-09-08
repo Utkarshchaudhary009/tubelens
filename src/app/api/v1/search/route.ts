@@ -200,14 +200,16 @@ async function serveContinuation(
   }
   // A cursor minted by another endpoint (e.g. a video-scoped watch cursor)
   // is rejected the same way — the foreign cursor is left untouched so it
-  // still works under its own endpoint.
+  // still works under its own endpoint. Like every cursor response, this is
+  // private/no-store: cursors are process-local, so a CDN-cached rejection
+  // would replay an opaque cursor that is meaningless elsewhere.
   if (entry.scope !== undefined && entry.scope !== SEARCH_SCOPE) {
     return successResponse([], {
       requestId,
       next: null,
       region,
       lang,
-      cacheControl: CACHE_CONTROL.search,
+      cacheControl: CACHE_CONTROL.noStore,
     });
   }
   // Buffered items remain on this page object: serve from this entry's own
