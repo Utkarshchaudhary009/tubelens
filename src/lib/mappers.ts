@@ -607,11 +607,22 @@ export function classifyVideoError(err: unknown): ClassifiedVideoError {
  * video failures: unknown/private/deleted -> 404 video_not_found; timeouts
  * -> 504 upstream_timeout; everything else -> 502 upstream_degraded.
  * Comments-disabled upstreams get their own 404 so callers can hide the
- * panel instead of reporting a missing video.
+ * panel instead of reporting a missing video. youtubei throws
+ * "The comments page did not have any content" when the video id does not
+ * resolve; an existing video with zero comments returns an empty feed
+ * (200 data:[] terminal page), never this throw — so it is a missing video.
  */
 export function classifyFeedError(err: unknown): ClassifiedVideoError {
   const raw =
     err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+  if (/did not have any content/i.test(raw)) {
+    return {
+      code: "video_not_found",
+      message: "Video not found or unavailable.",
+      hint: "Check the video id, or resolve the URL via /api/v1/resolve first.",
+      status: 404,
+    };
+  }
   if (
     /comments?.*?(disabled|turned.?off|unavailable|not available)/i.test(raw)
   ) {

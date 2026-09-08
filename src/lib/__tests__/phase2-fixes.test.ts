@@ -358,6 +358,18 @@ describe("finding 4: comments_disabled", () => {
       status: 404,
     });
   });
+
+  test("missing-video empty comments page -> 404 video_not_found", () => {
+    expect(
+      classifyFeedError(
+        new Error("The comments page did not have any content"),
+      ),
+    ).toMatchObject({ code: "video_not_found", status: 404 });
+    // Disabled-comment signals keep their own code.
+    expect(classifyFeedError(new Error("Comments are disabled"))).toMatchObject(
+      { code: "comments_disabled", status: 404 },
+    );
+  });
 });
 
 describe("finding 5: empty caption lists never cached, always 404", () => {
