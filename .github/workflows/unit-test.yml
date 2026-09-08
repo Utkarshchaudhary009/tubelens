@@ -33,29 +33,41 @@ jobs:
 
       - name: Lint
         run: |
-          bun run lint > /tmp/unit-test-lint.log 2>&1
-          code=$?
+          if bun run lint > /tmp/unit-test-lint.log 2>&1; then
+            code=0
+          else
+            code=$?
+          fi
           cat /tmp/unit-test-lint.log
           exit $code
 
       - name: Typecheck
         run: |
-          bunx tsc --noEmit > /tmp/unit-test-tsc.log 2>&1
-          code=$?
+          if bunx tsc --noEmit > /tmp/unit-test-tsc.log 2>&1; then
+            code=0
+          else
+            code=$?
+          fi
           cat /tmp/unit-test-tsc.log
           exit $code
 
       - name: Unit tests
         run: |
-          bun test > /tmp/unit-test-test.log 2>&1
-          code=$?
+          if bun test > /tmp/unit-test-test.log 2>&1; then
+            code=0
+          else
+            code=$?
+          fi
           cat /tmp/unit-test-test.log
           exit $code
 
       - name: Build
         run: |
-          bun run build > /tmp/unit-test-build.log 2>&1
-          code=$?
+          if bun run build > /tmp/unit-test-build.log 2>&1; then
+            code=0
+          else
+            code=$?
+          fi
           cat /tmp/unit-test-build.log
           exit $code
 
