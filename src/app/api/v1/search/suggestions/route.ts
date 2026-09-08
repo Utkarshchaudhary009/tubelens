@@ -2,6 +2,7 @@ import type { NextRequest, NextResponse } from "next/server";
 import { cached } from "@/lib/cache";
 import { CACHE_CONTROL, getRequestId, successResponse } from "@/lib/envelope";
 import { errorResponse } from "@/lib/errors";
+import { isUpstreamTimeout } from "@/lib/mappers";
 import { parseSuggestionsParams } from "@/lib/validate";
 
 export const runtime = "nodejs";
@@ -92,11 +93,4 @@ export async function handleSuggestions(
       status: 502,
     });
   }
-}
-
-/** Timeout/abort signal matching /search's classifier. */
-function isUpstreamTimeout(err: unknown): boolean {
-  const raw =
-    err instanceof Error ? `${err.name}: ${err.message}` : String(err);
-  return /timeout|timed out|abort|TimeoutError|AbortError/i.test(raw);
 }

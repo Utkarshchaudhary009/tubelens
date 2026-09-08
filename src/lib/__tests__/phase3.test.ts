@@ -5,7 +5,11 @@ import { buildOpenApiDocument } from "../../app/api/v1/openapi.json/route";
 import { handleSuggestions } from "../../app/api/v1/search/suggestions/route";
 import { cacheSet, clearCache } from "../cache";
 import { type ContinuationSearch, clearContinuations } from "../continuations";
-import { classifyHashtagError, mapSearchItem } from "../mappers";
+import {
+  classifyHashtagError,
+  isUpstreamTimeout,
+  mapSearchItem,
+} from "../mappers";
 import { parseHashtagTag, parseSuggestionsParams } from "../validate";
 
 beforeEach(() => {
@@ -116,6 +120,12 @@ describe("hashtag tag validator", () => {
     expect(parseHashtagTag("#hip-hop")).toEqual({ ok: true, value: "hip-hop" });
     expect(parseHashtagTag("音楽").ok).toBe(true);
   });
+
+  test("accepts combining marks: decomposed accents and Hindi matras", () => {
+    // e + U+0301 (combining acute) — NFD form of é.
+    expect(parseHashtagTag("cafe\u0301").ok).toBe(true);
+    expect(parseHashtagTag("संगीत").ok).toBe(true);
+  });
 });
 
 describe("phase 3 mappers", () => {
@@ -152,7 +162,7 @@ describe("phase 3 mappers", () => {
 
   test("classifyHashtagError: 404 / 504 / 502", () => {
     expect(
-      classifyHashtagError(new Error("NOT_FOUND: hashtag page")),
+      classifyHashtagError(new Error("hashtag not found: xyz")),
     ).toMatchObject({ code: "hashtag_not_found", status: 404 });
     expect(
       classifyHashtagError(new Error("No videos found for #xyz")),
@@ -186,6 +196,39 @@ describe("phase 3 mappers", () => {
     expect(
       classifyHashtagError(new Error("request failed with status 404")),
     ).toMatchObject({ code: "upstream_degraded", status: 502 });
+  });
+
+  test("transient error merely mentioning 'hashtag page' stays 502/504", () => {
+    // A parse/render failure on the tag page is transient: it must not
+    // become a definitive hashtag_not_found (which would 404 and refuse
+    // stale). Only explicit not-found signals in hashtag context 404.
+    expect(
+      classifyHashtagError(
+        new Error("failed to parse hashtag page: bad token"),
+      ),
+    ).toMatchObject({ code: "upstream_degraded", status: 502 });
+    const slow = new Error("timed out loading hashtag page");
+    slow.name = "TimeoutError";
+    expect(classifyHashtagError(slow)).toMatchObject({
+      code: "upstream_timeout",
+      status: 504,
+    });
+    expect(
+      classifyHashtagError(new Error("hashtag feed unavailable for xyz")),
+    ).toMatchObject({ code: "hashtag_not_found", status: 404 });
+  });
+});
+
+describe("shared isUpstreamTimeout helper (search + suggestions)", () => {
+  test("timeout/abort signals true; anything else false", () => {
+    const timeout = new Error("Upstream timed out after 8000ms");
+    timeout.name = "TimeoutError";
+    expect(isUpstreamTimeout(timeout)).toBe(true);
+    const abort = new Error("The operation was aborted");
+    abort.name = "AbortError";
+    expect(isUpstreamTimeout(abort)).toBe(true);
+    expect(isUpstreamTimeout(new Error("upstream down"))).toBe(false);
+    expect(isUpstreamTimeout("plain string")).toBe(false);
   });
 });
 
@@ -408,7 +451,7 @@ describe("hashtag handler (mocked upstream)", () => {
       "lofi",
       {
         fetchFirstPage: async () => {
-          throw new Error("NOT_FOUND: hashtag page");
+          throw new Error("hashtag not found: xyz");
         },
         continueFeed: async () => {
           throw new Error("must not continue");
@@ -572,7 +615,7 @@ describe("hashtag handler (mocked upstream)", () => {
       "nope",
       {
         fetchFirstPage: async () => {
-          throw new Error("NOT_FOUND: hashtag page");
+          throw new Error("hashtag not found: xyz");
         },
         continueFeed: async () => {
           throw new Error("unreached");

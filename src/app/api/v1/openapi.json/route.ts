@@ -465,9 +465,14 @@ export function buildOpenApiDocument() {
               name: "tag",
               in: "path",
               required: true,
-              schema: { type: "string" },
+              schema: {
+                type: "string",
+                pattern: "^[\\p{L}\\p{M}\\p{N}_-]{1,64}$",
+                minLength: 1,
+                maxLength: 65,
+              },
               description:
-                "Hashtag without the leading #, e.g. lofi. One leading # is also accepted.",
+                "Hashtag without the leading #, e.g. lofi. One leading # is also accepted (stripped server-side before validation, hence maxLength 65); charset is unicode letters/marks/numbers, underscore, and hyphen.",
             },
             {
               name: "limit",

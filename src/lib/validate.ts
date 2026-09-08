@@ -126,7 +126,7 @@ export type HashtagTagResult =
  */
 export function parseHashtagTag(raw: string): HashtagTagResult {
   const stripped = raw.startsWith("#") ? raw.slice(1) : raw;
-  if (!/^[\p{L}\p{N}_-]{1,64}$/u.test(stripped)) {
+  if (!/^[\p{L}\p{M}\p{N}_-]{1,64}$/u.test(stripped)) {
     return {
       ok: false,
       error: {

@@ -552,6 +552,17 @@ export interface ClassifiedVideoError {
 }
 
 /**
+ * Shared timeout/abort signal: the 8s fail-fast surfaces as
+ * TimeoutError/AbortError. Single copy used by /search and
+ * /search/suggestions (identical behavior in both).
+ */
+export function isUpstreamTimeout(err: unknown): boolean {
+  const raw =
+    err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+  return /timeout|timed out|abort|TimeoutError|AbortError/i.test(raw);
+}
+
+/**
  * Distinguishes: NOT_FOUND/private/deleted/video-unavailable -> 404
  * video_not_found; LOGIN_REQUIRED/bot-guard -> 502 upstream_degraded;
  * timeouts/aborts -> 504 upstream_timeout; everything else -> 502
@@ -712,7 +723,7 @@ export function classifyHashtagError(err: unknown): ClassifiedVideoError {
     };
   }
   if (
-    /hashtag.{0,40}(not.?found|not_found|unavailable|not available|empty|invalid)|no videos?( found)? for|hashtag page/i.test(
+    /hashtag.{0,40}(not.?found|not_found|unavailable|not available|empty|invalid)|no videos?( found)? for/i.test(
       raw,
     )
   ) {
