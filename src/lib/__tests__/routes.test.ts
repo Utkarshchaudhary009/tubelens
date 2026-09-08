@@ -12,7 +12,7 @@ describe("openapi stub", () => {
     expect(typeof doc.paths).toBe("object");
   });
 
-  test("lists exactly the 5 Phase 1 endpoints", () => {
+  test("lists exactly the 9 Phase 1+2 endpoints", () => {
     const doc = buildOpenApiDocument();
     const paths = Object.keys(doc.paths).sort();
     expect(paths).toEqual([
@@ -21,6 +21,10 @@ describe("openapi stub", () => {
       "/resolve",
       "/search",
       "/videos/{id}",
+      "/videos/{id}/captions",
+      "/videos/{id}/comments",
+      "/videos/{id}/related",
+      "/videos/{id}/transcript",
     ]);
   });
 
@@ -76,6 +80,24 @@ describe("openapi stub", () => {
     expect(errorBody.required).toContain("meta");
   });
 
+  test("404 descriptions document disabled/unavailable + not-found codes", () => {
+    const doc = buildOpenApiDocument();
+    type Paths = keyof typeof doc.paths;
+    const get404 = (path: Paths) =>
+      (
+        doc.paths[path].get.responses as Record<string, { description: string }>
+      )[404].description;
+    expect(get404("/videos/{id}/comments")).toContain("comments_disabled");
+    expect(get404("/videos/{id}/comments")).toContain("video_not_found");
+    expect(get404("/videos/{id}/captions")).toContain("captions_disabled");
+    expect(get404("/videos/{id}/captions")).toContain("video_not_found");
+    expect(get404("/videos/{id}/transcript")).toContain(
+      "transcript_unavailable",
+    );
+    expect(get404("/videos/{id}/transcript")).toContain("video_not_found");
+    expect(get404("/videos/{id}/related")).toContain("video_not_found");
+  });
+
   test("GET serves the raw spec (tooling-compatible) with headers", async () => {
     const res = await GET(
       new NextRequest("http://localhost/api/v1/openapi.json"),
@@ -83,7 +105,7 @@ describe("openapi stub", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.openapi).toMatch(/^3\.1\./);
-    expect(Object.keys(body.paths)).toHaveLength(5);
+    expect(Object.keys(body.paths)).toHaveLength(9);
     expect(res.headers.get("X-Request-Id")).toBeTruthy();
     expect(res.headers.get("Cache-Control")).toContain("s-maxage=86400");
   });

@@ -1,10 +1,21 @@
-// Opaque pagination-cursor store for /api/v1/search.
-// youtubei Search continuations live on the Search object, which cannot
-// cross instances — so live Search objects are kept in this L0 map keyed by
-// an opaque cursor id (5-min TTL, capped at 100). A cursor that misses (cold
-// instance, eviction, expiry) resolves to null and callers serve an empty
-// page with next: null rather than an error, per the Phase 1 contract.
+// Opaque pagination-cursor store for paged watch feeds.
+// youtubei continuations live on their page object (Search, watch-next
+// VideoInfo, Comments), which cannot cross instances — so live page objects
+// are kept in this L0 map keyed by an opaque cursor id (5-min TTL, capped at
+// 100). One shared store serves /api/v1/search, /api/v1/videos/:id/related,
+// and /api/v1/videos/:id/comments: routes adapt their upstream page to the
+// ContinuationSearch shape below and share the same fork semantics, so cached
+// cursors never share mutable state (see forkContinuation). A cursor that
+// misses (cold instance, eviction, expiry) resolves to null and callers serve
+// an empty page with next: null rather than an error, per the contract.
 // Pure lib module (no server-only import) so it is unit-testable.
+
+/**
+ * Generic paged-feed shape. Mirrors youtubei.js Search (results +
+ * has_continuation + getContinuation returning a NEW page object per call);
+ * related adapts VideoInfo.watch_next_feed/wn_has_continuation and comments
+ * adapts Comments.contents/has_continuation to this interface.
+ */
 
 export interface ContinuationSearch {
   results: unknown[];
@@ -21,6 +32,10 @@ export interface ContinuationEntry {
   search: ContinuationSearch;
   returned: number;
   expiresAt: number;
+  /** Owning scope (video id for watch feeds, "search" for /search).
+   * Cursors presented under a different scope yield an empty page, never
+   * another endpoint's items. */
+  scope?: string;
 }
 
 export const CONTINUATION_TTL_MS = 5 * 60 * 1000;
@@ -36,6 +51,7 @@ function mintCursor(): string {
 export function storeContinuation(
   search: ContinuationSearch,
   returned: number,
+  scope?: string,
 ): string | null {
   // Store while there is anything left to serve: an upstream continuation OR
   // unconsumed buffered items (a fetched page may hold more items than one
@@ -54,6 +70,7 @@ export function storeContinuation(
     search,
     returned,
     expiresAt: Date.now() + CONTINUATION_TTL_MS,
+    ...(scope !== undefined ? { scope } : {}),
   });
   return cursor;
 }
@@ -96,12 +113,24 @@ export function hasMoreResults(entry: ContinuationEntry): boolean {
  * branch, which would corrupt later forks. Returns null when the source is
  * gone/expired/exhausted; callers degrade to next: null, never a dangle.
  */
-export function forkContinuation(cursor: string | null): string | null {
+export function forkContinuation(
+  cursor: string | null,
+  scope?: string,
+): string | null {
   if (!cursor) {
     return null;
   }
   const entry = takeContinuation(cursor);
   if (!entry || !hasMoreResults(entry)) {
+    return null;
+  }
+  // A scoped cursor is only forkable under its own scope — cross-video reuse
+  // degrades to next: null, never another video's items.
+  if (
+    scope !== undefined &&
+    entry.scope !== undefined &&
+    entry.scope !== scope
+  ) {
     return null;
   }
   const source = entry.search;
@@ -110,7 +139,7 @@ export function forkContinuation(cursor: string | null): string | null {
     has_continuation: source.has_continuation,
     getContinuation: () => source.getContinuation(),
   };
-  return storeContinuation(fork, entry.returned);
+  return storeContinuation(fork, entry.returned, entry.scope ?? scope);
 }
 
 export function dropContinuation(cursor: string): void {

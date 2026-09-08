@@ -22,6 +22,12 @@ OPTIONAL and only when a phase explicitly demands it.
 | Third-party composed | `sponsors`, `dislikes`, `dearrow`, `combined` | 3600–21600 | 21600 |
 | Private/ephemeral | `audio` (signed URLs), `quota` | `private, no-store` | — |
 
+> Paginated exception: `videos/:id/related` and `videos/:id/comments` send
+> `private, no-store` whenever the response carries a cursor (`page.next !=
+> null`) or the request presented `?cursor=` — cursors are process-local, so a
+> CDN-cached cursor page would break paging on replay. Exhausted first pages
+> (`next == null`, no cursor) keep their public TTLs.
+
 ## Serve-stale-on-error rule
 
 1. Cache-first: serve L1/L0 hit with `meta.cached: true`.

@@ -35,6 +35,14 @@ export const CACHE_CONTROL = {
   healthDegraded: "public, s-maxage=10, stale-while-revalidate=30",
   /** search: fast-moving. */
   search: "public, s-maxage=300, stale-while-revalidate=3600",
+  /** related rail: fast-moving-ish (Phase 2). */
+  related: "public, s-maxage=600, stale-while-revalidate=3600",
+  /** comments: fast-moving (Phase 2). */
+  comments: "public, s-maxage=300, stale-while-revalidate=1800",
+  /** captions: static-ish track list (Phase 2). */
+  captions: "public, s-maxage=3600, stale-while-revalidate=86400",
+  /** transcript: aggressive cache, never live-only (Phase 2). */
+  transcript: "public, s-maxage=86400, stale-while-revalidate=86400",
   /** videos/:id + resolve: static-ish metadata. */
   staticish: "public, s-maxage=3600, stale-while-revalidate=86400",
   /** openapi.json: long-lived spec. */
