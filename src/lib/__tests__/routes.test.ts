@@ -97,7 +97,6 @@ describe("openapi stub", () => {
     expect(get404("/videos/{id}/transcript")).toContain("video_not_found");
     expect(get404("/videos/{id}/related")).toContain("video_not_found");
   });
-  });
 
   test("GET serves the raw spec (tooling-compatible) with headers", async () => {
     const res = await GET(
