@@ -175,6 +175,10 @@ async function serveContinuation(
 ) {
   const entry = takeContinuation(cursor);
   // Best-effort: unknown/expired/exhausted cursor -> empty page, never error.
+  // Cursor pages are NEVER publicly cached (no-store): continuation entries
+  // live in this instance's memory, so a CDN-cached cursor page would replay
+  // an opaque cursor that is meaningless (or already consumed) elsewhere.
+  // Only first-page (no-cursor) responses carry the public search TTL.
   if (!entry || !hasMoreResults(entry)) {
     if (entry) {
       dropContinuation(cursor);
@@ -184,7 +188,7 @@ async function serveContinuation(
       next: null,
       region,
       lang,
-      cacheControl: CACHE_CONTROL.search,
+      cacheControl: CACHE_CONTROL.noStore,
     });
   }
   // Buffered items remain on this page object: serve from this entry's own
@@ -205,7 +209,7 @@ async function serveContinuation(
       next,
       region,
       lang,
-      cacheControl: CACHE_CONTROL.search,
+      cacheControl: CACHE_CONTROL.noStore,
     });
   }
   // Buffer exhausted but upstream has more: fetch the next immutable page and
@@ -223,22 +227,26 @@ async function serveContinuation(
       next,
       region,
       lang,
-      cacheControl: CACHE_CONTROL.search,
+      cacheControl: CACHE_CONTROL.noStore,
     });
-  } catch {
+  } catch (err) {
+    // Upstream page-fetch failure is a typed error (never a silent terminal
+    // empty page — callers would mistake it for end-of-list). Only
+    // unknown/expired cursors degrade to data:[] + next:null above.
     dropContinuation(cursor);
-    return successResponse([], {
-      requestId,
-      next: null,
-      region,
-      lang,
-      warnings: [
-        {
-          code: "continuation_failed",
-          message: "Could not load the next page upstream.",
-        },
-      ],
-      cacheControl: CACHE_CONTROL.search,
+    if (isUpstreamTimeout(err)) {
+      return errorResponse(requestId, {
+        code: "upstream_timeout",
+        message: "Next-page fetch timed out upstream.",
+        hint: "Re-run the search to mint a fresh cursor; include X-Request-Id in bug reports.",
+        status: 504,
+      });
+    }
+    return errorResponse(requestId, {
+      code: "upstream_degraded",
+      message: "Could not load the next page upstream.",
+      hint: "Re-run the search to mint a fresh cursor; include X-Request-Id in bug reports.",
+      status: 502,
     });
   }
 }

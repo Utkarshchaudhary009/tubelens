@@ -125,6 +125,37 @@ describe("classifyUrl", () => {
     });
   });
 
+  test("/channel/ with non-UC name throws", () => {
+    expect(() =>
+      classifyUrl("https://www.youtube.com/channel/SomeName"),
+    ).toThrow(UnresolvableError);
+  });
+
+  test("UC-prefixed short name canonicalizes as /c/, not /channel/", () => {
+    const out = classifyUrl("https://www.youtube.com/c/UCbla");
+    expect(out.type).toBe("channel");
+    expect(out.canonicalUrl).toBe("https://www.youtube.com/c/UCbla");
+  });
+
+  test("/user/ preserves the /user/ route in canonicalUrl", () => {
+    const out = classifyUrl("https://www.youtube.com/user/SomeUser");
+    expect(out.type).toBe("channel");
+    expect(out.canonicalUrl).toBe("https://www.youtube.com/user/SomeUser");
+  });
+
+  test("non-http(s) protocol throws", () => {
+    expect(() => classifyUrl(`ftp://www.youtube.com/watch?v=${VID}`)).toThrow(
+      UnresolvableError,
+    );
+  });
+
+  test("attribution_link ?u= parses the embedded watch target", () => {
+    const out = classifyUrl(
+      `https://www.youtube.com/attribution_link?a=xyz&u=${encodeURIComponent(`/watch?v=${VID}`)}`,
+    );
+    expect(out).toMatchObject({ type: "video", id: VID });
+  });
+
   test("music.youtube.com watch -> video", () => {
     expect(
       classifyUrl(`https://music.youtube.com/watch?v=${VID}`),

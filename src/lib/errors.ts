@@ -25,12 +25,18 @@ export function errorResponse(
       hint: opts.hint,
       status: opts.status,
     },
+    // Header/body parity per contract: meta.requestId mirrors X-Request-Id
+    // on every response, success or typed error.
+    meta: { requestId },
   };
   const headers = baseHeaders(requestId);
   headers.set("Content-Type", "application/json");
   headers.set("Cache-Control", CACHE_CONTROL.noStore);
   if (opts.retryAfter !== undefined) {
     headers.set("Retry-After", String(opts.retryAfter));
+  } else if (opts.status === 429) {
+    // 429s MUST always carry Retry-After; default when the caller omits it.
+    headers.set("Retry-After", "60");
   }
   return new NextResponse(JSON.stringify(body), {
     status: opts.status,

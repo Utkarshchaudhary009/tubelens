@@ -96,6 +96,7 @@ describe("parseSearchParams", () => {
     expect(res.ok).toBe(false);
     if (!res.ok) {
       expect(res.error.code).toBe("invalid_limit");
+      expect(res.error.status).toBe(400);
     }
   });
 

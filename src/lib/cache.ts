@@ -16,7 +16,7 @@ const MAX_SIZE = 500;
 const inflight = new Map<string, Promise<unknown>>();
 
 function evictIfNeeded(): void {
-  if (store.size <= MAX_SIZE) {
+  if (store.size < MAX_SIZE) {
     return;
   }
   const oldest = store.keys().next();
@@ -80,6 +80,10 @@ export interface CachedResult<T> {
  * available, the stale copy is served so callers can set meta.cached +
  * warnings instead of returning a bare 500.
  *
+ * `isRetryable` gates serve-stale: definitive errors (e.g. a confirmed
+ * video_not_found) must NOT serve stale — only transient failures
+ * (timeouts, 429s, 5xx) may. Defaults to always serving stale.
+ *
  * Concurrent misses for one key share a single in-flight fetch (stored per
  * key, removed on settle) so a cold-key burst costs one upstream call.
  */
@@ -88,6 +92,7 @@ export async function cached<T>(
   ttlMs: number,
   fetcher: () => Promise<T>,
   staleMs = ttlMs,
+  isRetryable: (err: unknown) => boolean = () => true,
 ): Promise<CachedResult<T>> {
   const found = cacheGet<T>(key);
   if (found && !found.stale) {
@@ -99,8 +104,9 @@ export async function cached<T>(
       return (await ongoing) as CachedResult<T>;
     } catch (err) {
       // Joined a shared fetch that failed: serve our own stale copy when we
-      // hold one (cold-miss callers without stale still see the throw).
-      if (found) {
+      // hold one and the failure is transient (cold-miss callers without
+      // stale, or definitive errors, still see the throw).
+      if (found && isRetryable(err)) {
         return { value: found.value, hit: true, stale: true };
       }
       throw err;
@@ -113,7 +119,7 @@ export async function cached<T>(
       cacheSet(key, value, ttlMs, staleMs);
       return { value, hit: false, stale: false };
     } catch (err) {
-      if (found) {
+      if (found && isRetryable(err)) {
         return { value: found.value, hit: true, stale: true };
       }
       throw err;

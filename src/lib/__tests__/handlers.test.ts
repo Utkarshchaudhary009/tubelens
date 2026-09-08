@@ -7,7 +7,7 @@ import {
   toUpstreamSearchFilters,
 } from "../../app/api/v1/search/route";
 import { handleGetVideo } from "../../app/api/v1/videos/[id]/route";
-import { clearCache } from "../cache";
+import { cacheSet, clearCache } from "../cache";
 import { type ContinuationSearch, clearContinuations } from "../continuations";
 import type { VideoDetailsDTO } from "../mappers";
 
@@ -244,7 +244,24 @@ describe("search handler (mocked upstream)", () => {
     expect(typeof body.error.hint).toBe("string");
   });
 
-  test("continuation failure -> [] + next: null with warning", async () => {
+  test("first page is publicly cached; cursor pages are no-store", async () => {
+    const r1 = await handleSearch(
+      req("http://x/api/v1/search?q=nocache&limit=2"),
+      deps,
+    );
+    expect(r1.headers.get("Cache-Control")).toContain("s-maxage=300");
+    const b1 = await r1.json();
+    const r2 = await handleSearch(
+      req(`http://x/api/v1/search?cursor=${b1.page.next}&limit=2`),
+      deps,
+    );
+    expect(r2.status).toBe(200);
+    expect(r2.headers.get("Cache-Control")).toContain("no-store");
+  });
+
+  test("continuation fetch failure -> 502 (never a silent empty page)", async () => {
+    // limit=2 consumes the whole first buffer while upstream has more, so
+    // the cursor must fetch the next page upstream.
     const b1 = await (
       await handleSearch(req("http://x/api/v1/search?q=failcont&limit=2"), deps)
     ).json();
@@ -257,10 +274,32 @@ describe("search handler (mocked upstream)", () => {
         },
       },
     );
+    expect(res.status).toBe(502);
     const body = await res.json();
-    expect(body.data).toEqual([]);
-    expect(body.page.next).toBeNull();
-    expect(body.warnings[0].code).toBe("continuation_failed");
+    expect(body.error.code).toBe("upstream_degraded");
+    expect(typeof body.error.hint).toBe("string");
+  });
+
+  test("continuation fetch timeout -> 504 upstream_timeout", async () => {
+    const b1 = await (
+      await handleSearch(
+        req("http://x/api/v1/search?q=failtimeout&limit=2"),
+        deps,
+      )
+    ).json();
+    const err = new Error("The operation was aborted");
+    err.name = "AbortError";
+    const res = await handleSearch(
+      req(`http://x/api/v1/search?cursor=${b1.page.next}&limit=2`),
+      {
+        ...deps,
+        continueSearch: async () => {
+          throw err;
+        },
+      },
+    );
+    expect(res.status).toBe(504);
+    expect((await res.json()).error.code).toBe("upstream_timeout");
   });
 });
 
@@ -326,6 +365,42 @@ describe("videos handler (mocked upstream)", () => {
     );
     expect(res.status).toBe(504);
     expect((await res.json()).error.code).toBe("upstream_timeout");
+  });
+
+  test("stale + definitive not-found -> 404 (never serves stale)", async () => {
+    cacheSet("video:v1:AAAAAAAAAAA", dto, 1, 60_000);
+    await new Promise((r) => setTimeout(r, 5));
+    const res = await handleGetVideo(
+      req("http://x/api/v1/videos/AAAAAAAAAAA"),
+      "AAAAAAAAAAA",
+      {
+        fetchVideo: async () => {
+          throw new Error("NOT_FOUND: video");
+        },
+      },
+    );
+    expect(res.status).toBe(404);
+    expect((await res.json()).error.code).toBe("video_not_found");
+  });
+
+  test("stale + transient timeout -> 200 stale copy", async () => {
+    cacheSet("video:v1:BBBBBBBBBBB", dto, 1, 60_000);
+    await new Promise((r) => setTimeout(r, 5));
+    const err = new Error("Upstream timed out after 8000ms");
+    err.name = "TimeoutError";
+    const res = await handleGetVideo(
+      req("http://x/api/v1/videos/BBBBBBBBBBB"),
+      "BBBBBBBBBBB",
+      {
+        fetchVideo: async () => {
+          throw err;
+        },
+      },
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.meta.cached).toBe(true);
+    expect(body.warnings[0].code).toBe("stale_served");
   });
 
   test("region/lang are echo-only: shared cache entry, meta echoes request", async () => {

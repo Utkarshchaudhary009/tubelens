@@ -47,6 +47,26 @@ describe("openapi stub", () => {
     expect(schemas.ErrorBody.required).toContain("error");
   });
 
+  test("resolve documents url/region/lang params", () => {
+    const doc = buildOpenApiDocument();
+    const params = doc.paths["/resolve"].get.parameters.map(
+      (p: { name: string }) => p.name,
+    );
+    for (const name of ["url", "region", "lang"]) {
+      expect(params).toContain(name);
+    }
+  });
+
+  test("envelope meta requires region/lang/cached/requestId", () => {
+    const doc = buildOpenApiDocument();
+    const meta = doc.components.schemas.Envelope.properties.meta as {
+      required: string[];
+    };
+    for (const name of ["region", "lang", "cached", "requestId"]) {
+      expect(meta.required).toContain(name);
+    }
+  });
+
   test("GET serves the raw spec (tooling-compatible) with headers", async () => {
     const res = await GET(
       new NextRequest("http://localhost/api/v1/openapi.json"),

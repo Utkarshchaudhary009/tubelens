@@ -66,16 +66,21 @@ export function buildOpenApiDocument() {
               name: "region",
               in: "query",
               schema: { type: "string", default: "US" },
+              description:
+                "Echo-only: the upstream session is fixed to US/en by $0-design (single shared session), so region only affects meta and CDN cache variance.",
             },
             {
               name: "lang",
               in: "query",
               schema: { type: "string", default: "en" },
+              description:
+                "Echo-only: the upstream session is fixed to US/en by $0-design (single shared session), so lang only affects meta and CDN cache variance.",
             },
           ],
           responses: {
             200: {
-              description: "Paged search results.",
+              description:
+                "Paged search results. meta.cached reflects the origin L0 only — CDN L1 hits replay the stored JSON verbatim (including its meta).",
               content: {
                 "application/json": { schema: { $ref: envelopeRef } },
               },
@@ -168,6 +173,18 @@ export function buildOpenApiDocument() {
               required: true,
               schema: { type: "string", minLength: 1 },
             },
+            {
+              name: "region",
+              in: "query",
+              schema: { type: "string", default: "US" },
+              description: "Echo-only request context, mirrored in meta.",
+            },
+            {
+              name: "lang",
+              in: "query",
+              schema: { type: "string", default: "en" },
+              description: "Echo-only request context, mirrored in meta.",
+            },
           ],
           responses: {
             200: {
@@ -220,12 +237,20 @@ export function buildOpenApiDocument() {
             },
             meta: {
               type: "object",
-              required: ["region", "cached"],
+              required: ["region", "lang", "cached", "requestId"],
               properties: {
                 region: { type: "string" },
                 lang: { type: "string" },
-                cached: { type: "boolean" },
-                requestId: { type: "string" },
+                cached: {
+                  type: "boolean",
+                  description:
+                    "True when served from the origin L0 cache (fresh or stale). CDN L1 hits replay stored JSON verbatim, so a replayed true does not mean the CDN revalidated.",
+                },
+                requestId: {
+                  type: "string",
+                  description:
+                    "Mirrors the X-Request-Id response header. CDN L1 replays the origin requestId verbatim.",
+                },
               },
             },
             warnings: { type: "array", items: { type: "object" } },
@@ -243,6 +268,16 @@ export function buildOpenApiDocument() {
                 message: { type: "string" },
                 hint: { type: "string" },
                 status: { type: "integer" },
+              },
+            },
+            meta: {
+              type: "object",
+              required: ["requestId"],
+              properties: {
+                requestId: {
+                  type: "string",
+                  description: "Mirrors the X-Request-Id response header.",
+                },
               },
             },
           },

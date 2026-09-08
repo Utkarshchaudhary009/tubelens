@@ -19,6 +19,13 @@ describe("textOf", () => {
     expect(textOf({ runs: [{ text: "a" }, { text: "b" }] })).toBe("ab");
   });
 
+  test("malformed runs never throw", () => {
+    expect(
+      textOf({ runs: [null, undefined, 42, "x", { nope: 1 }, { text: "hi" }] }),
+    ).toBe("hi");
+    expect(textOf({ runs: [null] })).toBeUndefined();
+  });
+
   test("null/undefined -> undefined", () => {
     expect(textOf(null)).toBeUndefined();
     expect(textOf(undefined)).toBeUndefined();
@@ -154,6 +161,19 @@ describe("classifyVideoError", () => {
       code: "upstream_timeout",
       status: 504,
     });
+  });
+
+  test("generic Service Unavailable stays 502", () => {
+    expect(classifyVideoError(new Error("Service Unavailable"))).toMatchObject({
+      code: "upstream_degraded",
+      status: 502,
+    });
+  });
+
+  test("video-scoped unavailable -> 404", () => {
+    expect(
+      classifyVideoError(new Error("This video is unavailable")),
+    ).toMatchObject({ code: "video_not_found", status: 404 });
   });
 
   test("unknown -> 502 with hint, no stack", () => {

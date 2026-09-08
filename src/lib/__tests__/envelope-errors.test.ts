@@ -5,7 +5,7 @@ import { errorResponse } from "../errors";
 
 function reqWithId(id?: string): NextRequest {
   const headers = new Headers();
-  if (id) {
+  if (id !== undefined) {
     headers.set("x-request-id", id);
   }
   return new NextRequest("http://localhost/api/v1/x", { headers });
@@ -53,7 +53,7 @@ describe("success envelope", () => {
 });
 
 describe("typed errors", () => {
-  test("shape: { error: { code, message, hint, status } } + status", async () => {
+  test("shape: { error: { code, message, hint, status }, meta } + status", async () => {
     const res = errorResponse("r9", {
       code: "video_not_found",
       message: "Video not found or unavailable.",
@@ -69,7 +69,20 @@ describe("typed errors", () => {
         hint: "Check the video id.",
         status: 404,
       },
+      meta: { requestId: "r9" },
     });
+  });
+
+  test("error meta.requestId mirrors X-Request-Id header", async () => {
+    const res = errorResponse("r-parity", {
+      code: "missing_query",
+      message: "q required",
+      hint: "Add ?q=.",
+      status: 400,
+    });
+    const body = await res.json();
+    expect(body.meta.requestId).toBe("r-parity");
+    expect(res.headers.get("X-Request-Id")).toBe("r-parity");
   });
 
   test("errors also carry tracing headers", () => {
@@ -94,6 +107,16 @@ describe("typed errors", () => {
     expect(res.status).toBe(429);
     expect(res.headers.get("Retry-After")).toBe("30");
   });
+
+  test("429 without retryAfter still emits a default Retry-After", () => {
+    const res = errorResponse("r9", {
+      code: "rate_limited",
+      message: "Over limit.",
+      hint: "Slow down.",
+      status: 429,
+    });
+    expect(res.headers.get("Retry-After")).toBe("60");
+  });
 });
 
 describe("getRequestId", () => {
@@ -104,5 +127,13 @@ describe("getRequestId", () => {
   test("mints a uuid when absent", () => {
     const id = getRequestId(reqWithId());
     expect(id).toMatch(/^[0-9a-f-]{36}$/i);
+  });
+
+  test("blank values count as missing and mint a uuid", () => {
+    for (const blank of ["", "   "]) {
+      const id = getRequestId(reqWithId(blank));
+      expect(id).toMatch(/^[0-9a-f-]{36}$/i);
+      expect(id).not.toBe(blank);
+    }
   });
 });

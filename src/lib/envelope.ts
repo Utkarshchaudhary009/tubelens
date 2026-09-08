@@ -9,9 +9,11 @@ export interface Warning {
   message: string;
 }
 
-/** X-Request-Id: echo the caller's value, otherwise mint one. */
+/** X-Request-Id: echo the caller's value, otherwise mint one. Blank values
+ * (empty or whitespace-only) are treated as missing. */
 export function getRequestId(req: NextRequest): string {
-  return req.headers.get("x-request-id") ?? crypto.randomUUID();
+  const echoed = req.headers.get("x-request-id");
+  return echoed && echoed.trim() !== "" ? echoed : crypto.randomUUID();
 }
 
 /** Tracing + rate-limit stub headers attached to EVERY response. */

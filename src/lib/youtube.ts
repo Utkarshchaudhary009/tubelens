@@ -1,5 +1,6 @@
 import "server-only";
 import { Innertube, UniversalCache } from "youtubei.js";
+import { createLazySingleton } from "./singleton";
 
 // Singleton Innertube session shared across all route handlers in one
 // instance. Never instantiate per request — session creation is expensive
@@ -7,28 +8,29 @@ import { Innertube, UniversalCache } from "youtubei.js";
 
 type InnertubeInstance = Awaited<ReturnType<typeof Innertube.create>>;
 
-let innertubePromise: Promise<InnertubeInstance> | null = null;
+function defaultCreator(): Promise<InnertubeInstance> {
+  const config = {
+    cache: new UniversalCache(false),
+    lang: "en",
+    location: "US",
+    // Local session (no account) — supported by youtubei.js session options.
+    generate_session_locally: true,
+  } as unknown as Parameters<typeof Innertube.create>[0];
+  return Innertube.create(config);
+}
+
+// Creation itself is bounded (10s): without the race a hung
+// Innertube.create would wedge the cell pending forever — callers would
+// fail-fast individually via withTimeout, but creation would never retry.
+// Retry/reset semantics are implemented and tested in lib/singleton.
+const session = createLazySingleton(
+  defaultCreator,
+  10_000,
+  "Innertube session creation timed out",
+);
 
 export function getInnertube(): Promise<InnertubeInstance> {
-  if (!innertubePromise) {
-    const config = {
-      cache: new UniversalCache(false),
-      lang: "en",
-      location: "US",
-      // Local session (no account) — supported by youtubei.js session options.
-      generate_session_locally: true,
-    } as unknown as Parameters<typeof Innertube.create>[0];
-    const pending = Innertube.create(config);
-    innertubePromise = pending;
-    // Reset on failure so the next request retries instead of reusing a
-    // rejected promise forever. In-flight awaiters still see the rejection.
-    pending.catch(() => {
-      if (innertubePromise === pending) {
-        innertubePromise = null;
-      }
-    });
-  }
-  return innertubePromise;
+  return session.get();
 }
 
 /**

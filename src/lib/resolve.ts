@@ -33,6 +33,11 @@ const PLAYLIST_ID = /^[A-Za-z0-9_-]{2,64}$/;
 // Channel ids (UC…), handles (@…), legacy /c/ and /user/ names.
 const CHANNEL_ID =
   /^(?:@[A-Za-z0-9_.-]{1,64}|UC[A-Za-z0-9_-]{20,}|[A-Za-z0-9_.-]{1,64})$/;
+// Strict UC channel id: UC + 20 or more id chars (anchored — a mere "UC"
+// prefix on a legacy name is NOT a channel id).
+const STRICT_CHANNEL_ID = /^UC[A-Za-z0-9_-]{20,}$/;
+// Legacy custom names for /c/ and /user/ paths.
+const LEGACY_NAME = /^[A-Za-z0-9_.-]{1,64}$/;
 
 function video(id: string, playlistId?: string): ResolvedUrl {
   if (!VIDEO_ID.test(id)) {
@@ -66,13 +71,25 @@ function channel(id: string): ResolvedUrl {
   }
   const path = id.startsWith("@")
     ? id
-    : id.startsWith("UC")
+    : STRICT_CHANNEL_ID.test(id)
       ? `channel/${id}`
       : `c/${id}`;
   return {
     type: "channel",
     id,
     canonicalUrl: `https://www.youtube.com/${path}`,
+  };
+}
+
+/** Legacy /user/<name> channel: the /user/ route is preserved verbatim. */
+function userChannel(name: string): ResolvedUrl {
+  if (!LEGACY_NAME.test(name)) {
+    fail(`Not a valid channel name: "${name}".`);
+  }
+  return {
+    type: "channel",
+    id: name,
+    canonicalUrl: `https://www.youtube.com/user/${name}`,
   };
 }
 
@@ -104,6 +121,12 @@ export function classifyUrl(input: string): ResolvedUrl {
     url = new URL(raw.includes("://") ? raw : `https://${raw}`);
   } catch {
     fail(`Could not parse as a URL: "${raw}".`);
+  }
+
+  // Only http(s) inputs are accepted — e.g. ftp://youtube.com must not
+  // classify even when the host matches.
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    fail(`Unsupported URL protocol: "${url.protocol}".`);
   }
 
   const host = url.hostname.toLowerCase();
@@ -191,22 +214,35 @@ export function classifyUrl(input: string): ResolvedUrl {
     fail("Playlist URL is missing a list= id.");
   }
 
-  // /channel/<id>
+  // /channel/<UC-id> — strict: a /channel/ path always carries a real
+  // channel id, never a legacy custom name.
   if (head === "channel") {
     const id = segs[1] ?? "";
     if (!id) {
       fail("Channel URL is missing a channel id.");
     }
+    if (!STRICT_CHANNEL_ID.test(id)) {
+      fail(`Not a valid channel id: "${id}".`);
+    }
     return channel(id);
   }
 
-  // Legacy /c/<name> and /user/<name>
-  if (head === "c" || head === "user") {
+  // Legacy /c/<name>
+  if (head === "c") {
     const name = segs[1] ?? "";
     if (!name) {
       fail("Channel URL is missing a name.");
     }
     return channel(name);
+  }
+
+  // Legacy /user/<name> — preserves the /user/ route in the canonical URL.
+  if (head === "user") {
+    const name = segs[1] ?? "";
+    if (!name) {
+      fail("Channel URL is missing a name.");
+    }
+    return userChannel(name);
   }
 
   // /@handle[/videos|/shorts|/streams...] — only the handle identifies it.
@@ -219,6 +255,19 @@ export function classifyUrl(input: string): ResolvedUrl {
   const v = params.get("v");
   if (v) {
     return video(v, playlistId);
+  }
+  // Attribution links embed the real target in ?u= (e.g.
+  // /attribution_link?u=/watch?v=<id>); parse it recursively.
+  const embedded = params.get("u");
+  if (embedded) {
+    const target = embedded.startsWith("/")
+      ? `https://www.youtube.com${embedded}`
+      : embedded;
+    try {
+      return classifyUrl(target);
+    } catch {
+      // Fall through to the generic failure below.
+    }
   }
   if (playlistId && segs.length === 0) {
     return playlist(playlistId);

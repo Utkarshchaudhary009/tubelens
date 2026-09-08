@@ -101,6 +101,44 @@ describe("L0 cache", () => {
     });
   });
 
+  test("capacity: oldest entry evicted at MAX_SIZE, size stays bounded", async () => {
+    for (let i = 0; i < 500; i += 1) {
+      cacheSet(`cap-${i}`, i, 60_000);
+    }
+    expect(cacheGet("cap-0")).toMatchObject({ value: 0 });
+    cacheSet("cap-new", "new", 60_000);
+    expect(cacheGet("cap-0")).toBeUndefined();
+    expect(cacheGet("cap-1")).toMatchObject({ value: 1 });
+    expect(cacheGet("cap-new")).toMatchObject({ value: "new" });
+  });
+
+  test("isRetryable=false errors never serve stale", async () => {
+    cacheSet("k9", "old", 1, 60_000);
+    await new Promise((r) => setTimeout(r, 5));
+    const never = () => false;
+    await expect(
+      cached<string>(
+        "k9",
+        1,
+        async () => {
+          throw new Error("NOT_FOUND");
+        },
+        60_000,
+        never,
+      ),
+    ).rejects.toThrow("NOT_FOUND");
+    const res = await cached<string>(
+      "k9",
+      1,
+      async () => {
+        throw new Error("timeout");
+      },
+      60_000,
+      () => true,
+    );
+    expect(res).toMatchObject({ value: "old", hit: true, stale: true });
+  });
+
   test("failed fetch clears the in-flight slot so the next call retries", async () => {
     let calls = 0;
     await expect(

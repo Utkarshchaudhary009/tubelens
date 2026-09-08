@@ -46,8 +46,14 @@ export function textOf(t: unknown): string | undefined {
       return obj.text;
     }
     if (Array.isArray(obj.runs)) {
-      const joined = (obj.runs as Array<Record<string, unknown>>)
-        .map((r) => (typeof r.text === "string" ? r.text : ""))
+      const joined = (obj.runs as Array<unknown>)
+        .map((r) =>
+          typeof r === "object" &&
+          r !== null &&
+          typeof (r as Record<string, unknown>).text === "string"
+            ? ((r as Record<string, unknown>).text as string)
+            : "",
+        )
         .join("");
       return joined === "" ? undefined : joined;
     }
@@ -250,9 +256,11 @@ export interface ClassifiedVideoError {
 }
 
 /**
- * Distinguishes: NOT_FOUND/private/deleted -> 404 video_not_found;
- * LOGIN_REQUIRED/bot-guard -> 502 upstream_degraded; timeouts/aborts ->
- * 504 upstream_timeout; everything else -> 502 upstream_degraded.
+ * Distinguishes: NOT_FOUND/private/deleted/video-unavailable -> 404
+ * video_not_found; LOGIN_REQUIRED/bot-guard -> 502 upstream_degraded;
+ * timeouts/aborts -> 504 upstream_timeout; everything else -> 502
+ * upstream_degraded. "Unavailable" alone stays 502 — only video-scoped
+ * wording ("this video is unavailable") is a definitive 404.
  * Never leaks stack traces — callers use only these four fields.
  */
 export function classifyVideoError(err: unknown): ClassifiedVideoError {
@@ -271,7 +279,9 @@ export function classifyVideoError(err: unknown): ClassifiedVideoError {
     };
   }
   if (
-    /not_found|not found|\b404\b|unavailable|private|deleted|removed/i.test(raw)
+    /not_found|not found|\b404\b|video.{0,40}unavailable|unavailable.{0,40}video|private|deleted|removed/i.test(
+      raw,
+    )
   ) {
     return {
       code: "video_not_found",

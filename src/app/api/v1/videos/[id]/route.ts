@@ -74,6 +74,9 @@ export async function handleGetVideo(
       5 * 60 * 1000, // L0 fresh window; L1 CDN carries the 3600s TTL.
       () => deps.fetchVideo(id),
       60 * 60 * 1000, // stale window backs serve-stale-on-error.
+      // Definitive not-found errors must NOT serve stale — only transient
+      // failures (timeout/429/5xx) may. Not-found propagates below.
+      (err) => classifyVideoError(err).code !== "video_not_found",
     );
     staleServed = result.stale;
     cacheHit = result.hit;
