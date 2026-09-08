@@ -369,6 +369,15 @@ describe("finding 4: comments_disabled", () => {
     expect(classifyFeedError(new Error("Comments are disabled"))).toMatchObject(
       { code: "comments_disabled", status: 404 },
     );
+    // Both signals at once: the more specific, less destructive
+    // comments_disabled wins (hide panel, not video).
+    expect(
+      classifyFeedError(
+        new Error(
+          "Comments are disabled: the comments page did not have any content",
+        ),
+      ),
+    ).toMatchObject({ code: "comments_disabled", status: 404 });
   });
 });
 
