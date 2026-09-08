@@ -164,6 +164,10 @@ describe("phase 3 mappers", () => {
     expect(
       classifyHashtagError(new Error("hashtag not found: xyz")),
     ).toMatchObject({ code: "hashtag_not_found", status: 404 });
+    // Signal BEFORE "hashtag" also 404s.
+    expect(
+      classifyHashtagError(new Error("NOT_FOUND: hashtag page")),
+    ).toMatchObject({ code: "hashtag_not_found", status: 404 });
     expect(
       classifyHashtagError(new Error("No videos found for #xyz")),
     ).toMatchObject({ code: "hashtag_not_found", status: 404 });

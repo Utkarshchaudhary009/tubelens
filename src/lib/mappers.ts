@@ -708,7 +708,10 @@ export function classifyTranscriptError(err: unknown): ClassifiedVideoError {
  * text still reports 504); hashtag/feed-scoped not-found signals (unknown
  * or empty tag pages) -> 404 hashtag_not_found with a hint to try another
  * tag; everything else -> 502 upstream_degraded, so generic or transient
- * 404-ish messages never misclassify as a missing hashtag.
+ * 404-ish messages never misclassify as a missing hashtag. The explicit
+ * not-found signal may sit on EITHER side of "hashtag" (e.g. both
+ * "hashtag not found" and "NOT_FOUND: hashtag page" 404), but a bare
+ * "hashtag page" with no signal stays 502.
  * Never leaks stack traces — callers use only these four fields.
  */
 export function classifyHashtagError(err: unknown): ClassifiedVideoError {
@@ -723,7 +726,7 @@ export function classifyHashtagError(err: unknown): ClassifiedVideoError {
     };
   }
   if (
-    /hashtag.{0,40}(not.?found|not_found|unavailable|not available|empty|invalid)|no videos?( found)? for/i.test(
+    /(not.?found|not_found|unavailable|not available|empty|invalid)[\s\S]{0,40}hashtag|hashtag[\s\S]{0,40}(not.?found|not_found|unavailable|not available|empty|invalid)|no videos?( found)? for/i.test(
       raw,
     )
   ) {
