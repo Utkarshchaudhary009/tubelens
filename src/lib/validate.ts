@@ -59,6 +59,87 @@ export interface SearchParamsError {
   status: number;
 }
 
+export interface SuggestionsParams {
+  q: string;
+  limit: number;
+  region: string;
+  lang: string;
+}
+
+export type SuggestionsParamsResult =
+  | { ok: true; value: SuggestionsParams }
+  | { ok: false; error: SearchParamsError };
+
+/**
+ * Pure validation for /api/v1/search/suggestions query params (kept in lib
+ * so it is unit-testable without importing the route's youtubei singleton).
+ * Missing q reuses the search missing_query shape; limit via parseLimit.
+ */
+export function parseSuggestionsParams(
+  params: URLSearchParams,
+): SuggestionsParamsResult {
+  const q = (params.get("q") ?? "").trim();
+  if (!q) {
+    return {
+      ok: false,
+      error: {
+        code: "missing_query",
+        message: "Query parameter q is required.",
+        hint: "Add ?q= to your request, e.g. /api/v1/search/suggestions?q=lofi.",
+        status: 400,
+      },
+    };
+  }
+  const limit = parseLimit(params.get("limit"));
+  if (limit === null) {
+    return {
+      ok: false,
+      error: {
+        code: "invalid_limit",
+        message: "Invalid limit.",
+        hint: "Use an integer between 1 and 50; defaults to 20.",
+        status: 400,
+      },
+    };
+  }
+  return {
+    ok: true,
+    value: {
+      q,
+      limit,
+      region: parseRegion(params.get("region")),
+      lang: parseLang(params.get("lang")),
+    },
+  };
+}
+
+export type HashtagTagResult =
+  | { ok: true; value: string }
+  | { ok: false; error: SearchParamsError };
+
+/**
+ * Pure validation for /api/v1/hashtags/:tag path params. Strips one leading
+ * `#` (so `%23lofi` and `lofi` agree), then requires 1-64 letters, digits,
+ * underscores, or hyphens (unicode-aware, so real-world tags like `lo-fi`
+ * or non-ASCII tags pass). Slashes, dots, spaces, and `%` stay rejected, so
+ * the tag is safe to embed in cache keys, scopes, and the youtubei call.
+ */
+export function parseHashtagTag(raw: string): HashtagTagResult {
+  const stripped = raw.startsWith("#") ? raw.slice(1) : raw;
+  if (!/^[\p{L}\p{N}_-]{1,64}$/u.test(stripped)) {
+    return {
+      ok: false,
+      error: {
+        code: "invalid_hashtag",
+        message: "Invalid hashtag.",
+        hint: "Use 1-64 letters, digits, underscores, or hyphens, e.g. /api/v1/hashtags/lo-fi.",
+        status: 400,
+      },
+    };
+  }
+  return { ok: true, value: stripped };
+}
+
 export type SearchParamsResult =
   | { ok: true; value: ParsedSearchParams }
   | { ok: false; error: SearchParamsError };

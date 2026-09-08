@@ -3,7 +3,7 @@ import { baseHeaders, CACHE_CONTROL, getRequestId } from "@/lib/envelope";
 
 export const runtime = "nodejs";
 
-// OpenAPI 3.1 stub for Phase 2: documents exactly the 9 shipped endpoints.
+// OpenAPI 3.1 stub for Phase 3: documents exactly the 11 shipped endpoints.
 // Grows each phase; promoted to the full spec in Phase 10. Exported as a
 // pure builder so tests can validate it without HTTP.
 export function buildOpenApiDocument() {
@@ -17,7 +17,7 @@ export function buildOpenApiDocument() {
       // package.json (0.1.0 until the v1 API is declared stable).
       version: "0.1.0",
       description:
-        "API-first YouTube data API. Phase 2 ships watch essentials: related rail, comments, captions, and transcript, plus Phase 1 health, search, video details, URL resolving, and this spec.",
+        "API-first YouTube data API. Phase 3 ships discovery: search autocomplete suggestions and hashtag video feeds, plus Phase 2 watch essentials (related rail, comments, captions, transcript) and Phase 1 health, search, video details, URL resolving, and this spec.",
     },
     servers: [{ url: "https://tubelens.vercel.app/api/v1" }],
     paths: {
@@ -375,6 +375,135 @@ export function buildOpenApiDocument() {
             },
             404: {
               description: "transcript_unavailable or video_not_found.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: {
+              description:
+                "rate_limited; retry after the Retry-After seconds. X-RateLimit-* headers are present on every response.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            502: {
+              description:
+                "upstream_degraded; YouTube Innertube call failed. Retry shortly.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            504: {
+              description:
+                "upstream_timeout; the 8s fail-fast fired. Retry shortly.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+          },
+        },
+      },
+      "/search/suggestions": {
+        get: {
+          operationId: "getSearchSuggestions",
+          summary: "Autocomplete suggestions for a partial query",
+          parameters: [
+            {
+              name: "q",
+              in: "query",
+              required: true,
+              schema: { type: "string", minLength: 1 },
+            },
+            {
+              name: "limit",
+              in: "query",
+              schema: { type: "integer", minimum: 1, maximum: 50, default: 20 },
+            },
+            {
+              name: "region",
+              in: "query",
+              schema: { type: "string", default: "US" },
+              description:
+                "Echo-only: the upstream session is fixed to US/en by the zero-cost shared-session design (single shared session), so region only affects meta and CDN cache variance.",
+            },
+            {
+              name: "lang",
+              in: "query",
+              schema: { type: "string", default: "en" },
+              description:
+                "Echo-only: the upstream session is fixed to US/en by the zero-cost shared-session design (single shared session), so lang only affects meta and CDN cache variance.",
+            },
+          ],
+          responses: {
+            200: {
+              description:
+                "Suggestion strings. meta.cached reflects the origin L0 only — CDN L1 hits replay the stored JSON verbatim (including its meta).",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "missing_query or invalid_limit.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: {
+              description:
+                "rate_limited; retry after the Retry-After seconds. X-RateLimit-* headers are present on every response.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            502: {
+              description:
+                "upstream_degraded; YouTube Innertube call failed. Retry shortly.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            504: {
+              description:
+                "upstream_timeout; the 8s fail-fast fired. Retry shortly.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+          },
+        },
+      },
+      "/hashtags/{tag}": {
+        get: {
+          operationId: "getHashtagFeed",
+          summary: "Video feed for a hashtag",
+          parameters: [
+            {
+              name: "tag",
+              in: "path",
+              required: true,
+              schema: { type: "string" },
+              description:
+                "Hashtag without the leading #, e.g. lofi. One leading # is also accepted.",
+            },
+            {
+              name: "limit",
+              in: "query",
+              schema: { type: "integer", minimum: 1, maximum: 50, default: 20 },
+            },
+            { name: "cursor", in: "query", schema: { type: "string" } },
+            {
+              name: "region",
+              in: "query",
+              schema: { type: "string", default: "US" },
+              description:
+                "Echo-only: the upstream session is fixed to US/en by the zero-cost shared-session design (single shared session), so region only affects meta and CDN cache variance.",
+            },
+            {
+              name: "lang",
+              in: "query",
+              schema: { type: "string", default: "en" },
+              description:
+                "Echo-only: the upstream session is fixed to US/en by the zero-cost shared-session design (single shared session), so lang only affects meta and CDN cache variance.",
+            },
+          ],
+          responses: {
+            200: {
+              description:
+                "Paged hashtag videos. meta.cached reflects the origin L0 only — CDN L1 hits replay the stored JSON verbatim (including its meta).",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "invalid_hashtag or invalid_limit.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            404: {
+              description: "hashtag_not_found.",
               content: { "application/json": { schema: { $ref: errorRef } } },
             },
             429: {

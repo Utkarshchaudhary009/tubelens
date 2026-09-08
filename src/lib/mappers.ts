@@ -135,7 +135,7 @@ function detectKind(node: Record<string, unknown>): SearchKind | null {
     raw.includes("video") ||
     raw.includes("movie") ||
     raw.includes("reel") ||
-    raw === "short"
+    raw.includes("short")
   ) {
     return "video";
   }
@@ -689,4 +689,44 @@ export function classifyTranscriptError(err: unknown): ClassifiedVideoError {
     };
   }
   return classifyVideoError(err);
+}
+
+/**
+ * Hashtag feed failures: timeouts/aborts -> 504 upstream_timeout (checked
+ * first, mirroring classifyVideoError, so a timeout carrying not-found-ish
+ * text still reports 504); hashtag/feed-scoped not-found signals (unknown
+ * or empty tag pages) -> 404 hashtag_not_found with a hint to try another
+ * tag; everything else -> 502 upstream_degraded, so generic or transient
+ * 404-ish messages never misclassify as a missing hashtag.
+ * Never leaks stack traces — callers use only these four fields.
+ */
+export function classifyHashtagError(err: unknown): ClassifiedVideoError {
+  const raw =
+    err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+  if (/timeout|timed out|abort|TimeoutError|AbortError/i.test(raw)) {
+    return {
+      code: "upstream_timeout",
+      message: "Hashtag feed timed out upstream.",
+      hint: "Retry shortly; include X-Request-Id in bug reports.",
+      status: 504,
+    };
+  }
+  if (
+    /hashtag.{0,40}(not.?found|not_found|unavailable|not available|empty|invalid)|no videos?( found)? for|hashtag page/i.test(
+      raw,
+    )
+  ) {
+    return {
+      code: "hashtag_not_found",
+      message: "No videos found for this hashtag.",
+      hint: "Try another hashtag, e.g. /api/v1/hashtags/lofi.",
+      status: 404,
+    };
+  }
+  return {
+    code: "upstream_degraded",
+    message: "Hashtag feed failed upstream.",
+    hint: "Retry shortly; include X-Request-Id in bug reports.",
+    status: 502,
+  };
 }
