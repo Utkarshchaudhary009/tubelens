@@ -67,14 +67,14 @@ export function buildOpenApiDocument() {
               in: "query",
               schema: { type: "string", default: "US" },
               description:
-                "Echo-only: the upstream session is fixed to US/en by $0-design (single shared session), so region only affects meta and CDN cache variance.",
+                "Echo-only: the upstream session is fixed to US/en by the zero-cost shared-session design (single shared session), so region only affects meta and CDN cache variance.",
             },
             {
               name: "lang",
               in: "query",
               schema: { type: "string", default: "en" },
               description:
-                "Echo-only: the upstream session is fixed to US/en by $0-design (single shared session), so lang only affects meta and CDN cache variance.",
+                "Echo-only: the upstream session is fixed to US/en by the zero-cost shared-session design (single shared session), so lang only affects meta and CDN cache variance.",
             },
           ],
           responses: {
@@ -258,7 +258,7 @@ export function buildOpenApiDocument() {
         },
         ErrorBody: {
           type: "object",
-          required: ["error"],
+          required: ["error", "meta"],
           properties: {
             error: {
               type: "object",

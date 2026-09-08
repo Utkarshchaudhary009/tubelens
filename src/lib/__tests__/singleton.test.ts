@@ -42,6 +42,9 @@ describe("createLazySingleton", () => {
     );
     const p1 = cell.get();
     const p2 = cell.get();
+    // create() is deferred a microtask (sync throws become rejections);
+    // the cell itself is claimed synchronously, so still one attempt.
+    await Promise.resolve();
     expect(calls).toBe(1);
     gate.resolve("shared");
     await expect(p1).resolves.toBe("shared");
@@ -68,6 +71,62 @@ describe("createLazySingleton", () => {
     expect((err as Error).name).toBe("TimeoutError");
     await expect(cell.get()).resolves.toBe("recovered");
     expect(calls).toBe(2);
+  });
+
+  test("synchronous creator throw becomes a rejection and retries", async () => {
+    let calls = 0;
+    const cell = createLazySingleton<string>(
+      () => {
+        calls += 1;
+        if (calls === 1) {
+          throw new Error("sync boom");
+        }
+        return Promise.resolve("recovered");
+      },
+      1000,
+      "creation timed out",
+    );
+    await expect(cell.get()).rejects.toThrow("sync boom");
+    await expect(cell.get()).resolves.toBe("recovered");
+    expect(calls).toBe(2);
+  });
+
+  test("late rejection after a timeout win is absorbed; cell retries", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown) => {
+      unhandled.push(e);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      let calls = 0;
+      let rejectFirst!: (e: unknown) => void;
+      const cell = createLazySingleton<string>(
+        () => {
+          calls += 1;
+          if (calls === 1) {
+            return new Promise<string>((_, rej) => {
+              rejectFirst = rej;
+            });
+          }
+          return Promise.resolve("recovered");
+        },
+        10,
+        "creation timed out",
+      );
+      const err = await cell
+        .get()
+        .then((): unknown => null)
+        .catch((e: unknown) => e);
+      expect((err as Error).name).toBe("TimeoutError");
+      // The abandoned first attempt fails late — must not escape anywhere.
+      rejectFirst(new Error("late boom"));
+      await new Promise((r) => setTimeout(r, 10));
+      await expect(cell.get()).resolves.toBe("recovered");
+      expect(calls).toBe(2);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+    expect(unhandled).toEqual([]);
   });
 
   test("reset() drops the cached value", async () => {

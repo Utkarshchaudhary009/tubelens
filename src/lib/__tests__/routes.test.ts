@@ -67,6 +67,15 @@ describe("openapi stub", () => {
     }
   });
 
+  test("error body requires error + meta (parity contract)", () => {
+    const doc = buildOpenApiDocument();
+    const errorBody = doc.components.schemas.ErrorBody as {
+      required: string[];
+    };
+    expect(errorBody.required).toContain("error");
+    expect(errorBody.required).toContain("meta");
+  });
+
   test("GET serves the raw spec (tooling-compatible) with headers", async () => {
     const res = await GET(
       new NextRequest("http://localhost/api/v1/openapi.json"),

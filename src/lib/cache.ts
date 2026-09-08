@@ -15,8 +15,10 @@ const MAX_SIZE = 500;
 /** In-flight fetches by key for cold-key request coalescing. */
 const inflight = new Map<string, Promise<unknown>>();
 
-function evictIfNeeded(): void {
-  if (store.size < MAX_SIZE) {
+function evictIfNeeded(key: string): void {
+  // Refreshing a key that is already present never grows the map — only
+  // evict when a genuinely new key arrives at capacity.
+  if (store.size < MAX_SIZE || store.has(key)) {
     return;
   }
   const oldest = store.keys().next();
@@ -50,7 +52,7 @@ export function cacheSet(
   ttlMs: number,
   staleMs = ttlMs,
 ): void {
-  evictIfNeeded();
+  evictIfNeeded(key);
   const now = Date.now();
   store.set(key, {
     value,

@@ -112,6 +112,15 @@ describe("L0 cache", () => {
     expect(cacheGet("cap-new")).toMatchObject({ value: "new" });
   });
 
+  test("refreshing an existing key at capacity evicts nothing", async () => {
+    for (let i = 0; i < 500; i += 1) {
+      cacheSet(`ref-${i}`, i, 60_000);
+    }
+    cacheSet("ref-499", "refreshed", 60_000);
+    expect(cacheGet("ref-499")).toMatchObject({ value: "refreshed" });
+    expect(cacheGet("ref-0")).toMatchObject({ value: 0 });
+  });
+
   test("isRetryable=false errors never serve stale", async () => {
     cacheSet("k9", "old", 1, 60_000);
     await new Promise((r) => setTimeout(r, 5));

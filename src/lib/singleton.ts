@@ -22,13 +22,19 @@ export function createLazySingleton<T>(
   let current: Promise<T> | null = null;
   const get = (): Promise<T> => {
     if (!current) {
-      const attempt = create();
+      // Deferred so a synchronously-throwing create() enters the
+      // rejection/reset path instead of escaping get() as a sync throw.
+      const attempt = Promise.resolve().then(() => create());
       const gate = new Promise<never>((_resolve, reject) => {
         const timer = setTimeout(() => {
           const err = new Error(`${timeoutMessage} after ${timeoutMs}ms`);
           err.name = "TimeoutError";
           reject(err);
         }, timeoutMs);
+        // Late-settlement handler, independent of the race below: an
+        // abandoned attempt (gate won, cell reset, replacement started)
+        // that settles late is absorbed here — rejections never escape
+        // unhandled — and always clears its timer.
         attempt.then(
           () => clearTimeout(timer),
           () => clearTimeout(timer),
