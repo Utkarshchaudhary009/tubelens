@@ -43,6 +43,7 @@ jobs:
 
       - name: Install OpenCode
         run: |
+          set -o pipefail
           for i in 1 2 3; do
             if curl -fsSL https://opencode.ai/install | bash; then
               break

@@ -17,6 +17,9 @@ concurrency:
 
 jobs:
   advance-phase:
+    # PAT-backed privileged run: only the trusted default branch may execute it,
+    # so a manually dispatched run from any other branch cannot exfiltrate the PAT.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
