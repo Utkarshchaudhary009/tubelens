@@ -517,3 +517,104 @@ describe("review: cross-endpoint cursor isolation", () => {
     expect(back.page).toEqual({ next: null });
   });
 });
+
+describe("review: paginated cursor pages are private/no-store", () => {
+  const relatedDeps = {
+    fetchFirstPage: async (_id: string) =>
+      fakeFeed([[vid("r1", "R1"), vid("r2", "R2")], [vid("r3", "R3")]]),
+    continueFeed: async (p: ContinuationSearch) => p.getContinuation(),
+  };
+  const commentsDeps = {
+    fetchFirstPage: async (_id: string) =>
+      fakeFeed([[thread("c1", "one"), thread("c2", "two")]]),
+    continueFeed: async (p: ContinuationSearch) => p.getContinuation(),
+  };
+  const exhaustedDeps = {
+    fetchFirstPage: async (_id: string) => fakeFeed([[vid("only", "Only")]]),
+    continueFeed: async (p: ContinuationSearch) => p.getContinuation(),
+  };
+  const exhaustedCommentsDeps = {
+    fetchFirstPage: async (_id: string) => fakeFeed([[thread("c1", "one")]]),
+    continueFeed: async (p: ContinuationSearch) => p.getContinuation(),
+  };
+
+  test("related page-1 with next != null -> private, no-store", async () => {
+    const res = await handleRelated(
+      req("http://x/api/v1/videos/dQw4w9WgXcQ/related?limit=2"),
+      "dQw4w9WgXcQ",
+      relatedDeps,
+    );
+    const body = await res.json();
+    expect(typeof body.page.next).toBe("string");
+    expect(res.headers.get("Cache-Control")).toBe("private, no-store");
+  });
+
+  test("related exhausted page (next == null) -> public s-maxage=600", async () => {
+    const res = await handleRelated(
+      req("http://x/api/v1/videos/dQw4w9WgXcQ/related?limit=5"),
+      "dQw4w9WgXcQ",
+      exhaustedDeps,
+    );
+    const body = await res.json();
+    expect(body.page.next).toBeNull();
+    expect(res.headers.get("Cache-Control")).toContain("s-maxage=600");
+  });
+
+  test("related ?cursor= request -> private, no-store", async () => {
+    const first = await (
+      await handleRelated(
+        req("http://x/api/v1/videos/dQw4w9WgXcQ/related?limit=2"),
+        "dQw4w9WgXcQ",
+        relatedDeps,
+      )
+    ).json();
+    const res = await handleRelated(
+      req(
+        `http://x/api/v1/videos/dQw4w9WgXcQ/related?cursor=${first.page.next}&limit=2`,
+      ),
+      "dQw4w9WgXcQ",
+      relatedDeps,
+    );
+    expect(res.headers.get("Cache-Control")).toBe("private, no-store");
+  });
+
+  test("comments page-1 with next != null -> private, no-store", async () => {
+    const res = await handleComments(
+      req("http://x/api/v1/videos/dQw4w9WgXcQ/comments?limit=1"),
+      "dQw4w9WgXcQ",
+      commentsDeps,
+    );
+    const body = await res.json();
+    expect(typeof body.page.next).toBe("string");
+    expect(res.headers.get("Cache-Control")).toBe("private, no-store");
+  });
+
+  test("comments exhausted page (next == null) -> public s-maxage=300", async () => {
+    const res = await handleComments(
+      req("http://x/api/v1/videos/dQw4w9WgXcQ/comments?limit=5"),
+      "dQw4w9WgXcQ",
+      exhaustedCommentsDeps,
+    );
+    const body = await res.json();
+    expect(body.page.next).toBeNull();
+    expect(res.headers.get("Cache-Control")).toContain("s-maxage=300");
+  });
+
+  test("comments ?cursor= request -> private, no-store", async () => {
+    const first = await (
+      await handleComments(
+        req("http://x/api/v1/videos/dQw4w9WgXcQ/comments?limit=1"),
+        "dQw4w9WgXcQ",
+        commentsDeps,
+      )
+    ).json();
+    const res = await handleComments(
+      req(
+        `http://x/api/v1/videos/dQw4w9WgXcQ/comments?cursor=${first.page.next}&limit=1`,
+      ),
+      "dQw4w9WgXcQ",
+      commentsDeps,
+    );
+    expect(res.headers.get("Cache-Control")).toBe("private, no-store");
+  });
+});
