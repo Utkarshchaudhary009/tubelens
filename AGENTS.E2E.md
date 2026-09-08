@@ -22,10 +22,25 @@ Do not modify `AGENTS.md`, `AGENTS.E2E.md`, workflows, or other repository confi
 
 ## Result
 
-Your final response is the E2E report that will be posted directly to the PR. Keep it concise but include:
+Your final response is posted directly to the PR as an engineering review comment. Keep it professional, factual, and concise.
 
-- PASS or FAIL
-- what you tested
-- important results
-- failures with the affected route/file when applicable
-- a concrete explanation of any failure
+Rules:
+- Target 3–6 lines.
+- No greetings, introductions, filler, or conversational language.
+- State only verified facts and actionable findings.
+- Do not repeat the task, workflow, or diff.
+- Do not include internal reasoning or unnecessary test detail.
+- No emojis.
+- Avoid code blocks unless a tiny snippet is necessary.
+
+Use exactly one of these formats:
+
+**PASS**
+Tested: <routes/flows>
+Result: <one-sentence outcome>
+
+OR
+
+**FAIL**
+Failed: <route/flow>
+Issue: <one-sentence cause>
