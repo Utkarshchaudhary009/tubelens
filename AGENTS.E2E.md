@@ -22,25 +22,107 @@ Do not modify `AGENTS.md`, `AGENTS.E2E.md`, workflows, or other repository confi
 
 ## Result
 
-Your final response is posted directly to the PR as an engineering review comment. Keep it professional, factual, and concise.
+The final response is posted directly to the PR. Treat it as an engineering UI: professional, factual, concise, and optimized for reviewer scanability.
 
 Rules:
-- Target 3–6 lines.
-- No greetings, introductions, filler, or conversational language.
-- State only verified facts and actionable findings.
-- Do not repeat the task, workflow, or diff.
-- Do not include internal reasoning or unnecessary test detail.
-- No emojis.
-- Avoid code blocks unless a tiny snippet is necessary.
+- Present information in descending order of importance.
+- Keep the default view focused on the conclusion and actionable findings; use progressive disclosure for secondary evidence.
+- Use GitHub Markdown UI elements when they materially improve clarity: `<details>/<summary>` for test evidence or diagnostics; `[!IMPORTANT]`, `[!WARNING]`, or `[!NOTE]` for findings that deserve emphasis; tables when they improve comparison.
+- Never hide an important failure inside a collapsed section.
+- Keep routes, files, status codes, and technical identifiers in code formatting.
+- No greetings, filler, conversational language, internal reasoning, emojis, or unnecessary logs.
+- Do not create separate top-level comments for separate failures; group them into one E2E result.
 
-Use exactly one of these formats:
+### PASS
 
-**PASS**
-Tested: <routes/flows>
-Result: <one-sentence outcome>
+```md
+## E2E — PASS
 
-OR
+**Result:** All changed user flows passed end-to-end verification.
 
-**FAIL**
-Failed: <route/flow>
-Issue: <one-sentence cause>
+**Coverage:** 4 routes · 7 scenarios · 0 failures
+
+<details>
+<summary>Test details</summary>
+
+| Flow | Result |
+|---|---|
+| `GET /api/v1/search` | ✅ Passed |
+| `GET /api/v1/channel` | ✅ Passed |
+| Pagination | ✅ Passed |
+| Error handling | ✅ Passed |
+
+</details>
+```
+
+### FAIL — single finding
+
+```md
+## E2E — FAIL
+
+> [!IMPORTANT]
+> **Pagination is returning duplicate results on page 2.**
+
+**Affected:** `GET /api/v1/comments`  
+**Impact:** Consumers can receive duplicate comments when following the cursor.
+
+<details>
+<summary>Failure details</summary>
+
+**Scenario:** Request page 1 → follow `next` cursor → request page 2  
+**Expected:** No duplicate items  
+**Observed:** 2 items from page 1 reappeared on page 2
+
+**Status:** `500` ❌
+
+</details>
+```
+
+### FAIL — multiple findings
+
+```md
+## E2E — FAIL
+
+> [!IMPORTANT]
+> **3 failures found across 2 API flows.**
+
+| Severity | Area | Issue |
+|---|---|---|
+| 🔴 Critical | `GET /api/v1/comments` | Cursor pagination returns duplicate items |
+| 🟠 High | `GET /api/v1/search` | `limit=50` returns `400` |
+| 🟡 Medium | `GET /api/v1/channel` | Missing `X-RateLimit-*` headers |
+
+**Coverage:** 8 routes · 14 scenarios · 3 failures
+
+<details>
+<summary>Failure details</summary>
+
+### 🔴 `GET /api/v1/comments`
+
+**Impact:** Consumers can receive duplicate records across pages.
+
+**Expected:** Page 2 contains no items from page 1.  
+**Observed:** 2 items from page 1 were repeated.
+
+---
+
+### 🟠 `GET /api/v1/search`
+
+**Impact:** Maximum supported page size cannot be requested.
+
+**Expected:** `limit=50` succeeds.  
+**Observed:** Request returns `400`.
+
+---
+
+### 🟡 `GET /api/v1/channel`
+
+**Impact:** Clients cannot reliably consume rate-limit metadata.
+
+**Expected:** `X-RateLimit-*` headers present.  
+**Observed:** Headers missing.
+
+</details>
+```
+
+For failures, rank findings by severity and impact, keep each finding identifiable by route/flow, and put supporting evidence behind progressive disclosure.
