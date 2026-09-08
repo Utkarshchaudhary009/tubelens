@@ -152,6 +152,10 @@ export async function handleRelated(
     );
     // The source stays pristine: always fork, even on the miss that stored it.
     const next = forkContinuation(result.value.forkFrom, id);
+    // Cursors are process-local (see src/lib/continuations.ts): a response
+    // carrying one must never sit in the shared CDN, or a replay on another
+    // instance resolves it to [] + next: null. Only exhausted first pages
+    // (next == null, no cursor involved) keep the public TTL.
     return successResponse(result.value.items, {
       requestId,
       next,
@@ -166,7 +170,8 @@ export async function handleRelated(
             },
           ]
         : [],
-      cacheControl: CACHE_CONTROL.related,
+      cacheControl:
+        next !== null ? CACHE_CONTROL.noStore : CACHE_CONTROL.related,
     });
   } catch (err) {
     return errorResponse(requestId, classifyFeedError(err));
@@ -186,6 +191,8 @@ async function serveContinuation(
   // Best-effort: unknown/expired/exhausted cursor -> empty page, never error.
   // A cursor minted for another video is rejected the same way (the foreign
   // cursor is left untouched so it still works under its own video id).
+  // Every cursor response is private/no-store: cursors are process-local, so
+  // a CDN-cached cursor page would break paging on replay/cross-instance.
   if (!entry || !hasMoreResults(entry)) {
     if (entry) {
       dropContinuation(cursor);
@@ -195,7 +202,7 @@ async function serveContinuation(
       next: null,
       region,
       lang,
-      cacheControl: CACHE_CONTROL.related,
+      cacheControl: CACHE_CONTROL.noStore,
     });
   }
   if (entry.scope !== undefined && entry.scope !== videoId) {
@@ -204,7 +211,7 @@ async function serveContinuation(
       next: null,
       region,
       lang,
-      cacheControl: CACHE_CONTROL.related,
+      cacheControl: CACHE_CONTROL.noStore,
     });
   }
   // Buffered items remain on this page object: serve from this entry's own
@@ -225,7 +232,7 @@ async function serveContinuation(
       next,
       region,
       lang,
-      cacheControl: CACHE_CONTROL.related,
+      cacheControl: CACHE_CONTROL.noStore,
     });
   }
   // Buffer exhausted but upstream has more: fetch the next immutable page and
@@ -243,7 +250,7 @@ async function serveContinuation(
       next,
       region,
       lang,
-      cacheControl: CACHE_CONTROL.related,
+      cacheControl: CACHE_CONTROL.noStore,
     });
   } catch {
     dropContinuation(cursor);
@@ -258,7 +265,7 @@ async function serveContinuation(
           message: "Could not load the next page upstream.",
         },
       ],
-      cacheControl: CACHE_CONTROL.related,
+      cacheControl: CACHE_CONTROL.noStore,
     });
   }
 }

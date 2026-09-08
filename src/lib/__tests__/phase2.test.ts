@@ -119,7 +119,8 @@ describe("related handler (mocked upstream)", () => {
     expect(typeof b1.page.next).toBe("string");
     expect(b1.meta.requestId).toBe("phase2");
     expect(first.headers.get("X-Request-Id")).toBe("phase2");
-    expect(first.headers.get("Cache-Control")).toContain("s-maxage=600");
+    // Page carries a process-local cursor -> private/no-store, never CDN.
+    expect(first.headers.get("Cache-Control")).toBe("private, no-store");
 
     const second = await handleRelated(
       req(
