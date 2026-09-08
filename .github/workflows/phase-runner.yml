@@ -24,14 +24,15 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: true
+          token: ${{ secrets.PAT }}
 
       - name: Install OpenCode
         run: curl -fsSL https://opencode.ai/install | bash
 
       - name: Run phase runner
         env:
-          GH_TOKEN: ${{ github.token }}
-          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PAT }}
+          GITHUB_TOKEN: ${{ secrets.PAT }}
         run: |
           export PATH="$HOME/.opencode/bin:$PATH"
           set -o pipefail

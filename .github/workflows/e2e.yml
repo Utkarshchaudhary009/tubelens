@@ -42,7 +42,18 @@ jobs:
           fi
 
       - name: Install OpenCode
-        run: curl -fsSL https://opencode.ai/install | bash
+        run: |
+          for i in 1 2 3; do
+            if curl -fsSL https://opencode.ai/install | bash; then
+              break
+            fi
+            echo "OpenCode install attempt $i failed; retrying..."
+            sleep 10
+            if [ "$i" = 3 ]; then
+              echo "OpenCode install failed after 3 attempts."
+              exit 1
+            fi
+          done
 
       - name: Give E2E agent full machine access
         run: |
@@ -80,8 +91,12 @@ jobs:
       - name: Restore AGENTS.md
         if: always()
         run: |
-          cp /tmp/AGENTS.orig.md AGENTS.md
-          git diff --exit-code -- AGENTS.md
+          if [ -f /tmp/AGENTS.orig.md ]; then
+            cp /tmp/AGENTS.orig.md AGENTS.md
+            git diff --exit-code -- AGENTS.md
+          else
+            echo "No AGENTS.md backup found at /tmp/AGENTS.orig.md; skipping restore."
+          fi
 
       - name: Fail when the E2E agent changed the repository
         if: always()

@@ -1,0 +1,81 @@
+name: unit-test
+
+on:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: unit-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout (tokenless)
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          git clone "https://github.com/${GITHUB_REPOSITORY}.git" .
+          git fetch origin "$GITHUB_SHA" --depth 1
+          git checkout "$GITHUB_SHA"
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install deps
+        run: bun install --frozen-lockfile
+
+      - name: Lint
+        run: |
+          bun run lint > /tmp/unit-test-lint.log 2>&1
+          code=$?
+          cat /tmp/unit-test-lint.log
+          exit $code
+
+      - name: Typecheck
+        run: |
+          bunx tsc --noEmit > /tmp/unit-test-tsc.log 2>&1
+          code=$?
+          cat /tmp/unit-test-tsc.log
+          exit $code
+
+      - name: Unit tests
+        run: |
+          bun test > /tmp/unit-test-test.log 2>&1
+          code=$?
+          cat /tmp/unit-test-test.log
+          exit $code
+
+      - name: Build
+        run: |
+          bun run build > /tmp/unit-test-build.log 2>&1
+          code=$?
+          cat /tmp/unit-test-build.log
+          exit $code
+
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            echo '## unit-test summary'
+            echo
+            for step in lint tsc test build; do
+              log="/tmp/unit-test-${step}.log"
+              echo "### ${step}"
+              echo
+              if [ -f "$log" ]; then
+                echo '```'
+                cat "$log"
+                echo '```'
+              else
+                echo 'Not run (an earlier step failed).'
+              fi
+              echo
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
