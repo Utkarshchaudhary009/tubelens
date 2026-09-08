@@ -5,8 +5,19 @@ description: Base URL, auth, pagination, rate limits, and envelope conventions.
 
 # API Overview
 
-- **Base URL:** `/api/v1` — full contract in `openapi.json` (served at `/api/v1/openapi.json` when published).
+- **Base URL:** `/api/v1` — full contract served live at `/api/v1/openapi.json`.
 - **Auth:** none for public read endpoints (future: API key via `Authorization: Bearer`).
+- **Endpoints (Phase 1):** `GET /health`, `GET /search`, `GET /videos/{id}`,
+  `GET /resolve`, `GET /openapi.json`.
+- **Search:** `q` required; `type=video|channel|playlist|all` (default `all`);
+  `limit` 1–50 (default 20, clamped); `cursor` for pages 2+ (unknown/expired
+  cursor returns `data: []` + `page.next: null`, never an error).
+- **Videos:** `GET /videos/{id}` with a plausible YouTube id; `region`/`lang`
+  are echo-only context (upstream locale is fixed, cache key is the id).
+- **Resolve:** `GET /resolve?url=` classifies any YouTube URL to `{ type, id }`
+  with no upstream call.
+- **Health:** always 200 — `session: ready` normally, `session: degraded` +
+  `warnings[]` when the YouTube session fails (never 500).
 - **Envelope:** success `{ data, page: { next }, meta, warnings }`; errors `{ error: { code, message, hint, status } }`.
 - **Pagination:** opaque `cursor` + `limit`; empty page is `data: []` + `page.next: null` (never 404).
 - **Headers:** every response carries `X-Request-Id` (+ `meta.requestId`) and `X-RateLimit-*`; 429s add `Retry-After` + `code: rate_limited`.

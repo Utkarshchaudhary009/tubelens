@@ -9,10 +9,20 @@ Shape: `{ error: { code, message, hint, status } }` — stable snake_case `code`
 
 | Status | Code | Retry |
 | --- | --- | --- |
-| 400 | `invalid_params` | Fix query/path per `openapi.json`, do not retry as-is |
-| 404 | `not_found` | Only for missing resources (empty pages are 200) |
+| 400 | `missing_query` (`/search` without `?q=`) | Add `?q=`, do not retry as-is |
+| 400 | `invalid_type` (bad `type`) | Use `video`, `channel`, `playlist`, or `all` |
+| 400 | `invalid_limit` (non-integer `limit`) | Use an integer 1–50 (default 20) |
+| 400 | `invalid_video_id` | Use a valid YouTube video id |
+| 400 | `missing_url` (`/resolve` without `?url=`) | Add `?url=` with a YouTube link |
+| 400 | `unresolvable_url` | Check the URL is a supported YouTube link |
+| 404 | `video_not_found` (missing/private/deleted) | Check the id, or `/resolve` the URL first |
 | 429 | `rate_limited` | Honor `Retry-After`, back off exponentially |
-| 502 | `upstream_unavailable` | Retry with backoff; stale cache may serve `meta.cached: true` |
-| 500 | `internal_error` | Retry once with new `X-Request-Id`, then report |
+| 502 | `upstream_degraded` | Retry with backoff; stale cache may serve `meta.cached: true` |
+| 504 | `upstream_timeout` (8s fail-fast fired) | Retry shortly |
+
+Notes: unknown/expired search `cursor` values return 200 with `data: []`, never
+an error. `/health` always returns 200 (`session: degraded` + `warnings[]` when
+the YouTube session fails). Stale serves add `warnings[]` (`stale_served`,
+`continuation_failed`, `session_degraded`).
 
 Always echo `X-Request-Id` when reporting failures.

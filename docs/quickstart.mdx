@@ -8,9 +8,14 @@ description: Call your first TubeLens endpoint in under a minute.
 ```bash
 curl "http://localhost:3000/api/v1/health"
 curl "http://localhost:3000/api/v1/search?q=lofi&limit=20"
+curl "http://localhost:3000/api/v1/videos/dQw4w9WgXcQ"
+curl "http://localhost:3000/api/v1/resolve?url=https://youtu.be/dQw4w9WgXcQ"
+curl "http://localhost:3000/api/v1/openapi.json"
 ```
 
 Defaults: `limit` 20 / max 50, `region` US, `lang` en. Paginate with `?cursor=&limit=`.
+Search accepts `type=video|channel|playlist|all` (default `all`); unknown or
+expired `cursor` values return `data: []` + `page.next: null`, never an error.
 
 Next: [API Overview](/docs/api/overview) · [Errors](/docs/errors).
-Full contract: future `/api/v1/openapi.json` + `openapi.json`.
+Full contract: live at `/api/v1/openapi.json`.
