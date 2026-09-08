@@ -119,11 +119,25 @@ export async function handleRelated(
     });
   }
 
+  // Cursor scope binds endpoint + video: a related cursor presented to
+  // comments (or another video) is terminal ([] + next: null) and never
+  // yields foreign items. Scopes live server-side in the continuation
+  // entry; the opaque cursor itself reveals nothing.
+  const scope = `related:${id}`;
+
   // Cursor requests skip re-fetching page 1 — only limit/region/lang apply.
   // Unknown/expired cursors yield [] + next: null, never an error.
   const cursor = params.get("cursor");
   if (cursor) {
-    return serveContinuation(requestId, region, lang, id, cursor, limit, deps);
+    return serveContinuation(
+      requestId,
+      region,
+      lang,
+      scope,
+      cursor,
+      limit,
+      deps,
+    );
   }
 
   const cacheKey = `related:v1:${id}:${limit}`;
@@ -145,13 +159,13 @@ export async function handleRelated(
           .slice(0, limit)
           .map(mapRelatedItem)
           .filter((d): d is RelatedItemDTO => d !== null);
-        const forkFrom = storeContinuation(page, limit, id);
+        const forkFrom = storeContinuation(page, limit, scope);
         return { items, forkFrom };
       },
       60 * 60 * 1000, // stale window backs serve-stale-on-error.
     );
     // The source stays pristine: always fork, even on the miss that stored it.
-    const next = forkContinuation(result.value.forkFrom, id);
+    const next = forkContinuation(result.value.forkFrom, scope);
     // Cursors are process-local (see src/lib/continuations.ts): a response
     // carrying one must never sit in the shared CDN, or a replay on another
     // instance resolves it to [] + next: null. Only exhausted first pages
@@ -182,17 +196,18 @@ async function serveContinuation(
   requestId: string,
   region: string,
   lang: string,
-  videoId: string,
+  scope: string,
   cursor: string,
   pageSize: number = DEFAULT_LIMIT,
   deps: RelatedDeps = defaultDeps,
 ) {
   const entry = takeContinuation(cursor);
   // Best-effort: unknown/expired/exhausted cursor -> empty page, never error.
-  // A cursor minted for another video is rejected the same way (the foreign
-  // cursor is left untouched so it still works under its own video id).
-  // Every cursor response is private/no-store: cursors are process-local, so
-  // a CDN-cached cursor page would break paging on replay/cross-instance.
+  // A cursor minted for another endpoint or video is rejected the same way
+  // (the foreign cursor is left untouched so it still works under its own
+  // endpoint + video). Every cursor response is private/no-store: cursors
+  // are process-local, so a CDN-cached cursor page would break paging on
+  // replay/cross-instance.
   if (!entry || !hasMoreResults(entry)) {
     if (entry) {
       dropContinuation(cursor);
@@ -205,7 +220,7 @@ async function serveContinuation(
       cacheControl: CACHE_CONTROL.noStore,
     });
   }
-  if (entry.scope !== undefined && entry.scope !== videoId) {
+  if (entry.scope !== undefined && entry.scope !== scope) {
     return successResponse([], {
       requestId,
       next: null,
@@ -244,7 +259,7 @@ async function serveContinuation(
       .slice(0, pageSize)
       .map(mapRelatedItem)
       .filter((d): d is RelatedItemDTO => d !== null);
-    const next = resolveNext(storeContinuation(nextPage, pageSize, videoId));
+    const next = resolveNext(storeContinuation(nextPage, pageSize, scope));
     return successResponse(items, {
       requestId,
       next,

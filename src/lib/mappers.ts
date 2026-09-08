@@ -652,7 +652,8 @@ export function classifyCaptionsError(err: unknown): ClassifiedVideoError {
 
 /**
  * Only transcript-specific signals (missing engagement/transcript panel,
- * transcript continuation, or disabled captions) -> 404
+ * transcript continuation, a failed get_transcript fetch for an
+ * already-resolved video, or disabled captions) -> 404
  * transcript_unavailable with a hint telling callers to hide the panel.
  * Everything else delegates to classifyVideoError, so private/deleted videos
  * report video_not_found and transient failures report 502/504 instead of a
@@ -662,7 +663,7 @@ export function classifyTranscriptError(err: unknown): ClassifiedVideoError {
   const raw =
     err instanceof Error ? `${err.name}: ${err.message}` : String(err);
   if (
-    /transcript_unavailable|transcript\s+(panel|continuation|not found|unavailable|not available)|no transcript|engagement panels?|captions?_disabled|captions?\s+disabled/i.test(
+    /transcript_unavailable|get_transcript|transcript\s+(panel|continuation|not found|unavailable|not available)|no transcript|engagement panels?|captions?_disabled|captions?\s+disabled/i.test(
       raw,
     )
   ) {

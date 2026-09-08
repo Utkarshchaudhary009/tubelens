@@ -453,6 +453,40 @@ describe("review: narrow captions/transcript classifiers", () => {
       classifyTranscriptError(new Error("captions disabled")),
     ).toMatchObject({ code: "transcript_unavailable", status: 404 });
   });
+
+  test("failed get_transcript fetch -> 404 transcript_unavailable (route-level)", async () => {
+    // getInfo() succeeded but getTranscript() threw: the video resolves, so
+    // this is a missing transcript, not a missing video (never a 502).
+    const transcriptFailure = Object.assign(
+      new Error(
+        "Request to https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false failed with status code 400",
+      ),
+      { name: "InnertubeError" },
+    );
+    expect(classifyTranscriptError(transcriptFailure)).toMatchObject({
+      code: "transcript_unavailable",
+      status: 404,
+    });
+    // getInfo-stage failures still report the video, not the transcript.
+    expect(
+      classifyTranscriptError(new Error("NOT_FOUND: video")),
+    ).toMatchObject({ code: "video_not_found", status: 404 });
+
+    const id = "dQw4w9WgXcQ";
+    const res = await handleTranscript(
+      req(`http://x/api/v1/videos/${id}/transcript`),
+      id,
+      {
+        fetchTranscript: async () => {
+          throw transcriptFailure;
+        },
+      },
+    );
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error.code).toBe("transcript_unavailable");
+    expect(typeof body.error.hint).toBe("string");
+  });
 });
 
 describe("review: cross-endpoint cursor isolation", () => {
@@ -515,6 +549,86 @@ describe("review: cross-endpoint cursor isolation", () => {
     ).json();
     expect(back.data).toEqual([]);
     expect(back.page).toEqual({ next: null });
+  });
+
+  test("same-video related<->comments cursors are terminal ([] + next: null)", async () => {
+    const video = "CCCCCCCCCCC";
+    const relatedDeps = {
+      fetchFirstPage: async (_id: string) =>
+        fakeFeed([[vid("r1", "R1"), vid("r2", "R2")]]),
+      continueFeed: async (p: ContinuationSearch) => p.getContinuation(),
+    };
+    const commentsDeps = {
+      fetchFirstPage: async (_id: string) =>
+        fakeFeed([[thread("c1", "one"), thread("c2", "two")]]),
+      continueFeed: async (p: ContinuationSearch) => p.getContinuation(),
+    };
+
+    const rFirst = await (
+      await handleRelated(
+        req(`http://x/api/v1/videos/${video}/related?limit=1`),
+        video,
+        relatedDeps,
+      )
+    ).json();
+    expect(typeof rFirst.page.next).toBe("string");
+
+    // Related cursor on comments: terminal, foreign cursor untouched.
+    const toComments = await (
+      await handleComments(
+        req(
+          `http://x/api/v1/videos/${video}/comments?cursor=${rFirst.page.next}&limit=1`,
+        ),
+        video,
+        commentsDeps,
+      )
+    ).json();
+    expect(toComments.data).toEqual([]);
+    expect(toComments.page).toEqual({ next: null });
+
+    const cFirst = await (
+      await handleComments(
+        req(`http://x/api/v1/videos/${video}/comments?limit=1`),
+        video,
+        commentsDeps,
+      )
+    ).json();
+    expect(typeof cFirst.page.next).toBe("string");
+
+    // Comments cursor on related: terminal, foreign cursor untouched.
+    const toRelated = await (
+      await handleRelated(
+        req(
+          `http://x/api/v1/videos/${video}/related?cursor=${cFirst.page.next}&limit=1`,
+        ),
+        video,
+        relatedDeps,
+      )
+    ).json();
+    expect(toRelated.data).toEqual([]);
+    expect(toRelated.page).toEqual({ next: null });
+
+    // Both cursors still work under their own endpoint (no state consumed).
+    const ownRelated = await (
+      await handleRelated(
+        req(
+          `http://x/api/v1/videos/${video}/related?cursor=${rFirst.page.next}&limit=1`,
+        ),
+        video,
+        relatedDeps,
+      )
+    ).json();
+    expect(ownRelated.data.map((d: { id: string }) => d.id)).toEqual(["r2"]);
+    const ownComments = await (
+      await handleComments(
+        req(
+          `http://x/api/v1/videos/${video}/comments?cursor=${cFirst.page.next}&limit=1`,
+        ),
+        video,
+        commentsDeps,
+      )
+    ).json();
+    expect(ownComments.data.map((d: { id: string }) => d.id)).toEqual(["c2"]);
   });
 });
 
