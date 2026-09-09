@@ -148,7 +148,7 @@ say, and what is spoken.
 
 **Goal:** Read any playlist and list a channel's curated collections.
 
-**Status:** `[~]` in progress
+**Status:** `[x]` done — shipped via PR #8 (merged 2026-09-09): playlists/:id profile + items pagination + channels/:id/playlists live with 340 unit tests + e2e PASS on live upstream.
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
