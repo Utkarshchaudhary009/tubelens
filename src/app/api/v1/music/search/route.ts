@@ -19,6 +19,7 @@ import {
   type MusicSearchType,
   mapMusicItem,
   parseMusicSearchParams,
+  toUpstreamMusicFilter,
 } from "@/lib/music";
 import {
   DEFAULT_LIMIT,
@@ -43,10 +44,11 @@ const defaultDeps: MusicSearchDeps = {
     // Single 8s budget for the whole first-page fetch (session + search).
     return withTimeout(async () => {
       const innertube = await getInnertube();
-      const filters = type === "all" ? undefined : { type };
-      const search = filters
-        ? await innertube.music.search(q, filters)
-        : await innertube.music.search(q);
+      const filters = toUpstreamMusicFilter(type);
+      const search =
+        filters.type === undefined
+          ? await innertube.music.search(q)
+          : await innertube.music.search(q, filters);
       return adaptMusicSearch(
         search as unknown as Parameters<typeof adaptMusicSearch>[0],
       );

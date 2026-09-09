@@ -262,6 +262,22 @@ function parseCountText(v: unknown): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
+/**
+ * Audience counts only: like parseCountText but requires an explicit
+ * audience/subscriber/follower/listener label in the text, so free-form
+ * bios ("16 Grammy Awards…") never leak bare numbers into subscriberCount.
+ */
+function parseLabeledCount(v: unknown): number | undefined {
+  const text = textOf(v);
+  if (
+    !text ||
+    !/(subscriber|audience|follower|monthly listener|listener)/i.test(text)
+  ) {
+    return undefined;
+  }
+  return parseCountText(text);
+}
+
 /** Spread an ObservedArray/iterable defensively; non-iterables -> []. */
 function spreadChildren(v: unknown): unknown[] {
   if (v === null || v === undefined) {
@@ -683,14 +699,10 @@ export function mapArtistProfile(
     return null;
   }
   const header = asRecord(root.header);
-  // A usable profile needs a header (or at minimum a root title) — a bare
-  // {} with only a fallback id is a hollow payload, i.e. 404, not a profile
-  // named after its own id.
-  if (!header && !textOf(root.title)) {
-    return null;
-  }
-  const name =
-    textOf(header?.title) ?? textOf(root.title) ?? fallbackId ?? undefined;
+  // The name must come from upstream titles only — a bare {} or an empty
+  // header with just a fallback id is a hollow payload (404), never a
+  // profile named after its own UC id.
+  const name = textOf(header?.title) ?? textOf(root.title) ?? undefined;
   if (!name) {
     return null;
   }
@@ -720,12 +732,15 @@ export function mapArtistProfile(
   if (thumbs) {
     dto.thumbnails = thumbs;
   }
-  // Monthly-audience / subscriber text lives in header description runs or
-  // subtitle text ("375M monthly audience", "15.7M subscribers").
+  // Audience counts are only read from text carrying an audience label
+  // ("375M monthly audience", "15.7M subscribers"). The header description
+  // is a free-form bio ("16 Grammy Awards…") — parsing bare numbers out of
+  // it would publish unrelated figures as subscriberCount, so unlabeled
+  // text yields undefined (omitted) instead of a wrong number.
   const audience =
-    parseCountText(header?.description) ??
-    parseCountText(header?.subtitle) ??
-    parseCountText(header?.subscriber_count_text);
+    parseLabeledCount(header?.description) ??
+    parseLabeledCount(header?.subtitle) ??
+    parseLabeledCount(header?.subscriber_count_text);
   if (audience !== undefined) {
     dto.subscriberCount = Math.round(audience);
   }
@@ -796,15 +811,43 @@ export interface ChartSectionDTO {
 }
 
 /**
- * Navigates a parsed charts browse response to its shelf array:
- * SingleColumnBrowseResults -> selected (else first) tab -> content
- * (SectionList) -> contents. Any shape mismatch yields [] so callers serve
- * data:[] + next:null instead of fabricating sections.
+ * Navigates a charts browse response to its shelf array. Two shapes are
+ * supported, raw first:
+ *
+ * - Raw UNPARSED browse (`parse` omitted): `data.contents.
+ *   singleColumnBrowseResultsRenderer.tabs[0].tabRenderer.content.
+ *   sectionListRenderer.contents` — an array of `musicShelfRenderer` /
+ *   `musicCarouselShelfRenderer` objects. This is the primary path: the
+ *   youtubei.js v18 parsed Parser throws `Tabs not found!` internally for
+ *   FEmusic_charts and yields empty contents, while the raw payload is valid
+ *   (verified live). Raw renderers are normalized to parsed-like nodes below
+ *   so mapping stays single-sourced.
+ * - Parsed browse (SuperParsedResult `.item()` or bare `{ tabs }`):
+ *   SingleColumnBrowseResults -> selected (else first) tab -> content
+ *   (SectionList) -> contents. Kept for tolerance, not used by the route.
+ *
+ * Any shape mismatch yields [] so callers serve data:[] + next:null instead
+ * of fabricating sections.
  */
 export function extractChartShelves(browse: unknown): unknown[] {
   const root = asRecord(browse);
   if (!root) {
     return [];
+  }
+  const rawTabs = spreadChildren(
+    asRecord(
+      asRecord(asRecord(root.data)?.contents)
+        ?.singleColumnBrowseResultsRenderer,
+    )?.tabs,
+  );
+  if (rawTabs.length > 0) {
+    const firstTab = asRecord(rawTabs[0]);
+    const sections = spreadChildren(
+      asRecord(
+        asRecord(asRecord(firstTab?.tabRenderer)?.content)?.sectionListRenderer,
+      )?.contents,
+    );
+    return sections.map(normalizeRawShelf);
   }
   // actions.execute(parse:true) wraps the node in a SuperParsedResult
   // exposing .item(); tolerate both wrapped and bare payloads.
@@ -824,6 +867,134 @@ export function extractChartShelves(browse: unknown): unknown[] {
     return [];
   }
   return spreadChildren(content.contents);
+}
+
+/**
+ * Normalizes a raw `navigationEndpoint` ({ watchEndpoint, browseEndpoint,
+ * watchPlaylistEndpoint }) to the parsed `{ payload }` shape mappers read.
+ */
+function normalizeNavEndpoint(nav: unknown): Record<string, unknown> | null {
+  const e = asRecord(nav);
+  if (!e) {
+    return null;
+  }
+  const payload: Record<string, string> = {};
+  const videoId = asRecord(e.watchEndpoint)?.videoId;
+  if (typeof videoId === "string" && videoId !== "") {
+    payload.videoId = videoId;
+  }
+  const browseId = asRecord(e.browseEndpoint)?.browseId;
+  if (typeof browseId === "string" && browseId !== "") {
+    payload.browseId = browseId;
+  }
+  const playlistId = asRecord(e.watchPlaylistEndpoint)?.playlistId;
+  if (typeof playlistId === "string" && playlistId !== "") {
+    payload.playlistId = playlistId;
+  }
+  return Object.keys(payload).length > 0 ? { payload } : null;
+}
+
+/** Raw browse pageType for kind inference (ARTIST rows carry no item_type). */
+function navPageType(nav: unknown): string {
+  return String(
+    asRecord(
+      asRecord(asRecord(nav)?.browseEndpoint)
+        ?.browseEndpointContextSupportedConfigs,
+    )?.browseEndpointContextMusicConfig ?? "",
+  ).toUpperCase();
+}
+
+function normalizeThumbsRaw(v: unknown): Thumbnail[] | undefined {
+  // Raw: thumbnail.musicThumbnailRenderer.thumbnail.thumbnails.
+  const inner = asRecord(asRecord(v)?.musicThumbnailRenderer)?.thumbnail ?? v;
+  return normalizeThumbs(asRecord(inner)?.thumbnails ?? inner);
+}
+
+function normalizeRawRow(row: unknown): unknown {
+  const r = asRecord(row);
+  if (!r || typeof r.type === "string") {
+    return row;
+  }
+  const list = asRecord(r.musicResponsiveListItemRenderer);
+  if (list) {
+    const endpoint = normalizeNavEndpoint(list.navigationEndpoint);
+    const flex = spreadChildren(list.flexColumns).map((fc) => {
+      const col =
+        asRecord(asRecord(fc)?.musicResponsiveListItemFlexColumnRenderer) ??
+        asRecord(fc) ??
+        {};
+      const runs = asRecord(col.text)?.runs;
+      return {
+        title: {
+          text: textOf(col.text),
+          runs: Array.isArray(runs)
+            ? runs.map((run) => ({
+                text: String(asRecord(run)?.text ?? ""),
+                endpoint: normalizeNavEndpoint(
+                  asRecord(run)?.navigationEndpoint,
+                ),
+              }))
+            : undefined,
+        },
+      };
+    });
+    const normalized: Record<string, unknown> = {
+      type: "MusicResponsiveListItem",
+      flex_columns: flex,
+      endpoint,
+      thumbnail: normalizeThumbsRaw(list.thumbnail) ?? [],
+    };
+    // Raw artist rows carry no item_type — the ARTIST pageType is the signal
+    // (song rows link to albums/playlists instead).
+    if (navPageType(list.navigationEndpoint).includes("ARTIST")) {
+      normalized.item_type = "artist";
+    }
+    return normalized;
+  }
+  const card = asRecord(r.musicTwoRowItemRenderer);
+  if (card) {
+    return {
+      type: "MusicTwoRowItem",
+      title: { text: textOf(card.title) },
+      subtitle: { text: textOf(card.subtitle) },
+      endpoint: normalizeNavEndpoint(card.navigationEndpoint),
+      thumbnail: normalizeThumbsRaw(card.thumbnailRenderer) ?? [],
+    };
+  }
+  return row;
+}
+
+/**
+ * Normalizes one raw shelf renderer to a parsed-like shelf. Already-parsed
+ * shelves (with a `type`) pass through untouched.
+ */
+function normalizeRawShelf(shelf: unknown): unknown {
+  const s = asRecord(shelf);
+  if (!s || typeof s.type === "string") {
+    return shelf;
+  }
+  const musicShelf = asRecord(s.musicShelfRenderer);
+  if (musicShelf) {
+    // The leading top-songs shelf arrives title-less and row-less on first
+    // paint (rows lazy-load) — normalize to an empty shelf so it is skipped
+    // downstream rather than served hollow.
+    return {
+      type: "MusicShelf",
+      title: musicShelf.title ? { text: textOf(musicShelf.title) } : undefined,
+      contents: spreadChildren(musicShelf.contents).map(normalizeRawRow),
+    };
+  }
+  const carousel = asRecord(s.musicCarouselShelfRenderer);
+  if (carousel) {
+    const header = asRecord(carousel.header);
+    const basic = asRecord(header?.musicCarouselShelfBasicHeaderRenderer);
+    return {
+      type: "MusicCarouselShelf",
+      title: { text: textOf(basic?.title) },
+      contents: spreadChildren(carousel.contents).map(normalizeRawRow),
+    };
+  }
+  return shelf;
 }
 
 /**
@@ -849,6 +1020,17 @@ export function mapChartSections(
       .filter((d): d is MusicItemDTO => d !== null);
     if (!title && items.length === 0) {
       continue;
+    }
+    // Raw chart rows carry no ATV musicVideoType signal, so track rows with
+    // plain watch endpoints map as video. Inside a section YouTube Music
+    // itself titles "Top songs", those rows are definitionally songs —
+    // relabel the kind (ids/titles untouched), never invent items.
+    if (title && /^\s*top songs/i.test(title)) {
+      for (const item of items) {
+        if (item.kind === "video") {
+          item.kind = "song";
+        }
+      }
     }
     sections.push({ title: title ?? "Untitled section", items });
   }

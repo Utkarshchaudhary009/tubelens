@@ -192,6 +192,122 @@ const searchDeps = (rows: unknown[], hasMore = false) => ({
   continueSearch: async (page: MusicSearchPage) => page.getContinuation(),
 });
 
+// Raw UNPARSED charts browse shape (mirrors the live payload: data.contents.
+// singleColumnBrowseResultsRenderer.tabs[0].tabRenderer.content.
+// sectionListRenderer.contents). This is the shape the route actually fetches
+// after the parsed-Parser `Tabs not found!` failure — the parsed-shape
+// fixture above only covers the tolerance path.
+const rawArtistRow = (id: string, name: string, audience: string): unknown => ({
+  musicResponsiveListItemRenderer: {
+    thumbnail: {
+      musicThumbnailRenderer: {
+        thumbnail: {
+          thumbnails: [{ url: "https://i/a", width: 60, height: 60 }],
+        },
+      },
+    },
+    flexColumns: [
+      {
+        musicResponsiveListItemFlexColumnRenderer: {
+          text: { runs: [{ text: name }] },
+        },
+      },
+      {
+        musicResponsiveListItemFlexColumnRenderer: {
+          text: { runs: [{ text: audience }] },
+        },
+      },
+    ],
+    navigationEndpoint: {
+      browseEndpoint: {
+        browseId: id,
+        browseEndpointContextSupportedConfigs: {
+          browseEndpointContextMusicConfig: {
+            pageType: "MUSIC_PAGE_TYPE_ARTIST",
+          },
+        },
+      },
+    },
+  },
+});
+
+const rawChartCard = (id: string, title: string): unknown => ({
+  musicTwoRowItemRenderer: {
+    title: { runs: [{ text: title }] },
+    subtitle: {
+      runs: [{ text: "Chart" }, { text: " • " }, { text: "YouTube Music" }],
+    },
+    navigationEndpoint: { browseEndpoint: { browseId: id } },
+    thumbnailRenderer: {
+      musicThumbnailRenderer: {
+        thumbnail: {
+          thumbnails: [{ url: "https://i/c", width: 192, height: 192 }],
+        },
+      },
+    },
+  },
+});
+
+const rawWatchRow = (id: string, title: string): unknown => ({
+  musicResponsiveListItemRenderer: {
+    flexColumns: [
+      {
+        musicResponsiveListItemFlexColumnRenderer: {
+          text: { runs: [{ text: title }] },
+        },
+      },
+    ],
+    navigationEndpoint: { watchEndpoint: { videoId: id } },
+    thumbnail: {
+      musicThumbnailRenderer: { thumbnail: { thumbnails: [] } },
+    },
+  },
+});
+
+const rawCarousel = (title: string, rows: unknown[]): unknown => ({
+  musicCarouselShelfRenderer: {
+    header: {
+      musicCarouselShelfBasicHeaderRenderer: {
+        title: { runs: [{ text: title }] },
+      },
+    },
+    contents: rows,
+  },
+});
+
+const rawChartsPage = (contents: unknown[]): unknown => ({
+  data: {
+    contents: {
+      singleColumnBrowseResultsRenderer: {
+        tabs: [
+          {
+            tabRenderer: {
+              content: { sectionListRenderer: { contents } },
+            },
+          },
+        ],
+      },
+    },
+  },
+});
+
+const chartsRawUnparsed = (): unknown =>
+  rawChartsPage([
+    // Title-less, row-less top-songs shelf -> skipped.
+    { musicShelfRenderer: { trackingParams: "x" } },
+    rawCarousel("Top artists", [
+      rawArtistRow("UC_top1000000000000001", "Top Artist", "15.7M subscribers"),
+      rawArtistRow(
+        "UC_top2000000000000001",
+        "Second Artist",
+        "7.31M subscribers",
+      ),
+    ]),
+    rawCarousel("Video charts", [
+      rawChartCard("VLPLchart00000000000001", "Top 100 Songs"),
+    ]),
+  ]);
+
 describe("music search validation", () => {
   test("missing q is a 400 missing_query", async () => {
     const res = await handleMusicSearch(
@@ -437,6 +553,49 @@ describe("music charts", () => {
     expect(res.headers.get("x-request-id")).toBe("phase6");
   });
 
+  test("RAW unparsed browse payload populates sections (live regression)", async () => {
+    const res = await handleMusicCharts(req("http://x/api/v1/music/charts"), {
+      fetchCharts: async () => chartsRawUnparsed(),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // The title-less, row-less top-songs shelf is skipped; carousels serve.
+    expect(body.data.sections.map((s: { title: string }) => s.title)).toEqual([
+      "Top artists",
+      "Video charts",
+    ]);
+    const artists = body.data.sections[0].items;
+    expect(artists).toHaveLength(2);
+    expect(artists[0]).toMatchObject({
+      id: "UC_top1000000000000001",
+      kind: "artist",
+      title: "Top Artist",
+    });
+    expect(artists[0].thumbnails[0].url).toBe("https://i/a");
+    const charts = body.data.sections[1].items;
+    expect(charts).toHaveLength(1);
+    expect(charts[0]).toMatchObject({
+      id: "VLPLchart00000000000001",
+      kind: "playlist",
+      title: "Top 100 Songs",
+    });
+    expect(body.page.next).toBeNull();
+  });
+
+  test("RAW top-songs rows relabel video to song, never fabricated", async () => {
+    const raw = rawChartsPage([
+      rawCarousel("Top songs", [rawWatchRow("vidraw1", "Some Song")]),
+    ]);
+    const res = await handleMusicCharts(req("http://x/api/v1/music/charts"), {
+      fetchCharts: async () => raw,
+    });
+    const body = await res.json();
+    expect(body.data.sections[0].title).toBe("Top songs");
+    expect(body.data.sections[0].items).toEqual([
+      expect.objectContaining({ id: "vidraw1", kind: "song" }),
+    ]);
+  });
+
   test("non-US country echoes with a country_fallback warning", async () => {
     const res = await handleMusicCharts(
       req("http://x/api/v1/music/charts?country=de"),
@@ -567,6 +726,34 @@ describe("artists", () => {
       },
     );
     expect(hollow.status).toBe(404);
+
+    // Empty header: no upstream title, so no profile named after the UC id.
+    const emptyHeader = await handleArtist(
+      req(`http://x/api/v1/artists/${UC}`),
+      UC,
+      {
+        fetchArtist: async () => ({ header: {}, sections: [] }),
+      },
+    );
+    expect(emptyHeader.status).toBe(404);
+    expect((await emptyHeader.json()).error.code).toBe("artist_not_found");
+  });
+
+  test("unlabeled bio numbers never become subscriberCount", async () => {
+    const res = await handleArtist(req(`http://x/api/v1/artists/${UC}`), UC, {
+      fetchArtist: async () => ({
+        header: {
+          title: { text: "Adele" },
+          description: "Won 16 Grammy Awards and 12 Brit Awards in 2021.",
+          thumbnail: { contents: [{ url: "https://i/a" }] },
+        },
+        sections: [],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.name).toBe("Adele");
+    expect(body.data.subscriberCount).toBeUndefined();
   });
 
   test("timeout is a 504, generic failure a 502", async () => {

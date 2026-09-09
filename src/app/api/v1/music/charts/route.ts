@@ -17,13 +17,16 @@ export const runtime = "nodejs";
 // lazily so this module stays importable without the server-only singleton).
 // Tests inject mocks here and never touch src/lib/youtube.
 export interface MusicChartsDeps {
-  /** Raw parsed charts browse response (shelf navigation happens in-mapper). */
+  /** Raw UNPARSED charts browse response (shelf navigation happens in-mapper). */
   fetchCharts: () => Promise<unknown>;
 }
 
-// Charts browseId + params (verified live 2026-09-09): the Charts entry in
-// getExplore() carries browseId FEmusic_charts with these exact params; a
-// bare browse without params returns no sections.
+// Charts browseId + params (verified live): the Charts entry in getExplore()
+// carries browseId FEmusic_charts with these exact params; a bare browse
+// without params returns no sections. Fetched UNPARSED — youtubei.js v18's
+// Parser throws `Tabs not found!` internally for this page and yields empty
+// contents, while the raw payload carries all shelves (mapper normalizes the
+// raw `music*Renderer` shapes, so `parse` is deliberately omitted).
 export const CHARTS_BROWSE_ID = "FEmusic_charts";
 export const CHARTS_PARAMS = "sgYPRkVtdXNpY19leHBsb3Jl";
 
@@ -37,7 +40,6 @@ const defaultDeps: MusicChartsDeps = {
         browseId: CHARTS_BROWSE_ID,
         params: CHARTS_PARAMS,
         client: "YTMUSIC",
-        parse: true,
       })) as unknown;
     }, 8000);
   },
