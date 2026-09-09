@@ -128,7 +128,7 @@ say, and what is spoken.
 
 **Goal:** Full channel profiles and their content surfaces.
 
-**Status:** `[~]` in progress — Phase 4 branch open (profile + videos/shorts/streams routes, mappers, openapi paths, unit tests).
+**Status:** `[x]` done — shipped via PR #7 (merged 2026-09-09): channels/:id profile + videos/shorts/streams feeds live with 286 unit tests + e2e PASS on live upstream.
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
