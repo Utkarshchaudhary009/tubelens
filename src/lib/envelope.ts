@@ -43,6 +43,10 @@ export const CACHE_CONTROL = {
   hashtag: "public, s-maxage=600, stale-while-revalidate=3600",
   /** channel uploads/shorts/streams feeds (Phase 4). */
   channelFeed: "public, s-maxage=600, stale-while-revalidate=3600",
+  /** playlist items + channel playlists feeds (Phase 5). */
+  playlistFeed: "public, s-maxage=600, stale-while-revalidate=3600",
+  /** playlist metadata + first items page (Phase 5). */
+  playlist: "public, s-maxage=3600, stale-while-revalidate=86400",
   /** comments: fast-moving (Phase 2). */
   comments: "public, s-maxage=300, stale-while-revalidate=1800",
   /** captions: static-ish track list (Phase 2). */

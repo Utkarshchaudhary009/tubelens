@@ -148,7 +148,7 @@ say, and what is spoken.
 
 **Goal:** Read any playlist and list a channel's curated collections.
 
-**Status:** `[ ]` not started
+**Status:** `[~]` in progress
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
