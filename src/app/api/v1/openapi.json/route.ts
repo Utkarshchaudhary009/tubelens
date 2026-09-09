@@ -3,12 +3,54 @@ import { baseHeaders, CACHE_CONTROL, getRequestId } from "@/lib/envelope";
 
 export const runtime = "nodejs";
 
-// OpenAPI 3.1 stub for Phase 3: documents exactly the 11 shipped endpoints.
+// OpenAPI 3.1 stub for Phase 4: documents exactly the 15 shipped endpoints.
 // Grows each phase; promoted to the full spec in Phase 10. Exported as a
 // pure builder so tests can validate it without HTTP.
 export function buildOpenApiDocument() {
   const envelopeRef = "#/components/schemas/Envelope";
   const errorRef = "#/components/schemas/ErrorBody";
+  const channelIdParam = {
+    name: "id",
+    in: "path",
+    required: true,
+    schema: { type: "string" },
+    description:
+      "UC channel id (e.g. UC_x5XG1OV2P6uZZ5FSM9Ttw) or @handle (e.g. @veritasium).",
+  };
+  const limitParam = {
+    name: "limit",
+    in: "query",
+    schema: { type: "integer", minimum: 1, maximum: 50, default: 20 },
+  };
+  const cursorParam = {
+    name: "cursor",
+    in: "query",
+    schema: { type: "string" },
+  };
+  const regionParam = {
+    name: "region",
+    in: "query",
+    schema: { type: "string", default: "US" },
+  };
+  const langParam = {
+    name: "lang",
+    in: "query",
+    schema: { type: "string", default: "en" },
+  };
+  const rateLimitedResponse = {
+    description:
+      "rate_limited; retry after the Retry-After seconds. X-RateLimit-* headers are present on every response.",
+    content: { "application/json": { schema: { $ref: errorRef } } },
+  };
+  const degradedResponse = {
+    description:
+      "upstream_degraded; YouTube Innertube call failed. Retry shortly.",
+    content: { "application/json": { schema: { $ref: errorRef } } },
+  };
+  const timeoutResponse = {
+    description: "upstream_timeout; the 8s fail-fast fired. Retry shortly.",
+    content: { "application/json": { schema: { $ref: errorRef } } },
+  };
   return {
     openapi: "3.1.0",
     info: {
@@ -17,7 +59,7 @@ export function buildOpenApiDocument() {
       // package.json (0.1.0 until the v1 API is declared stable).
       version: "0.1.0",
       description:
-        "API-first YouTube data API. Phase 3 ships discovery: search autocomplete suggestions and hashtag video feeds, plus Phase 2 watch essentials (related rail, comments, captions, transcript) and Phase 1 health, search, video details, URL resolving, and this spec.",
+        "API-first YouTube data API. Phase 4 ships channel profiles, uploads, Shorts shelves, and live/upcoming/past streams, plus Phase 3 discovery (search autocomplete suggestions, hashtag feeds), Phase 2 watch essentials (related rail, comments, captions, transcript) and Phase 1 health, search, video details, URL resolving, and this spec.",
     },
     servers: [{ url: "https://tubelens.vercel.app/api/v1" }],
     paths: {
@@ -574,6 +616,131 @@ export function buildOpenApiDocument() {
                 "upstream_degraded; URL resolution failed. Retry shortly.",
               content: { "application/json": { schema: { $ref: errorRef } } },
             },
+          },
+        },
+      },
+      "/channels/{id}": {
+        get: {
+          operationId: "getChannel",
+          summary: "Channel profile, stats, and about info",
+          parameters: [channelIdParam, regionParam, langParam],
+          responses: {
+            200: {
+              description: "Channel profile.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "invalid_channel_id.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            404: {
+              description: "channel_not_found.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
+            502: degradedResponse,
+            504: timeoutResponse,
+          },
+        },
+      },
+      "/channels/{id}/videos": {
+        get: {
+          operationId: "getChannelVideos",
+          summary: "Channel uploads (latest long-form videos)",
+          parameters: [
+            channelIdParam,
+            limitParam,
+            cursorParam,
+            regionParam,
+            langParam,
+          ],
+          responses: {
+            200: {
+              description:
+                "Paged channel uploads. Long-form only — shorts never leak into this feed.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "invalid_channel_id or invalid_limit.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            404: {
+              description: "channel_not_found.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
+            502: degradedResponse,
+            504: timeoutResponse,
+          },
+        },
+      },
+      "/channels/{id}/shorts": {
+        get: {
+          operationId: "getChannelShorts",
+          summary: "Channel Shorts shelf",
+          parameters: [
+            channelIdParam,
+            limitParam,
+            cursorParam,
+            regionParam,
+            langParam,
+          ],
+          responses: {
+            200: {
+              description:
+                "Paged channel Shorts. Shorts only — long-form never leaks into this feed. A channel with no shorts tab yields data:[] + next:null, never 404.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "invalid_channel_id or invalid_limit.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            404: {
+              description: "channel_not_found.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
+            502: degradedResponse,
+            504: timeoutResponse,
+          },
+        },
+      },
+      "/channels/{id}/streams": {
+        get: {
+          operationId: "getChannelStreams",
+          summary: "Live, upcoming, and past streams",
+          parameters: [
+            channelIdParam,
+            limitParam,
+            cursorParam,
+            regionParam,
+            langParam,
+          ],
+          responses: {
+            200: {
+              description:
+                "Paged live/upcoming/past streams. Every item carries isLive/isUpcoming plus scheduled start and viewer counts where served. A channel with no live tab yields data:[] + next:null, never 404.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "invalid_channel_id or invalid_limit.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            404: {
+              description: "channel_not_found.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
+            502: degradedResponse,
+            504: timeoutResponse,
           },
         },
       },
