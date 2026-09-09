@@ -51,6 +51,12 @@ export const CACHE_CONTROL = {
   musicSearch: "public, s-maxage=300, stale-while-revalidate=3600",
   /** music charts snapshot (Phase 6). */
   musicCharts: "public, s-maxage=600, stale-while-revalidate=3600",
+  /** shorts discovery feed: fast-moving (Phase 7). */
+  feedShorts: "public, s-maxage=600, stale-while-revalidate=3600",
+  /** live discovery feed: fastest-moving vertical (Phase 7). */
+  feedLive: "public, s-maxage=300, stale-while-revalidate=3600",
+  /** gaming hub feed: fast-moving (Phase 7). */
+  feedGaming: "public, s-maxage=600, stale-while-revalidate=3600",
   /** comments: fast-moving (Phase 2). */
   comments: "public, s-maxage=300, stale-while-revalidate=1800",
   /** captions: static-ish track list (Phase 2). */
