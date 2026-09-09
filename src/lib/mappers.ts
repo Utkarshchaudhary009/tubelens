@@ -135,7 +135,7 @@ function detectKind(node: Record<string, unknown>): SearchKind | null {
     raw.includes("video") ||
     raw.includes("movie") ||
     raw.includes("reel") ||
-    raw === "short"
+    raw.includes("short")
   ) {
     return "video";
   }
@@ -552,6 +552,17 @@ export interface ClassifiedVideoError {
 }
 
 /**
+ * Shared timeout/abort signal: the 8s fail-fast surfaces as
+ * TimeoutError/AbortError. Single copy used by /search and
+ * /search/suggestions (identical behavior in both).
+ */
+export function isUpstreamTimeout(err: unknown): boolean {
+  const raw =
+    err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+  return /timeout|timed out|abort|TimeoutError|AbortError/i.test(raw);
+}
+
+/**
  * Distinguishes: NOT_FOUND/private/deleted/video-unavailable -> 404
  * video_not_found; LOGIN_REQUIRED/bot-guard -> 502 upstream_degraded;
  * timeouts/aborts -> 504 upstream_timeout; everything else -> 502
@@ -689,4 +700,49 @@ export function classifyTranscriptError(err: unknown): ClassifiedVideoError {
     };
   }
   return classifyVideoError(err);
+}
+
+/**
+ * Hashtag feed failures: timeouts/aborts -> 504 upstream_timeout (checked
+ * first, mirroring classifyVideoError, so a timeout carrying not-found-ish
+ * text still reports 504); hashtag/feed-scoped not-found signals (unknown
+ * or empty tag pages) -> 404 hashtag_not_found with a hint to try another
+ * tag; everything else -> 502 upstream_degraded, so generic or transient
+ * 404-ish messages never misclassify as a missing hashtag. The explicit
+ * not-found signal may sit on EITHER side of "hashtag": after it within a
+ * bounded window (e.g. "hashtag feed unavailable"), or directly before it
+ * in tight NOT_FOUND/404 form (e.g. "NOT_FOUND: hashtag page"). A bare
+ * "hashtag page" with no signal stays 502 — so does a loose transient like
+ * "Service Unavailable: hashtag page fetch failed".
+ * Never leaks stack traces — callers use only these four fields.
+ */
+export function classifyHashtagError(err: unknown): ClassifiedVideoError {
+  const raw =
+    err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+  if (/timeout|timed out|abort|TimeoutError|AbortError/i.test(raw)) {
+    return {
+      code: "upstream_timeout",
+      message: "Hashtag feed timed out upstream.",
+      hint: "Retry shortly; include X-Request-Id in bug reports.",
+      status: 504,
+    };
+  }
+  if (
+    /(?:not.?found|404)\s*:?\s*hashtag|hashtag[\s\S]{0,40}(not.?found|not_found|unavailable|not available|empty|invalid)|no videos?( found)? for/i.test(
+      raw,
+    )
+  ) {
+    return {
+      code: "hashtag_not_found",
+      message: "No videos found for this hashtag.",
+      hint: "Try another hashtag, e.g. /api/v1/hashtags/lofi.",
+      status: 404,
+    };
+  }
+  return {
+    code: "upstream_degraded",
+    message: "Hashtag feed failed upstream.",
+    hint: "Retry shortly; include X-Request-Id in bug reports.",
+    status: 502,
+  };
 }

@@ -37,6 +37,10 @@ export const CACHE_CONTROL = {
   search: "public, s-maxage=300, stale-while-revalidate=3600",
   /** related rail: fast-moving-ish (Phase 2). */
   related: "public, s-maxage=600, stale-while-revalidate=3600",
+  /** search suggestions: autocomplete (Phase 3). */
+  suggestions: "public, s-maxage=300, stale-while-revalidate=1800",
+  /** hashtag feed: fast-moving band, same as related (Phase 3). */
+  hashtag: "public, s-maxage=600, stale-while-revalidate=3600",
   /** comments: fast-moving (Phase 2). */
   comments: "public, s-maxage=300, stale-while-revalidate=1800",
   /** captions: static-ish track list (Phase 2). */

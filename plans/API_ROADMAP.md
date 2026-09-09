@@ -19,8 +19,9 @@ No frontend work is tracked here — each phase ships backend endpoints only.
 > Status legend: `[ ]` not started · `[~]` in progress · `[x]` done.
 > Update the checkbox and `Status` line as phases land.
 
-Total: **38 endpoints across 10 phases** (`openapi.json` stub lands in Phase 1,
-completed in Phase 10 — counted once).
+Total: **37 endpoints across 10 phases** (`openapi.json` stub lands in Phase 1,
+completed in Phase 10 — counted once). (`trending` deferred out of Phase 3 on
+2026-09-08 — see Phase 3 plan note; was 38.)
 
 ---
 
@@ -96,20 +97,28 @@ say, and what is spoken.
 
 ---
 
-## Phase 3 — Discovery (3 endpoints)
+## Phase 3 — Discovery (2 endpoints)
 
 **Goal:** Answer "what's popular and what did you mean" beyond raw search.
 
-**Status:** `[ ]` not started
+**Status:** `[~]` in progress — branch `phase-3-discovery`.
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
-| GET | `/api/v1/trending` | Trending videos filterable by geo and category |
 | GET | `/api/v1/search/suggestions` | Autocomplete suggestions for a partial query |
 | GET | `/api/v1/hashtags/:tag` | Video feed for a hashtag |
 
+> **Plan note (2026-09-08, verified live):** `GET /trending` is **deferred** —
+> its upstream no longer exists. YouTube removed the Trending tab/feed (2025);
+> youtubei.js dropped `getTrending` in v17 (`#1114`); raw browses of
+> `FEtrending` / `FEexplore` return HTTP 400; and logged-out `getHomeFeed()`
+> returns only a sign-in nudge (no videos) across WEB/ANDROID/TVHTML5 sessions.
+> Shipping `/trending` on any of these would serve empty or fabricated data.
+> It returns to the roadmap only when a $0-viable popular-feed source exists
+> (candidates: Phase 6 charts or Phase 7 vertical feeds). The remaining
+> Phase 3 exit criteria below are unchanged and verifiable.
+
 **Exit criteria / validate before Phase 4:**
-- `trending` matches the YouTube trending tab's top items for 3 regions.
 - `suggestions` p95 latency < 500ms (cacheable, short TTL).
 - Hashtag feed returns non-empty results for 10 sampled real-world tags.
 

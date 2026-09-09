@@ -17,7 +17,7 @@ API-first YouTube data API: **Next.js App Router Route Handlers + youtubei.ts on
 - `src/app/api/v1/` — all endpoints (Route Handlers only, no pages per phase).
 - `src/lib/youtube.ts` — youtubei.ts **singleton, `import "server-only"`**; never instantiate per request.
 - `src/lib/{envelope,cache,errors}.ts` — shared envelope, cache headers, typed errors.
-- `plans/API_ROADMAP.md` — **owner-only single source of truth** (10 phases, 38 endpoints); `plans/DX_PRINCIPLES.md` (envelope, cursor, error+hint); `plans/CACHING.md` (L0/L1/L2 ladder + TTLs).
+- `plans/API_ROADMAP.md` — **owner-only single source of truth** (10 phases, 37 endpoints); `plans/DX_PRINCIPLES.md` (envelope, cursor, error+hint); `plans/CACHING.md` (L0/L1/L2 ladder + TTLs).
 - `docs/*.mdx` — **public developer docs** (Fumadocs/MDX); docs bot owns `docs/**`, never `plans/`.
 
 ## Commands

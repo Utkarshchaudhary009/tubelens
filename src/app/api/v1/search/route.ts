@@ -11,7 +11,11 @@ import {
 } from "@/lib/continuations";
 import { CACHE_CONTROL, getRequestId, successResponse } from "@/lib/envelope";
 import { errorResponse } from "@/lib/errors";
-import { mapSearchItem, type SearchResultDTO } from "@/lib/mappers";
+import {
+  isUpstreamTimeout,
+  mapSearchItem,
+  type SearchResultDTO,
+} from "@/lib/mappers";
 import {
   DEFAULT_LIMIT,
   parseLang,
@@ -160,16 +164,6 @@ export async function handleSearch(
       status: 502,
     });
   }
-}
-
-/**
- * Timeout/abort signal matching videos/[id]'s classifier
- * (classifyVideoError): the 8s fail-fast surfaces as TimeoutError/AbortError.
- */
-function isUpstreamTimeout(err: unknown): boolean {
-  const raw =
-    err instanceof Error ? `${err.name}: ${err.message}` : String(err);
-  return /timeout|timed out|abort|TimeoutError|AbortError/i.test(raw);
 }
 
 async function serveContinuation(
