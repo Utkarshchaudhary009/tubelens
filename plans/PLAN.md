@@ -185,7 +185,7 @@ say, and what is spoken.
 
 **Goal:** Cover the three highest-traffic vertical feeds.
 
-**Status:** `[ ]` not started
+**Status:** `[~]` in progress — branch `phase-7-explore-verticals`
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |

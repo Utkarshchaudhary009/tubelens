@@ -3,7 +3,7 @@ import { baseHeaders, CACHE_CONTROL, getRequestId } from "@/lib/envelope";
 
 export const runtime = "nodejs";
 
-// OpenAPI 3.1 stub for Phase 6: documents exactly the 21 shipped endpoints.
+// OpenAPI 3.1 stub for Phase 7: documents exactly the 24 shipped endpoints.
 // Grows each phase; promoted to the full spec in Phase 10. Exported as a
 // pure builder so tests can validate it without HTTP.
 export function buildOpenApiDocument() {
@@ -66,7 +66,7 @@ export function buildOpenApiDocument() {
       // package.json (0.1.0 until the v1 API is declared stable).
       version: "0.1.0",
       description:
-        "API-first YouTube data API. Phase 6 ships music-native search (typed song vs album vs artist), charts snapshots, and artist profiles with top releases, plus Phase 5 playlist reads (metadata plus first items page, paginated items, and a channel's curated playlists), Phase 4 channel profiles, uploads, Shorts shelves, and live/upcoming/past streams, Phase 3 discovery (search autocomplete suggestions, hashtag feeds), Phase 2 watch essentials (related rail, comments, captions, transcript) and Phase 1 health, search, video details, URL resolving, and this spec.",
+        "API-first YouTube data API. Phase 7 ships explore verticals (Shorts discovery, cross-channel live discovery with viewer counts/scheduled times, and the gaming hub), plus Phase 6 music-native search (typed song vs album vs artist), charts snapshots, and artist profiles with top releases, plus Phase 5 playlist reads (metadata plus first items page, paginated items, and a channel's curated playlists), Phase 4 channel profiles, uploads, Shorts shelves, and live/upcoming/past streams, Phase 3 discovery (search autocomplete suggestions, hashtag feeds), Phase 2 watch essentials (related rail, comments, captions, transcript) and Phase 1 health, search, video details, URL resolving, and this spec.",
     },
     servers: [{ url: "https://tubelens.vercel.app/api/v1" }],
     paths: {
@@ -575,6 +575,75 @@ export function buildOpenApiDocument() {
                 "upstream_timeout; the 8s fail-fast fired. Retry shortly.",
               content: { "application/json": { schema: { $ref: errorRef } } },
             },
+          },
+        },
+      },
+      "/feed/shorts": {
+        get: {
+          operationId: "getShortsFeed",
+          summary: "Shorts discovery feed",
+          parameters: [limitParam, cursorParam, regionParam, langParam],
+          responses: {
+            200: {
+              description:
+                "Paged Shorts discovery items (search-backed, Shorts-refined; falls back to base video results when the Shorts chip is absent). meta.cached reflects the origin L0 only — CDN L1 hits replay the stored JSON verbatim (including its meta).",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "invalid_limit.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
+            502: degradedResponse,
+            504: timeoutResponse,
+          },
+        },
+      },
+      "/feed/live": {
+        get: {
+          operationId: "getLiveFeed",
+          summary: "Cross-channel live discovery",
+          parameters: [limitParam, cursorParam, regionParam, langParam],
+          responses: {
+            200: {
+              description:
+                "Paged live/upcoming streams across channels (search-backed live filtering; per-channel state is also available via /channels/{id}/streams). Every item carries isLive/isUpcoming plus a live viewer count or scheduled start.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "invalid_limit.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
+            502: degradedResponse,
+            504: timeoutResponse,
+          },
+        },
+      },
+      "/feed/gaming": {
+        get: {
+          operationId: "getGamingFeed",
+          summary: "Gaming hub video discovery",
+          parameters: [limitParam, cursorParam, regionParam, langParam],
+          responses: {
+            200: {
+              description:
+                "Paged gaming videos (search-backed; the /gaming browse feed is not servable logged-out, so the hub resolves to search). meta.cached reflects the origin L0 only — CDN L1 hits replay the stored JSON verbatim (including its meta).",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "invalid_limit.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
+            502: degradedResponse,
+            504: timeoutResponse,
           },
         },
       },
