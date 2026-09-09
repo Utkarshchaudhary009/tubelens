@@ -3,7 +3,7 @@ import { baseHeaders, CACHE_CONTROL, getRequestId } from "@/lib/envelope";
 
 export const runtime = "nodejs";
 
-// OpenAPI 3.1 stub for Phase 4: documents exactly the 15 shipped endpoints.
+// OpenAPI 3.1 stub for Phase 5: documents exactly the 18 shipped endpoints.
 // Grows each phase; promoted to the full spec in Phase 10. Exported as a
 // pure builder so tests can validate it without HTTP.
 export function buildOpenApiDocument() {
@@ -16,6 +16,13 @@ export function buildOpenApiDocument() {
     schema: { type: "string" },
     description:
       "UC channel id (e.g. UC_x5XG1OV2P6uZZ5FSM9Ttw) or @handle (e.g. @veritasium).",
+  };
+  const playlistIdParam = {
+    name: "id",
+    in: "path",
+    required: true,
+    schema: { type: "string", pattern: "^[A-Za-z0-9_-]{2,64}$" },
+    description: "Playlist id (e.g. PLbpi6ZahtOH6Ar_3Genz5apy8Clnv3m0A).",
   };
   const limitParam = {
     name: "limit",
@@ -59,7 +66,7 @@ export function buildOpenApiDocument() {
       // package.json (0.1.0 until the v1 API is declared stable).
       version: "0.1.0",
       description:
-        "API-first YouTube data API. Phase 4 ships channel profiles, uploads, Shorts shelves, and live/upcoming/past streams, plus Phase 3 discovery (search autocomplete suggestions, hashtag feeds), Phase 2 watch essentials (related rail, comments, captions, transcript) and Phase 1 health, search, video details, URL resolving, and this spec.",
+        "API-first YouTube data API. Phase 5 ships playlist reads (metadata plus first items page, paginated items, and a channel's curated playlists), plus Phase 4 channel profiles, uploads, Shorts shelves, and live/upcoming/past streams, Phase 3 discovery (search autocomplete suggestions, hashtag feeds), Phase 2 watch essentials (related rail, comments, captions, transcript) and Phase 1 health, search, video details, URL resolving, and this spec.",
     },
     servers: [{ url: "https://tubelens.vercel.app/api/v1" }],
     paths: {
@@ -736,6 +743,99 @@ export function buildOpenApiDocument() {
             },
             404: {
               description: "channel_not_found.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
+            502: degradedResponse,
+            504: timeoutResponse,
+          },
+        },
+      },
+      "/channels/{id}/playlists": {
+        get: {
+          operationId: "getChannelPlaylists",
+          summary: "Playlists created by a channel",
+          parameters: [
+            channelIdParam,
+            limitParam,
+            cursorParam,
+            regionParam,
+            langParam,
+          ],
+          responses: {
+            200: {
+              description:
+                "Paged channel playlists. A channel with no playlists shelf yields data:[] + next:null, never 404.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "invalid_channel_id or invalid_limit.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            404: {
+              description: "channel_not_found.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
+            502: degradedResponse,
+            504: timeoutResponse,
+          },
+        },
+      },
+      "/playlists/{id}": {
+        get: {
+          operationId: "getPlaylist",
+          summary: "Playlist metadata plus first page of items",
+          parameters: [playlistIdParam, limitParam, regionParam, langParam],
+          responses: {
+            200: {
+              description:
+                "Playlist metadata plus the first items page. data is { playlist, items }; the forked cursor is scoped playlist:{id} so it also resolves under /playlists/{id}/items for pages 2+. Deleted/private videos degrade to typed placeholders ({ kind: deleted|private }), never 500s.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "invalid_playlist_id or invalid_limit.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            404: {
+              description: "playlist_not_found.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
+            502: degradedResponse,
+            504: timeoutResponse,
+          },
+        },
+      },
+      "/playlists/{id}/items": {
+        get: {
+          operationId: "getPlaylistItems",
+          summary: "Paginated playlist items",
+          parameters: [
+            playlistIdParam,
+            limitParam,
+            cursorParam,
+            regionParam,
+            langParam,
+          ],
+          responses: {
+            200: {
+              description:
+                "Paged playlist items in stable upstream order. Deleted/private videos degrade to typed placeholders ({ kind: deleted|private }), never 500s.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "invalid_playlist_id or invalid_limit.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            404: {
+              description: "playlist_not_found.",
               content: { "application/json": { schema: { $ref: errorRef } } },
             },
             429: rateLimitedResponse,
