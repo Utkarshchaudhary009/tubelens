@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import { NextRequest } from "next/server";
 import {
   clearHandleCache,
+  defaultResolveChannelId,
   lookupHandle,
   storeHandle,
 } from "../../app/api/v1/channels/_lib";
@@ -204,6 +205,8 @@ describe("duration text helper", () => {
     expect(parseDurationText("1:02:03")).toBe(3723);
     expect(parseDurationText({ text: "5:00" })).toBe(300);
     expect(parseDurationText("25:00:00")).toBe(90_000);
+    // Huge hour values must not overflow to Infinity.
+    expect(parseDurationText("1e308:59")).toBeUndefined();
     for (const bad of [
       "",
       "live",
@@ -506,6 +509,72 @@ describe("handle -> UC id map cache", () => {
     }
     expect(lookupHandle("@h0")).toBeUndefined();
     expect(lookupHandle("@h500")).toBe(UC);
+  });
+
+  test("re-store refreshes recency: hot handles survive eviction", () => {
+    for (let i = 0; i < 500; i += 1) {
+      storeHandle(`@h${i}`, UC);
+    }
+    storeHandle("@h0", UC);
+    storeHandle("@fresh", UC);
+    expect(lookupHandle("@h0")).toBe(UC);
+    expect(lookupHandle("@h1")).toBeUndefined();
+    expect(lookupHandle("@fresh")).toBe(UC);
+  });
+
+  test("expired entries swept before evicting live ones", () => {
+    for (let i = 0; i < 499; i += 1) {
+      storeHandle(`@h${i}`, UC);
+    }
+    storeHandle("@dead", UC, -1);
+    storeHandle("@fresh", UC);
+    expect(lookupHandle("@dead")).toBeUndefined();
+    expect(lookupHandle("@h0")).toBe(UC);
+    expect(lookupHandle("@fresh")).toBe(UC);
+  });
+
+  test("concurrent resolves for one handle share one upstream call", async () => {
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const upstream = async (_handle: string): Promise<string> => {
+      calls += 1;
+      await gate;
+      return UC;
+    };
+    const p1 = defaultResolveChannelId("@coalesce", upstream);
+    const p2 = defaultResolveChannelId("@coalesce", upstream);
+    release();
+    const [r1, r2] = await Promise.all([p1, p2]);
+    expect([r1, r2]).toEqual([UC, UC]);
+    expect(calls).toBe(1);
+    expect(lookupHandle("@coalesce")).toBe(UC);
+  });
+
+  test("failed resolve clears the in-flight entry so the next call retries", async () => {
+    let calls = 0;
+    const failing = async (_handle: string): Promise<string> => {
+      calls += 1;
+      throw new Error("resolve_url failed with status code 404");
+    };
+    let first: unknown;
+    try {
+      await defaultResolveChannelId("@fail", failing);
+    } catch (err) {
+      first = err;
+    }
+    expect(first).toBeDefined();
+    let second: unknown;
+    try {
+      await defaultResolveChannelId("@fail", failing);
+    } catch (err) {
+      second = err;
+    }
+    expect(second).toBeDefined();
+    expect(calls).toBe(2);
+    expect(lookupHandle("@fail")).toBeUndefined();
   });
 });
 

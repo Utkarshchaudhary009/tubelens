@@ -131,17 +131,20 @@ export function parseDurationText(v: unknown): number | undefined {
   }
   const [a, b, c] = parts as number[];
   // Clock components below hours must be < 60 — "1:60" is malformed, not
-  // 120s. Hours may be arbitrarily large (multi-hour streams/VODs).
+  // 120s. Hours may be arbitrarily large (multi-hour streams/VODs), but a
+  // huge hour value must not overflow to Infinity.
   if (c === undefined) {
     if (b >= 60) {
       return undefined;
     }
-    return a * 60 + b;
+    const seconds = a * 60 + b;
+    return Number.isFinite(seconds) ? seconds : undefined;
   }
   if (b >= 60 || c >= 60) {
     return undefined;
   }
-  return a * 3600 + b * 60 + c;
+  const seconds = a * 3600 + b * 60 + c;
+  return Number.isFinite(seconds) ? seconds : undefined;
 }
 
 function normalizeThumbs(v: unknown): Thumbnail[] | undefined {

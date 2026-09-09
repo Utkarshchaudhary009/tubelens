@@ -41,18 +41,32 @@ export function storeHandle(
   id: string,
   ttlMs: number = HANDLE_TTL_MS,
 ): void {
-  if (handleCache.size >= HANDLE_MAX && !handleCache.has(handle)) {
-    const oldest = handleCache.keys().next();
-    if (!oldest.done) {
-      handleCache.delete(oldest.value);
+  if (handleCache.has(handle)) {
+    // Refresh recency on re-store so hot handles are evicted last (LRU).
+    handleCache.delete(handle);
+  } else {
+    // Sweep expired entries first so dead keys never push out live ones;
+    // only evict the oldest live entry when still at capacity.
+    const now = Date.now();
+    for (const [key, entry] of handleCache) {
+      if (now > entry.expiresAt) {
+        handleCache.delete(key);
+      }
+    }
+    if (handleCache.size >= HANDLE_MAX) {
+      const oldest = handleCache.keys().next();
+      if (!oldest.done) {
+        handleCache.delete(oldest.value);
+      }
     }
   }
   handleCache.set(handle, { id, expiresAt: Date.now() + ttlMs });
 }
 
-/** Test helper — clears the handle -> UC id map. */
+/** Test helper — clears the handle -> UC id map (plus in-flight resolves). */
 export function clearHandleCache(): void {
   handleCache.clear();
+  inflightHandles.clear();
 }
 
 interface RawChannel {
@@ -65,21 +79,13 @@ interface RawChannel {
 }
 
 /**
- * UC id or @handle -> canonical UC channel id. UC ids pass through with no
- * upstream call; handles resolve via navigation/resolve_url, whose browse
- * endpoint payload carries the canonical browseId.
+ * Upstream half of handle resolution (resolveURL -> browseId), separated so
+ * the coalescing wrapper below stays unit-testable with an injected mock.
+ * Never touches the TTL map — the wrapper stores only successes.
  */
-export async function defaultResolveChannelId(input: string): Promise<string> {
-  if (STRICT_CHANNEL_ID.test(input)) {
-    return input;
-  }
-  const key = input.toLowerCase();
-  const cached = lookupHandle(key);
-  if (cached) {
-    return cached;
-  }
+export async function upstreamResolveHandle(input: string): Promise<string> {
   const { getInnertube, withTimeout } = await import("@/lib/youtube");
-  const resolved = await withTimeout(async () => {
+  return withTimeout(async () => {
     const innertube = await getInnertube();
     const endpoint = (await innertube.resolveURL(
       `https://www.youtube.com/${input}`,
@@ -97,8 +103,47 @@ export async function defaultResolveChannelId(input: string): Promise<string> {
     }
     return browseId;
   }, 8000);
-  storeHandle(key, resolved);
-  return resolved;
+}
+
+/** In-flight resolveURL calls by normalized handle for request coalescing. */
+const inflightHandles = new Map<string, Promise<string>>();
+
+/**
+ * UC id or @handle -> canonical UC channel id. UC ids pass through with no
+ * upstream call; handles resolve via navigation/resolve_url (cached ~1h) and
+ * concurrent resolves for one handle share a single in-flight upstream call.
+ */
+export async function defaultResolveChannelId(
+  input: string,
+  upstream: (handle: string) => Promise<string> = upstreamResolveHandle,
+): Promise<string> {
+  if (STRICT_CHANNEL_ID.test(input)) {
+    return input;
+  }
+  const key = input.toLowerCase();
+  const cached = lookupHandle(key);
+  if (cached) {
+    return cached;
+  }
+  const ongoing = inflightHandles.get(key);
+  if (ongoing) {
+    return ongoing;
+  }
+  let task: Promise<string> | undefined;
+  const runner = (async (): Promise<string> => {
+    try {
+      const resolved = await upstream(input);
+      storeHandle(key, resolved);
+      return resolved;
+    } finally {
+      if (task !== undefined && inflightHandles.get(key) === task) {
+        inflightHandles.delete(key);
+      }
+    }
+  })();
+  task = runner;
+  inflightHandles.set(key, runner);
+  return runner;
 }
 
 /** Canonical UC id -> raw getChannel payload for mapChannelProfile. */
