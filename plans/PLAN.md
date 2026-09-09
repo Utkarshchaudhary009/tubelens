@@ -167,7 +167,7 @@ say, and what is spoken.
 
 **Goal:** Music-scoped discovery and artist pages.
 
-**Status:** `[ ]` not started
+**Status:** `[x]` done — shipped via PR #9 (merged 2026-09-09): music/search + music/charts + artists/:id live with 369 unit tests + e2e PASS on live upstream (prod build). Note: `country` is echo-only with `country_fallback` warning for non-US (per-country charts need the YTMusic menu-feedback flow); charts snapshot verified live for the default US region.
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
