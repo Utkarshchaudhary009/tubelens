@@ -205,10 +205,16 @@ describe("phase 3 mappers", () => {
   test("transient error merely mentioning 'hashtag page' stays 502/504", () => {
     // A parse/render failure on the tag page is transient: it must not
     // become a definitive hashtag_not_found (which would 404 and refuse
-    // stale). Only explicit not-found signals in hashtag context 404.
+    // stale). Only explicit not-found signals in hashtag context 404 —
+    // and a loose "Unavailable ... hashtag" is NOT a tight NOT_FOUND.
     expect(
       classifyHashtagError(
         new Error("failed to parse hashtag page: bad token"),
+      ),
+    ).toMatchObject({ code: "upstream_degraded", status: 502 });
+    expect(
+      classifyHashtagError(
+        new Error("Service Unavailable: hashtag page fetch failed"),
       ),
     ).toMatchObject({ code: "upstream_degraded", status: 502 });
     const slow = new Error("timed out loading hashtag page");
