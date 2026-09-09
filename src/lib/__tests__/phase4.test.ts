@@ -1,5 +1,10 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { NextRequest } from "next/server";
+import {
+  clearHandleCache,
+  lookupHandle,
+  storeHandle,
+} from "../../app/api/v1/channels/_lib";
 import { handleChannel } from "../../app/api/v1/channels/[id]/route";
 import { handleChannelShorts } from "../../app/api/v1/channels/[id]/shorts/route";
 import { handleChannelStreams } from "../../app/api/v1/channels/[id]/streams/route";
@@ -26,6 +31,7 @@ import { type ContinuationSearch, clearContinuations } from "../continuations";
 beforeEach(() => {
   clearCache();
   clearContinuations();
+  clearHandleCache();
 });
 
 function req(url: string, requestId = "phase4"): NextRequest {
@@ -77,7 +83,10 @@ const reel = (id: string) => ({
 
 const shortsLockup = (id: string) => ({
   type: "ShortsLockupView",
-  entity_id: id,
+  // entity_id is opaque on real clients (collection id) — the watch id comes
+  // from the tap endpoint.
+  entity_id: `collection-${id}`,
+  on_tap_endpoint: { payload: { videoId: id } },
   accessibility_text: "Short alt",
   thumbnail: [{ url: "https://i/short" }],
   overlay_metadata: {
@@ -194,7 +203,19 @@ describe("duration text helper", () => {
     expect(parseDurationText("12:34")).toBe(754);
     expect(parseDurationText("1:02:03")).toBe(3723);
     expect(parseDurationText({ text: "5:00" })).toBe(300);
-    for (const bad of ["", "live", "12", "1:2:3:4", "ab:cd", null]) {
+    expect(parseDurationText("25:00:00")).toBe(90_000);
+    for (const bad of [
+      "",
+      "live",
+      "12",
+      "1:2:3:4",
+      "ab:cd",
+      "1:60",
+      "59:60",
+      "1:02:60",
+      "1:60:00",
+      null,
+    ]) {
       expect(parseDurationText(bad)).toBeUndefined();
     }
   });
@@ -301,6 +322,14 @@ describe("type-leakage guards", () => {
     });
     expect(mapChannelShort(shortsLockup("s1"))).toMatchObject({ id: "s1" });
     expect(mapChannelShort(lockupShort("ls1"))).toMatchObject({ id: "ls1" });
+    // Opaque entity_id alone is not a watch id — dropped, never emitted.
+    expect(
+      mapChannelShort({
+        type: "ShortsLockupView",
+        entity_id: "opaque-collection-id",
+        overlay_metadata: { primary_text: { text: "Short" } },
+      }),
+    ).toBeNull();
     expect(mapChannelShort(longVideo("v1", "V"))).toBeNull();
     expect(mapChannelShort(lockupVideo("lv1"))).toBeNull();
     expect(mapChannelShort(playlistNode)).toBeNull();
@@ -373,6 +402,27 @@ describe("type-leakage guards", () => {
     });
   });
 
+  test("stream lockups read stats nested in metadata views", () => {
+    const nested = mapChannelStream({
+      type: "LockupView",
+      content_id: "ls1",
+      content_type: "VIDEO",
+      metadata: {
+        title: { text: "Nested stats" },
+        view_count: { text: "10K views" },
+        published: { text: "3 days ago" },
+        length_text: { text: "1:05:00" },
+      },
+    });
+    expect(nested).toMatchObject({
+      id: "ls1",
+      title: "Nested stats",
+      viewText: "10K views",
+      publishedText: "3 days ago",
+      durationSeconds: 3900,
+    });
+  });
+
   test("hasChannelTab: explicit false skips, true/unknown proceeds", () => {
     expect(hasChannelTab({ has_videos: true }, "videos")).toBe(true);
     expect(hasChannelTab({ has_videos: false }, "videos")).toBe(false);
@@ -398,12 +448,23 @@ describe("classifyChannelError", () => {
       "Failed to resolve URL. Expected a NavigationEndpoint but got undefined: @nope",
       "Invalid channel",
       "This channel has been terminated",
+      // Real upstream shape for an unknown @handle: resolveURL throws the
+      // request failure verbatim (resolve_url + 404, no word "channel").
+      "Request to https://youtubei.googleapis.com/youtubei/v1/navigation/resolve_url?prettyPrint=false failed with status code 404",
     ]) {
       expect(classifyChannelError(new Error(msg))).toMatchObject({
         code: "channel_not_found",
         status: 404,
       });
     }
+    // A resolve_url 500 (transient) is NOT a missing channel.
+    expect(
+      classifyChannelError(
+        new Error(
+          "Request to https://youtubei.googleapis.com/youtubei/v1/navigation/resolve_url?prettyPrint=false failed with status code 500",
+        ),
+      ),
+    ).toMatchObject({ code: "upstream_degraded", status: 502 });
     expect(classifyChannelError(new Error("upstream down"))).toMatchObject({
       code: "upstream_degraded",
       status: 502,
@@ -427,6 +488,24 @@ describe("classifyChannelError", () => {
         status: 404,
       });
     }
+  });
+});
+
+describe("handle -> UC id map cache", () => {
+  test("roundtrip hit, miss, and expiry", () => {
+    expect(lookupHandle("@x")).toBeUndefined();
+    storeHandle("@x", UC);
+    expect(lookupHandle("@x")).toBe(UC);
+    storeHandle("@expired", UC, -1);
+    expect(lookupHandle("@expired")).toBeUndefined();
+  });
+
+  test("bounded: oldest entry evicted past the cap", () => {
+    for (let i = 0; i < 501; i += 1) {
+      storeHandle(`@h${i}`, UC);
+    }
+    expect(lookupHandle("@h0")).toBeUndefined();
+    expect(lookupHandle("@h500")).toBe(UC);
   });
 });
 
@@ -547,7 +626,11 @@ describe("profile handler (mocked upstream)", () => {
       "@nope",
       {
         resolveChannelId: async () => {
-          throw new Error('Failed to resolve URL for "@nope"');
+          // Real upstream shape: resolveURL throws the request failure
+          // verbatim for an unknown handle (resolve_url + 404).
+          throw new Error(
+            "Request to https://youtubei.googleapis.com/youtubei/v1/navigation/resolve_url?prettyPrint=false failed with status code 404",
+          );
         },
         fetchProfile: async () => c4Profile,
       },

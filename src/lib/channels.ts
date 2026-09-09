@@ -130,8 +130,18 @@ export function parseDurationText(v: unknown): number | undefined {
     return undefined;
   }
   const [a, b, c] = parts as number[];
-  const seconds = c === undefined ? a * 60 + b : a * 3600 + b * 60 + c;
-  return Number.isFinite(seconds) ? seconds : undefined;
+  // Clock components below hours must be < 60 — "1:60" is malformed, not
+  // 120s. Hours may be arbitrarily large (multi-hour streams/VODs).
+  if (c === undefined) {
+    if (b >= 60) {
+      return undefined;
+    }
+    return a * 60 + b;
+  }
+  if (b >= 60 || c >= 60) {
+    return undefined;
+  }
+  return a * 3600 + b * 60 + c;
 }
 
 function normalizeThumbs(v: unknown): Thumbnail[] | undefined {
@@ -575,14 +585,20 @@ export function mapChannelShort(node: unknown): ChannelShortDTO | null {
   }
   if (lower === "shortslockupview") {
     const overlay = asRecord(n.overlay_metadata);
-    // entity_id can be an opaque collection id on some clients — prefer a
-    // real watch id when the tap endpoint carries one.
     const tapPayload = asRecord(asRecord(n.on_tap_endpoint)?.payload);
     const tapId =
       (typeof tapPayload?.videoId === "string" && tapPayload.videoId) ||
       (typeof tapPayload?.video_id === "string" && tapPayload.video_id) ||
       undefined;
-    const id = tapId ?? videoIdOf(n);
+    // entity_id is deliberately excluded: on some clients it is an opaque
+    // collection id, not a watch id — emitting it would hand callers an
+    // unplayable id. Only real video/watch ids qualify, else null.
+    const watchId =
+      (typeof n.video_id === "string" && n.video_id) ||
+      (typeof n.id === "string" && n.id) ||
+      (typeof n.content_id === "string" && n.content_id) ||
+      undefined;
+    const id = tapId ?? watchId;
     if (!id) {
       return null;
     }
@@ -689,22 +705,21 @@ function finishStreamDTO(
   } else if (typeof upcoming === "string") {
     dto.scheduledStart = upcoming;
   }
-  const views = textOf(n.view_count ?? n.short_view_count ?? n.views);
-  if (views) {
-    if (isLive && /watching/i.test(views)) {
-      dto.viewersText = views;
+  // Stats may sit at the top level or nested in lockup metadata views —
+  // lockupStats covers both shapes (same paths as the video mapper).
+  const stats = lockupStats(n);
+  if (stats.viewText) {
+    if (isLive && /watching/i.test(stats.viewText)) {
+      dto.viewersText = stats.viewText;
     } else {
-      dto.viewText = views;
+      dto.viewText = stats.viewText;
     }
   }
-  const published = textOf(n.published);
-  if (published) {
-    dto.publishedText = published;
+  if (stats.publishedText) {
+    dto.publishedText = stats.publishedText;
   }
-  const duration =
-    parseDurationText(n.length_text) ?? parseDurationText(n.duration);
-  if (duration !== undefined && !isLive) {
-    dto.durationSeconds = Math.round(duration);
+  if (stats.durationSeconds !== undefined && !isLive) {
+    dto.durationSeconds = stats.durationSeconds;
   }
   return dto;
 }
@@ -793,7 +808,7 @@ export function classifyChannelError(err: unknown): ClassifiedChannelError {
     };
   }
   if (
-    /failed to resolve url|channel.{0,60}(not.?found|not found|unavailable|not available|invalid|does.?not.?exist|terminated|private|deleted|removed)|not.?found.{0,40}channel|invalid channel|unknown channel|\b404\b.{0,40}channel|channel.{0,40}\b404\b/i.test(
+    /failed to resolve[ _]url|resolve_url[\s\S]{0,120}(not.?found|\b404\b)|(not.?found|\b404\b)[\s\S]{0,120}resolve_url|channel.{0,60}(not.?found|not found|unavailable|not available|invalid|does.?not.?exist|terminated|private|deleted|removed)|not.?found.{0,40}channel|invalid channel|unknown channel|\b404\b.{0,40}channel|channel.{0,40}\b404\b/i.test(
       raw,
     )
   ) {
