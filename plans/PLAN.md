@@ -185,7 +185,7 @@ say, and what is spoken.
 
 **Goal:** Cover the three highest-traffic vertical feeds.
 
-**Status:** `[~]` in progress — branch `phase-7-explore-verticals`
+**Status:** `[x]` done — shipped via PR #10 (merged 2026-09-09): feed/shorts + feed/live + feed/gaming live with 407 unit tests + e2e PASS on live upstream (prod build). All three search-backed (no native v18 feed methods; gaming browse resolves to a topic channel with no servable tabs logged-out). Note: gaming returns video discovery (no dedicated live filter); `country`/`region` echo-only.
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
