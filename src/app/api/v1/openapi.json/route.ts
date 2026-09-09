@@ -22,7 +22,7 @@ export function buildOpenApiDocument() {
     in: "path",
     required: true,
     schema: { type: "string", pattern: "^[A-Za-z0-9_-]{2,64}$" },
-    description: "Playlist id (e.g. PLbpi6ZahtOH6Ar_3Genz5apy8Clnv3m0A).",
+    description: "Playlist id (e.g. PLplXQ2cg9B_qrCVd1J_iId5SvP8Kf_BfS).",
   };
   const limitParam = {
     name: "limit",

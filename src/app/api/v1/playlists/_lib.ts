@@ -4,12 +4,15 @@
 // tests stay network-free). Single 8s fail-fast budget per first-page fetch,
 // per the API route checklist.
 
-import { adaptChannelTab, emptyChannelTab } from "@/lib/channels";
 import type { ContinuationSearch } from "@/lib/continuations";
-import { adaptPlaylistFeed, emptyPlaylistFeed } from "@/lib/playlists";
+import {
+  adaptChannelPlaylistsPage,
+  adaptPlaylistFeed,
+  emptyPlaylistFeed,
+} from "@/lib/playlists";
 
 type PlaylistTabShape = Parameters<typeof adaptPlaylistFeed>[0];
-type ChannelTabShape = Parameters<typeof adaptChannelTab>[0];
+type ChannelPlaylistsTabShape = Parameters<typeof adaptChannelPlaylistsPage>[0];
 
 interface RawPlaylist {
   items?: unknown;
@@ -65,20 +68,23 @@ export async function defaultContinueFeed(
  * network): an explicit `has_playlists === false` skips the tab call and
  * yields a terminal empty page; otherwise the guarded getPlaylists() call
  * runs, whose missing-method fallback is the same empty page rather than a
- * throw. Never touches Feed internals: items come from the Feed `videos`
- * memo getter via adaptChannelTab.
+ * throw. Reads the Feed `playlists` memo (NOT `videos` — the getPlaylists
+ * tab carries LockupView PLAYLIST nodes there, verified live), with an
+ * `items`/raw-current_tab fallback for client drift.
  */
 export async function fetchChannelPlaylistsTab(
   channel: RawChannel,
 ): Promise<ContinuationSearch> {
   if (channel.has_playlists === false) {
-    return emptyChannelTab();
+    return emptyPlaylistFeed();
   }
   if (typeof channel.getPlaylists !== "function") {
-    return emptyChannelTab();
+    return emptyPlaylistFeed();
   }
-  const tab = (await channel.getPlaylists.call(channel)) as ChannelTabShape;
-  return adaptChannelTab(tab);
+  const tab = (await channel.getPlaylists.call(
+    channel,
+  )) as ChannelPlaylistsTabShape;
+  return adaptChannelPlaylistsPage(tab);
 }
 
 /**

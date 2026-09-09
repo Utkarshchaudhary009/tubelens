@@ -9,10 +9,12 @@ import { handlePlaylist } from "../../app/api/v1/playlists/[id]/route";
 import { cacheSet, clearCache } from "../cache";
 import { type ContinuationSearch, clearContinuations } from "../continuations";
 import {
+  adaptChannelPlaylistsPage,
   adaptPlaylistFeed,
   type ChannelPlaylistsDeps,
   classifyPlaylistError,
   emptyPlaylistFeed,
+  isTransientUpstreamError,
   mapChannelPlaylist,
   mapPlaylistItem,
   mapPlaylistProfile,
@@ -41,7 +43,7 @@ function fakeFeed(pages: Array<unknown[]>): ContinuationSearch {
   return page(0);
 }
 
-const PL = "PLbpi6ZahtOH6Ar_3Genz5apy8Clnv3m0A";
+const PL = "PLplXQ2cg9B_qrCVd1J_iId5SvP8Kf_BfS";
 const UC = "UC_x5XG1OV2P6uZZ5FSM9Ttw";
 
 const playlistVideo = (id: string, title: string, index = 1) => ({
@@ -297,6 +299,8 @@ describe("classifyPlaylistError", () => {
     for (const msg of [
       "playlist_not_found: PLx",
       "Playlist not found",
+      "The playlist does not exist.",
+      "This playlist type is unviewable.",
       "This playlist is private",
       "The playlist has been deleted",
       "Invalid playlist id",
@@ -346,6 +350,128 @@ describe("playlist feed adapter", () => {
   });
 });
 
+describe("isTransientUpstreamError (stale-retry gate)", () => {
+  test("timeout, 429, and 5xx are transient", () => {
+    const timeout = new Error("Upstream timed out after 8000ms");
+    timeout.name = "TimeoutError";
+    expect(isTransientUpstreamError(timeout)).toBe(true);
+    expect(isTransientUpstreamError(new Error("aborted"))).toBe(true);
+    expect(
+      isTransientUpstreamError(
+        new Error("Request failed with status code 429"),
+      ),
+    ).toBe(true);
+    expect(
+      isTransientUpstreamError(new Error("failed with status code 503")),
+    ).toBe(true);
+    expect(isTransientUpstreamError(new Error("bad gateway upstream"))).toBe(
+      true,
+    );
+  });
+
+  test("not-found, unviewable, and other 4xx are definitive (never stale)", () => {
+    for (const msg of [
+      "playlist_not_found: PLx",
+      "channel_not_found: UCx",
+      "This playlist type is unviewable.",
+      "The playlist does not exist.",
+      "Request failed with status code 400",
+      "Request failed with status code 403",
+      "upstream down",
+    ]) {
+      expect(isTransientUpstreamError(new Error(msg))).toBe(false);
+    }
+  });
+});
+
+describe("channel playlists page adapter", () => {
+  /** Live getPlaylists() tab shape: playlists memo populated, videos empty. */
+  const playlistsTab = (nodes: unknown[], continuation: unknown[] = []) => ({
+    playlists: nodes,
+    videos: [],
+    has_continuation: continuation.length > 0,
+    getContinuation: async () => ({
+      playlists: continuation,
+      videos: [],
+      has_continuation: false,
+      getContinuation: async () => ({}),
+    }),
+  });
+
+  test("reads the playlists memo while videos stays empty + re-adapts", async () => {
+    const first = adaptChannelPlaylistsPage(
+      playlistsTab(
+        [lockupPlaylist("PL1"), gridPlaylist("PL2", "P2")],
+        [lockupPlaylist("PL3")],
+      ),
+    );
+    expect(first.results).toHaveLength(2);
+    expect(first.has_continuation).toBe(true);
+    const second = await first.getContinuation();
+    expect(second.results).toHaveLength(1);
+    expect(second.has_continuation).toBe(false);
+  });
+
+  test("handler serves playlists-memo tabs end to end (was data:[] live)", async () => {
+    const deps: ChannelPlaylistsDeps = {
+      resolveChannelId: async (i) => i,
+      fetchFirstPage: async (_id) =>
+        adaptChannelPlaylistsPage(
+          playlistsTab(
+            [lockupPlaylist("PL1"), lockupPlaylist("PL2")],
+            [lockupPlaylist("PL3")],
+          ),
+        ),
+      continueFeed: async (p) => p.getContinuation(),
+    };
+    const first = await handleChannelPlaylists(
+      req(`http://x/api/v1/channels/${UC}/playlists?limit=2`),
+      UC,
+      deps,
+    );
+    const b1 = await first.json();
+    expect(b1.data.map((d: { id: string }) => d.id)).toEqual(["PL1", "PL2"]);
+    expect(typeof b1.page.next).toBe("string");
+    const second = await handleChannelPlaylists(
+      req(
+        `http://x/api/v1/channels/${UC}/playlists?cursor=${b1.page.next}&limit=2`,
+      ),
+      UC,
+      deps,
+    );
+    const b2 = await second.json();
+    expect(b2.data.map((d: { id: string }) => d.id)).toEqual(["PL3"]);
+    expect(b2.page.next).toBeNull();
+  });
+
+  test("raw current_tab fallback harvests items without memos", async () => {
+    const page = await fetchChannelPlaylistsTab({
+      has_playlists: true,
+      getPlaylists: async () => ({
+        current_tab: {
+          content: {
+            contents: [{ contents: [{ items: [lockupPlaylist("PL9")] }] }],
+          },
+        },
+        has_continuation: false,
+        getContinuation: async () => ({}),
+      }),
+    });
+    expect(page.results).toHaveLength(1);
+    expect(page.results.map((n) => mapChannelPlaylist(n))).toMatchObject([
+      { id: "PL9" },
+    ]);
+  });
+
+  test("missing memos and tab -> empty page (never throws)", async () => {
+    const page = adaptChannelPlaylistsPage({
+      has_continuation: false,
+      getContinuation: async () => ({}),
+    });
+    expect(page.results).toEqual([]);
+  });
+});
+
 describe("channel playlists tab selector (_lib)", () => {
   test("has_playlists false skips the tab call -> terminal empty page", async () => {
     let called = false;
@@ -367,11 +493,12 @@ describe("channel playlists tab selector (_lib)", () => {
     expect(page.has_continuation).toBe(false);
   });
 
-  test("success adapts the playlists tab", async () => {
+  test("success adapts the playlists tab (playlists memo, not videos)", async () => {
     const page = await fetchChannelPlaylistsTab({
       has_playlists: true,
       getPlaylists: async () => ({
-        videos: [gridPlaylist("PL1", "P1")],
+        playlists: [gridPlaylist("PL1", "P1")],
+        videos: [],
         has_continuation: false,
         getContinuation: async () => ({}),
       }),
@@ -539,7 +666,9 @@ describe("playlist profile handler (mocked upstream)", () => {
       PL,
       {
         fetchPlaylist: async () => {
-          throw new Error("upstream down");
+          const err = new Error("Upstream timed out after 8000ms");
+          err.name = "TimeoutError";
+          throw err;
         },
       },
     );
@@ -928,7 +1057,9 @@ describe("playlist items handler (mocked upstream)", () => {
       {
         ...deps,
         fetchFirstPage: async () => {
-          throw new Error("upstream down");
+          const err = new Error("Upstream timed out after 8000ms");
+          err.name = "TimeoutError";
+          throw err;
         },
       },
     );
@@ -949,6 +1080,102 @@ describe("playlist items handler (mocked upstream)", () => {
       },
     );
     expect(nf.status).toBe(404);
+  });
+});
+
+describe("stale-retry gate at the handlers (transient only)", () => {
+  test("unviewable playlist -> 404 playlist_not_found (never 502)", async () => {
+    const res = await handlePlaylistItems(
+      req(`http://x/api/v1/playlists/${PL}/items`),
+      PL,
+      {
+        fetchFirstPage: async () => {
+          throw new Error("This playlist type is unviewable.");
+        },
+        continueFeed: async () => {
+          throw new Error("unreached");
+        },
+      },
+    );
+    expect(res.status).toBe(404);
+    expect((await res.json()).error.code).toBe("playlist_not_found");
+  });
+
+  test("429 refresh failure serves stale; 403 surfaces the error", async () => {
+    const deps = itemsDeps([[playlistVideo("v1", "V1")]]);
+    const primed = await (
+      await handlePlaylistItems(
+        req(`http://x/api/v1/playlists/${PL}/items?limit=1`),
+        PL,
+        deps,
+      )
+    ).json();
+    cacheSet(
+      `playlist:items:v1:${PL}:1`,
+      { items: primed.data, forkFrom: null },
+      -1,
+      60 * 60 * 1000,
+    );
+    const limited = await handlePlaylistItems(
+      req(`http://x/api/v1/playlists/${PL}/items?limit=1`),
+      PL,
+      {
+        ...deps,
+        fetchFirstPage: async () => {
+          throw new Error("Request failed with status code 429");
+        },
+      },
+    );
+    expect(limited.status).toBe(200);
+    const limitedBody = await limited.json();
+    expect(limitedBody.data).toEqual(primed.data);
+    expect(limitedBody.warnings[0].code).toBe("stale_served");
+
+    const forbidden = await handlePlaylistItems(
+      req(`http://x/api/v1/playlists/${PL}/items?limit=1`),
+      PL,
+      {
+        ...deps,
+        fetchFirstPage: async () => {
+          throw new Error("Request failed with status code 403");
+        },
+      },
+    );
+    expect(forbidden.status).toBe(502);
+    const forbiddenBody = await forbidden.json();
+    expect(forbiddenBody.error.code).toBe("upstream_degraded");
+  });
+
+  test("unviewable never serves stale on the profile route", async () => {
+    const deps = profileDeps([playlistVideo("v1", "V1")]);
+    const primed = await (
+      await handlePlaylist(
+        req(`http://x/api/v1/playlists/${PL}?limit=1`),
+        PL,
+        deps,
+      )
+    ).json();
+    cacheSet(
+      `playlist:profile:v1:${PL}:1`,
+      {
+        profile: primed.data.playlist,
+        items: primed.data.items,
+        forkFrom: null,
+      },
+      -1,
+      24 * 60 * 60 * 1000,
+    );
+    const res = await handlePlaylist(
+      req(`http://x/api/v1/playlists/${PL}?limit=1`),
+      PL,
+      {
+        fetchPlaylist: async () => {
+          throw new Error("This playlist type is unviewable.");
+        },
+      },
+    );
+    expect(res.status).toBe(404);
+    expect((await res.json()).error.code).toBe("playlist_not_found");
   });
 });
 
@@ -1058,7 +1285,13 @@ describe("channel playlists handler (mocked upstream)", () => {
       UC,
       deps,
     );
-    expect((await ucFirst.json()).meta.cached).toBe(true);
+    const ucBody = await ucFirst.json();
+    expect(ucBody.meta.cached).toBe(true);
+    // Both address forms behave identically: same items, and both mint a
+    // page-1 cursor (the live skew came from the empty videos-memo adapter
+    // + upstream has_continuation flip-flops, now fixed at the source).
+    expect(ucBody.data).toEqual(b1.data);
+    expect(typeof ucBody.page.next).toBe("string");
   });
 
   test("unknown cursor -> [] + next: null; cross-channel rejected", async () => {
@@ -1171,7 +1404,9 @@ describe("channel playlists handler (mocked upstream)", () => {
       {
         ...deps,
         fetchFirstPage: async () => {
-          throw new Error("upstream down");
+          const err = new Error("Upstream timed out after 8000ms");
+          err.name = "TimeoutError";
+          throw err;
         },
       },
     );

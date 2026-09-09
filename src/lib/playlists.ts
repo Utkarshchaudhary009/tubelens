@@ -64,7 +64,7 @@ export function parsePlaylistId(raw: string): PlaylistIdResult {
     error: {
       code: "invalid_playlist_id",
       message: "Invalid playlist id.",
-      hint: "Use a playlist id, e.g. /api/v1/playlists/PLbpi6ZahtOH6Ar_3Genz5apy8Clnv3m0A.",
+      hint: "Use a playlist id, e.g. /api/v1/playlists/PLplXQ2cg9B_qrCVd1J_iId5SvP8Kf_BfS.",
       status: 400,
     },
   };
@@ -517,9 +517,9 @@ export interface ClassifiedPlaylistError {
 }
 
 /**
- * Timeouts/aborts -> 504 upstream_timeout; unknown/private/deleted playlists
- * -> 404 playlist_not_found; everything else -> 502 upstream_degraded. Never
- * leaks stack traces.
+ * Timeouts/aborts -> 504 upstream_timeout; unknown/private/deleted/
+ * unviewable playlists -> 404 playlist_not_found; everything else -> 502
+ * upstream_degraded. Never leaks stack traces.
  */
 export function classifyPlaylistError(err: unknown): ClassifiedPlaylistError {
   const raw =
@@ -533,7 +533,7 @@ export function classifyPlaylistError(err: unknown): ClassifiedPlaylistError {
     };
   }
   if (
-    /playlist_not_found|playlist.{0,80}(not.?found|unavailable|not available|invalid|does.?not.?exist|terminated|private|deleted|removed)|not.?found.{0,80}playlist|invalid playlist|unknown playlist|\b404\b.{0,40}playlist|playlist.{0,40}\b404\b/i.test(
+    /playlist_not_found|playlist.{0,80}(not.?found|unavailable|not available|invalid|does.?not.?exist|terminated|private|deleted|removed|unviewable)|not.?found.{0,80}playlist|invalid playlist|unknown playlist|\b404\b.{0,40}playlist|playlist.{0,40}\b404\b/i.test(
       raw,
     )
   ) {
@@ -550,6 +550,31 @@ export function classifyPlaylistError(err: unknown): ClassifiedPlaylistError {
     hint: "Retry shortly; include X-Request-Id in bug reports.",
     status: 502,
   };
+}
+
+/**
+ * Stale-retry gate for serve-stale-on-error: only transient upstream
+ * failures (timeouts/aborts, 429 rate limits, 5xx) may serve a stale cached
+ * copy. Definitive failures — not-found, unviewable, and other permanent
+ * 4xx (400/403 etc.) — must always surface as errors, never a stale 200.
+ */
+export function isTransientUpstreamError(err: unknown): boolean {
+  const raw =
+    err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+  if (/timeout|timed out|abort|TimeoutError|AbortError/i.test(raw)) {
+    return true;
+  }
+  if (/\b429\b|too many requests|rate.?limited|rate_limit/i.test(raw)) {
+    return true;
+  }
+  if (
+    /\b5\d\d\b|internal server error|bad gateway|service unavailable|gateway timeout/i.test(
+      raw,
+    )
+  ) {
+    return true;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -594,6 +619,86 @@ export function emptyPlaylistFeed(): ContinuationSearch {
     results: [],
     has_continuation: false,
     getContinuation: async () => emptyPlaylistFeed(),
+  };
+}
+
+/** Present-and-iterable check shared by the channel-playlists adapter. */
+function asIterableList(v: unknown): unknown[] | undefined {
+  if (
+    v !== null &&
+    v !== undefined &&
+    typeof (v as { [Symbol.iterator]?: unknown })[Symbol.iterator] ===
+      "function"
+  ) {
+    return [...(v as Iterable<unknown>)];
+  }
+  return undefined;
+}
+
+/**
+ * Last-resort node collector for channel-playlists tab shapes whose memo
+ * getters are missing (client drift, partial payloads): walks
+ * `current_tab.content.contents…items` (e.g. contents[0].contents[0].items)
+ * up to 5 levels deep and gathers every `items` array found. Non-playlist
+ * nodes in the harvest are dropped by mapChannelPlaylist downstream.
+ */
+function currentTabPlaylistNodes(tab: unknown): unknown[] {
+  const out: unknown[] = [];
+  const visit = (node: unknown, depth: number): void => {
+    if (depth > 5 || typeof node !== "object" || node === null) {
+      return;
+    }
+    const r = node as Record<string, unknown>;
+    if (Array.isArray(r.items)) {
+      out.push(...r.items);
+      return;
+    }
+    for (const key of ["content", "contents"]) {
+      const child = r[key];
+      if (Array.isArray(child)) {
+        for (const c of child) {
+          visit(c, depth + 1);
+        }
+      } else if (typeof child === "object" && child !== null) {
+        visit(child, depth + 1);
+      }
+    }
+  };
+  visit(tab, 0);
+  return out;
+}
+
+/**
+ * Adapts a channel-playlists tab page to the generic continuation-page
+ * shape. The Channel returned by `getPlaylists()` (and its
+ * ChannelListContinuation pages) carries playlist nodes in the Feed
+ * `playlists` memo — NOT the `videos` memo that adaptChannelTab reads
+ * (verified live: ~30 LockupView PLAYLIST nodes in `playlists`, `videos`
+ * empty). Reads the `playlists` memo first, then the `items` getter, then
+ * the raw current_tab walk; a tab with no nodes yields a terminal empty
+ * page, never a 404. Continuations re-adapt through this same function, so
+ * pages 2+ read the same source.
+ */
+export function adaptChannelPlaylistsPage(feed: {
+  playlists?: { [Symbol.iterator](): Iterator<unknown> } | null;
+  items?: { [Symbol.iterator](): Iterator<unknown> } | null;
+  current_tab?: unknown;
+  has_continuation: boolean;
+  getContinuation: () => Promise<unknown>;
+}): ContinuationSearch {
+  const results =
+    asIterableList(feed.playlists) ??
+    asIterableList(feed.items) ??
+    currentTabPlaylistNodes(feed.current_tab);
+  return {
+    results,
+    has_continuation: feed.has_continuation,
+    getContinuation: async () =>
+      adaptChannelPlaylistsPage(
+        (await feed.getContinuation()) as Parameters<
+          typeof adaptChannelPlaylistsPage
+        >[0],
+      ),
   };
 }
 
@@ -691,9 +796,10 @@ export async function handlePlaylistProfile(
         return { profile, items, forkFrom };
       },
       24 * 60 * 60 * 1000, // stale window backs serve-stale-on-error.
-      // Definitive not-found errors must NOT serve stale — only transient
-      // failures (timeout/429/5xx) may. Not-found propagates below.
-      (err) => classifyPlaylistError(err).code !== "playlist_not_found",
+      // Only transient failures (timeout/429/5xx) may serve stale —
+      // definitive errors (not-found, unviewable, other permanent 4xx)
+      // propagate below.
+      (err) => isTransientUpstreamError(err),
     );
     // The source stays pristine: always fork, even on the miss that stored it.
     const next = forkContinuation(
@@ -800,9 +906,10 @@ export async function handlePlaylistFeed(
         return { items, forkFrom };
       },
       60 * 60 * 1000, // stale window backs serve-stale-on-error.
-      // Definitive not-found errors must NOT serve stale — only transient
-      // failures (timeout/429/5xx) may. Not-found propagates below.
-      (err) => classifyPlaylistError(err).code !== "playlist_not_found",
+      // Only transient failures (timeout/429/5xx) may serve stale —
+      // definitive errors (not-found, unviewable, other permanent 4xx)
+      // propagate below.
+      (err) => isTransientUpstreamError(err),
     );
     // The source stays pristine: always fork, even on the miss that stored it.
     const next = forkContinuation(result.value.forkFrom, scope);
@@ -811,7 +918,6 @@ export async function handlePlaylistFeed(
     // instance resolves it to [] + next: null. Only exhausted first pages
     // (next == null, no cursor involved) keep the public TTL. Cursor-paged
     // requests always take the serveContinuation branch above (no-store).
-    const cursorRequested = cursor !== null;
     return successResponse(result.value.items, {
       requestId,
       next,
@@ -827,9 +933,7 @@ export async function handlePlaylistFeed(
           ]
         : [],
       cacheControl:
-        next !== null || cursorRequested
-          ? CACHE_CONTROL.noStore
-          : CACHE_CONTROL.playlistFeed,
+        next !== null ? CACHE_CONTROL.noStore : CACHE_CONTROL.playlistFeed,
     });
   } catch (err) {
     return errorResponse(requestId, classifyPlaylistError(err));
@@ -1012,9 +1116,10 @@ export async function handleChannelPlaylists(
         return { items, forkFrom };
       },
       60 * 60 * 1000, // stale window backs serve-stale-on-error.
-      // Definitive not-found errors must NOT serve stale — only transient
-      // failures (timeout/429/5xx) may. Not-found propagates below.
-      (err) => classifyChannelError(err).code !== "channel_not_found",
+      // Only transient failures (timeout/429/5xx) may serve stale —
+      // definitive errors (channel_not_found, other permanent 4xx)
+      // propagate below.
+      (err) => isTransientUpstreamError(err),
     );
     // The source stays pristine: always fork, even on the miss that stored it.
     const next = forkContinuation(result.value.forkFrom, scope);
@@ -1023,7 +1128,6 @@ export async function handleChannelPlaylists(
     // instance resolves it to [] + next: null. Only exhausted first pages
     // (next == null, no cursor involved) keep the public TTL. Cursor-paged
     // requests always take the serveContinuation branch above (no-store).
-    const cursorRequested = cursor !== null;
     return successResponse(result.value.items, {
       requestId,
       next,
@@ -1039,9 +1143,7 @@ export async function handleChannelPlaylists(
           ]
         : [],
       cacheControl:
-        next !== null || cursorRequested
-          ? CACHE_CONTROL.noStore
-          : CACHE_CONTROL.playlistFeed,
+        next !== null ? CACHE_CONTROL.noStore : CACHE_CONTROL.playlistFeed,
     });
   } catch (err) {
     return errorResponse(requestId, classifyChannelError(err));
