@@ -31,7 +31,7 @@ Your scheduled task is: **advance the next phase**.
 ## Phase selection
 
 1. Read `AGENTS.md`.
-2. Read `plans/PLAN.md` and identify the first phase that is not `[x]`.
+2. Read `plans/API_ROADMAP.md` and identify the first phase that is not `[x]`.
 3. Inspect branches and open PRs before starting work.
 4. If a PR already represents that phase, resume that work instead of creating a duplicate.
 5. Never skip the first incomplete phase or start a later phase early.
@@ -75,7 +75,7 @@ Follow every mandatory lifecycle rule in `AGENTS.md`, including:
 - complete the GitHub bot/review loop exactly as specified in `AGENTS.md`, including its maximum rounds and minimum waiting interval;
 - fix every genuine finding before considering merge;
 - merge only when the mandatory merge gate is satisfied;
-- **only after a successful merge**, update `plans/PLAN.md` on `main` to mark the merged phase `[x]` and its Status as done, then commit and push that roadmap update;
+- **only after a successful merge**, update `plans/API_ROADMAP.md` on `main` to mark the merged phase `[x]` and its Status as done, then commit and push that roadmap update;
 - perform the required post-merge production verification;
 - only then allow the next scheduled run to advance the next phase.
 
