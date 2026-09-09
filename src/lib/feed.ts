@@ -13,9 +13,10 @@
 //   rows (2-5); the refinement path returns a full 20-item Video page.
 // - live: search(query, { type: "video", features: ["live"] }) — the v18
 //   Feature union carries "live", and ~19/20 rows arrive with is_live /
-//   is_upcoming plus "N watching" counts. Items map via mapChannelStream so
-//   every entry carries isLive/isUpcoming plus viewersText/scheduledStart
-//   where served (Phase 7 exit criterion).
+//   is_upcoming plus "N watching" counts. Items map via mapChannelStream,
+//   and rows carrying neither a live viewer count nor a scheduled start
+//   are dropped (Phase 7 exit criterion: every item carries one or the
+//   other) — the same no-leakage discipline as the Phase 4 channel mappers.
 // - gaming: search(query, { type: "video" }). resolveURL(
 //   "https://www.youtube.com/gaming") resolves to a topic channel
 //   (UCOpNcN46UbXVtpKMrmU4Abg) whose getChannel serves NO video/live tabs
@@ -94,7 +95,24 @@ function feedFreshMs(kind: FeedKind): number {
 }
 
 function feedMapper(kind: FeedKind): (node: unknown) => FeedItemDTO | null {
-  return kind === "live" ? mapChannelStream : mapSearchItem;
+  return kind === "live" ? mapLiveItem : mapSearchItem;
+}
+
+/**
+ * Live-only guard (Phase 7 exit criterion): the live-filtered search can
+ * leak a generic/past Video row carrying neither a live viewer count nor a
+ * scheduled start. Such rows map to null here and are dropped by callers —
+ * the same no-leakage discipline as the Phase 4 channel mappers — so every
+ * served feed/live item carries viewersText or scheduledStart.
+ */
+function mapLiveItem(node: unknown): FeedItemDTO | null {
+  const dto = mapChannelStream(node);
+  if (!dto) {
+    return null;
+  }
+  return dto.viewersText !== undefined || dto.scheduledStart !== undefined
+    ? dto
+    : null;
 }
 
 export interface ClassifiedFeedError {

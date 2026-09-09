@@ -301,6 +301,76 @@ describe("feed/live stream fields", () => {
       scheduledStart: "2026-09-10T00:00:00.000Z",
     });
   });
+
+  test("bare video rows without live metadata are dropped", async () => {
+    const res = await handleFeedLive(
+      req("http://x/api/v1/feed/live?limit=5"),
+      feedDeps([
+        liveRow("l1"),
+        videoRow("v9", "Leaked VOD"),
+        upcomingRow("l2"),
+      ]),
+    );
+    const body = await res.json();
+    expect(body.data.map((d: { id: string }) => d.id)).toEqual(["l1", "l2"]);
+  });
+});
+
+describe("feed upstream continuation", () => {
+  test("buffer-exhausted cursor fetches the next upstream page", async () => {
+    const page2 = fakeFeedPage([videoRow("v2", "B")], false);
+    const page1: ContinuationSearch = {
+      results: [videoRow("v1", "A")],
+      has_continuation: true,
+      getContinuation: async () => page2,
+    };
+    const deps: FeedDeps = {
+      fetchFirstPage: async () => page1,
+      continueFeed: async (p) => p.getContinuation(),
+    };
+    const first = await handleFeedShorts(
+      req("http://x/api/v1/feed/shorts?limit=1"),
+      deps,
+    );
+    const cursor = (await first.json()).page.next as string;
+    expect(typeof cursor).toBe("string");
+    const second = await handleFeedShorts(
+      req(`http://x/api/v1/feed/shorts?cursor=${cursor}&limit=1`),
+      deps,
+    );
+    const body = await second.json();
+    expect(body.data.map((d: { id: string }) => d.id)).toEqual(["v2"]);
+    expect(body.page.next).toBeNull();
+    expect(second.headers.get("cache-control")).toBe("private, no-store");
+  });
+
+  test("upstream continuation failure is an empty page with a warning", async () => {
+    const page1: ContinuationSearch = {
+      results: [videoRow("v1", "A")],
+      has_continuation: true,
+      getContinuation: async () => {
+        throw new Error("socket hang up");
+      },
+    };
+    const deps: FeedDeps = {
+      fetchFirstPage: async () => page1,
+      continueFeed: async (p) => p.getContinuation(),
+    };
+    const first = await handleFeedShorts(
+      req("http://x/api/v1/feed/shorts?limit=1"),
+      deps,
+    );
+    const cursor = (await first.json()).page.next as string;
+    const second = await handleFeedShorts(
+      req(`http://x/api/v1/feed/shorts?cursor=${cursor}&limit=1`),
+      deps,
+    );
+    expect(second.status).toBe(200);
+    const body = await second.json();
+    expect(body.data).toEqual([]);
+    expect(body.page.next).toBeNull();
+    expect(body.warnings[0].code).toBe("continuation_failed");
+  });
 });
 
 describe("feed scope isolation", () => {

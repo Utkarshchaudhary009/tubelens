@@ -609,7 +609,7 @@ export function buildOpenApiDocument() {
           responses: {
             200: {
               description:
-                "Paged live/upcoming streams across channels (per-channel state via /channels/{id}/streams). Every item carries isLive/isUpcoming plus viewer counts or scheduled times where served.",
+                "Paged live/upcoming streams across channels (search-backed live filtering; per-channel state is also available via /channels/{id}/streams). Every item carries isLive/isUpcoming plus a live viewer count or scheduled start.",
               content: {
                 "application/json": { schema: { $ref: envelopeRef } },
               },
@@ -627,7 +627,7 @@ export function buildOpenApiDocument() {
       "/feed/gaming": {
         get: {
           operationId: "getGamingFeed",
-          summary: "Gaming hub videos and live streams",
+          summary: "Gaming hub video discovery",
           parameters: [limitParam, cursorParam, regionParam, langParam],
           responses: {
             200: {

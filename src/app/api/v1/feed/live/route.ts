@@ -11,8 +11,9 @@ export const runtime = "nodejs";
 // Upstream seam: search(seed, { type: "video", features: ["live"] }) — the
 // v18 Feature union carries "live" (verified live: ~19/20 rows arrive with
 // is_live/is_upcoming plus "N watching" counts). Items map via
-// mapChannelStream so every entry carries isLive/isUpcoming plus
-// viewersText/scheduledStart where served. Lazily imports the server-only
+// mapChannelStream with rows lacking both viewersText and scheduledStart
+// dropped, so every entry carries isLive/isUpcoming plus a live viewer
+// count or scheduled start. Lazily imports the server-only
 // singleton so this module stays importable in tests, which inject mocks.
 const defaultDeps: FeedDeps = {
   async fetchFirstPage() {
