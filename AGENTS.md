@@ -17,7 +17,7 @@ API-first YouTube data API: **Next.js App Router Route Handlers + youtubei.ts on
 - `src/app/api/v1/` — all endpoints (Route Handlers only, no pages per phase).
 - `src/lib/youtube.ts` — youtubei.ts **singleton, `import "server-only"`**; never instantiate per request.
 - `src/lib/{envelope,cache,errors}.ts` — shared envelope, cache headers, typed errors.
-- `plans/API_ROADMAP.md` — **owner-only single source of truth** (10 phases, 37 endpoints); `plans/DX_PRINCIPLES.md` (envelope, cursor, error+hint); `plans/CACHING.md` (L0/L1/L2 ladder + TTLs).
+- `plans/PLAN.md` — **owner-only single source of truth** (10 phases, 37 endpoints); `plans/DX_PRINCIPLES.md` (envelope, cursor, error+hint); `plans/CACHING.md` (L0/L1/L2 ladder + TTLs).
 - `docs/*.mdx` — **public developer docs** (Fumadocs/MDX); docs bot owns `docs/**`, never `plans/`.
 
 ## Commands
@@ -30,7 +30,7 @@ API-first YouTube data API: **Next.js App Router Route Handlers + youtubei.ts on
 
 ## WORKFLOW (core — mandatory)
 
-`plans/API_ROADMAP.md` is the single source of truth. The following are **MUST** rules, not suggestions.
+`plans/PLAN.md` is the single source of truth. The following are **MUST** rules, not suggestions.
 
 1. **One phase at a time.** Determine the first roadmap phase whose status is not `[x]`. Never skip a phase. If that phase already has an open PR, continue that PR instead of creating another.
 2. **Plan first.** Read the entire current phase and its exit criteria before coding. If the phase description is stale or unclear, fix the plan before implementation. Mark a phase `[~]` only when work has actually started.
@@ -41,7 +41,7 @@ API-first YouTube data API: **Next.js App Router Route Handlers + youtubei.ts on
 7. **GitHub bot/review loop.** After the PR is opened or updated, allow **up to 3 bot/review rounds**. Each round MUST wait at least 10 minutes for GitHub Actions, e2e, and automated reviewers to finish, then inspect checks/reviews/comments, fix every genuine finding, push the fix, and let CI rerun. A round with no genuine findings counts as a clean round.
 8. **Merge gate is mandatory.** Merge the phase PR only when the latest commit has all required checks green, the e2e review is successful, no genuine review finding remains unresolved, the PR is mergeable, and the current phase exit criteria are satisfied. Never merge merely because the 3-round limit was reached.
 9. **If still failing after 3 rounds, stop.** Do not merge. Leave the PR open with the remaining failure clearly reported. A later scheduled run must continue that existing phase/PR rather than starting a new one.
-10. **Post-merge roadmap update is mandatory.** Only AFTER the phase PR has actually merged, update `plans/API_ROADMAP.md` on `main`: change that phase from `[~]` or `[ ]` to `[x]` and change its `Status` line to `**Status:** `[x]` done`. Commit and push that roadmap change. Never mark a phase `[x]` before its PR is merged.
+10. **Post-merge roadmap update is mandatory.** Only AFTER the phase PR has actually merged, update `plans/PLAN.md` on `main`: change that phase from `[~]` or `[ ]` to `[x]` and change its `Status` line to `**Status:** `[x]` done`. Commit and push that roadmap change. Never mark a phase `[x]` before its PR is merged.
 11. **Post-merge verification is mandatory.** After the roadmap update, verify production health and the phase's relevant endpoint(s) on production as required by the deployment checklist. Never declare the phase complete before this check.
 12. **Only then advance.** After the merged phase is checked `[x]` and its post-merge verification is complete, the next scheduled run may begin the next phase.
 
