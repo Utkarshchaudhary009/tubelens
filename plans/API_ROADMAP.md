@@ -167,7 +167,7 @@ say, and what is spoken.
 
 **Goal:** Music-scoped discovery and artist pages.
 
-**Status:** `[ ]` not started
+**Status:** `[~]` in progress — `phase-6-music` branch: music/search + music/charts + artists/:id implemented with unit tests, pending PR review/e2e.
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
