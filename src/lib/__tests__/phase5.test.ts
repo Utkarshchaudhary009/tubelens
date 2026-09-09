@@ -444,6 +444,33 @@ describe("channel playlists page adapter", () => {
     expect(b2.page.next).toBeNull();
   });
 
+  test("empty playlists memo falls through to items/current_tab fallbacks", async () => {
+    const fromItems = adaptChannelPlaylistsPage({
+      playlists: [],
+      items: [lockupPlaylist("PL7")],
+      has_continuation: false,
+      getContinuation: async () => ({}),
+    });
+    expect(fromItems.results).toHaveLength(1);
+
+    const fromRawTab = adaptChannelPlaylistsPage({
+      playlists: [],
+      current_tab: {
+        content: {
+          contents: [{ contents: [{ items: [lockupPlaylist("PL8")] }] }],
+        },
+      },
+      has_continuation: false,
+      getContinuation: async () => ({}),
+    });
+    expect(fromRawTab.results).toHaveLength(1);
+    expect(
+      [...fromItems.results, ...fromRawTab.results].map(
+        (n) => mapChannelPlaylist(n)?.id,
+      ),
+    ).toEqual(["PL7", "PL8"]);
+  });
+
   test("raw current_tab fallback harvests items without memos", async () => {
     const page = await fetchChannelPlaylistsTab({
       has_playlists: true,

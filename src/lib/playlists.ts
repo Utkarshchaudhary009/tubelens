@@ -674,10 +674,12 @@ function currentTabPlaylistNodes(tab: unknown): unknown[] {
  * ChannelListContinuation pages) carries playlist nodes in the Feed
  * `playlists` memo — NOT the `videos` memo that adaptChannelTab reads
  * (verified live: ~30 LockupView PLAYLIST nodes in `playlists`, `videos`
- * empty). Reads the `playlists` memo first, then the `items` getter, then
- * the raw current_tab walk; a tab with no nodes yields a terminal empty
- * page, never a 404. Continuations re-adapt through this same function, so
- * pages 2+ read the same source.
+ * empty). Selects the first NON-EMPTY source among the `playlists` memo,
+ * the `items` getter, and the raw current_tab walk — a present-but-empty
+ * memo falls through to the drift fallbacks instead of masking them; a tab
+ * with no nodes anywhere yields a terminal empty page, never a 404.
+ * Continuations re-adapt through this same function, so pages 2+ read the
+ * same source.
  */
 export function adaptChannelPlaylistsPage(feed: {
   playlists?: { [Symbol.iterator](): Iterator<unknown> } | null;
@@ -686,10 +688,12 @@ export function adaptChannelPlaylistsPage(feed: {
   has_continuation: boolean;
   getContinuation: () => Promise<unknown>;
 }): ContinuationSearch {
-  const results =
-    asIterableList(feed.playlists) ??
-    asIterableList(feed.items) ??
-    currentTabPlaylistNodes(feed.current_tab);
+  const candidates = [
+    asIterableList(feed.playlists),
+    asIterableList(feed.items),
+    currentTabPlaylistNodes(feed.current_tab),
+  ];
+  const results = candidates.find((list) => (list?.length ?? 0) > 0) ?? [];
   return {
     results,
     has_continuation: feed.has_continuation,
