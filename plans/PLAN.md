@@ -167,7 +167,7 @@ say, and what is spoken.
 
 **Goal:** Music-scoped discovery and artist pages.
 
-**Status:** `[x]` done — shipped via PR #9 (merged 2026-09-09): music/search + music/charts + artists/:id live with 369 unit tests + e2e PASS on live upstream (prod build). Note: `country` is echo-only with `country_fallback` warning for non-US (per-country charts need the YTMusic menu-feedback flow); charts snapshot verified live for the default US region.
+**Status:** `[ ]` not started
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
@@ -268,3 +268,30 @@ API pleasant to consume and operate.
   appears in it (stub promoted to full spec, no drift).
 - `batch` handles 10 sub-requests with per-item error isolation.
 - Public demo app runs exclusively on documented endpoints.
+
+---
+
+## Part B — MCP (post-REST, not started)
+
+> **Gate: REST must complete first.** All 10 phases above (37 endpoints) ship,
+> validate, and reach production health before any MCP work starts. MCP is a
+> thin read layer over the finished REST surface — never a parallel track.
+
+**Framework choice:** `mcp-handler` + `@modelcontextprotocol/server` v2 + `zod` v4
+at `src/app/mcp/route.ts` with `runtime = "nodejs"`, stateless Streamable HTTP, $0
+(no Redis). Rationale: `mcp-handler` is the Vercel-native adapter (ex-`@vercel/mcp-adapter`)
+so transport/edge wiring is solved; SDK v2 carries the protocol; tool schemas
+will reuse the same zod validators as REST routes.
+
+**Rejected alternatives:** plain SDK hand-wired transport costs custom
+SSE/Streamable plumbing for zero gain; XMCP is heavyweight (codegen/CLI
+opinions) for what is a thin adapter over existing handlers.
+
+**Outline (no implementation yet):**
+
+- **M0 — Spike (2 read-only tools):** `search` + `videos/:id` behind the
+  adapter; same envelope/cursor (`DX_PRINCIPLES.md`) and TTLs (`CACHING.md`).
+- **M1 — Read parity per group:** one tool per remaining read group
+  (related/comments/transcript, channels, playlists, music, feeds — M0 tools not duplicated); POST `batch` stays out.
+- **M2 — Harden:** rate-limit + `X-Request-Id` propagation, read-only auth story (no per-user OAuth writes, per gate #4),
+  docs + `openapi.json` cross-link; e2e via MCP inspector before public flag.
