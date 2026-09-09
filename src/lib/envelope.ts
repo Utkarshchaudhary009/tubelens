@@ -41,6 +41,8 @@ export const CACHE_CONTROL = {
   suggestions: "public, s-maxage=300, stale-while-revalidate=1800",
   /** hashtag feed: fast-moving band, same as related (Phase 3). */
   hashtag: "public, s-maxage=600, stale-while-revalidate=3600",
+  /** channel uploads/shorts/streams feeds (Phase 4). */
+  channelFeed: "public, s-maxage=600, stale-while-revalidate=3600",
   /** comments: fast-moving (Phase 2). */
   comments: "public, s-maxage=300, stale-while-revalidate=1800",
   /** captions: static-ish track list (Phase 2). */

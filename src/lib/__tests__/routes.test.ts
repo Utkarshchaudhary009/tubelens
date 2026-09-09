@@ -12,10 +12,14 @@ describe("openapi stub", () => {
     expect(typeof doc.paths).toBe("object");
   });
 
-  test("lists exactly the 11 Phase 1+2+3 endpoints", () => {
+  test("lists exactly the 15 Phase 1+2+3+4 endpoints", () => {
     const doc = buildOpenApiDocument();
     const paths = Object.keys(doc.paths).sort();
     expect(paths).toEqual([
+      "/channels/{id}",
+      "/channels/{id}/shorts",
+      "/channels/{id}/streams",
+      "/channels/{id}/videos",
       "/hashtags/{tag}",
       "/health",
       "/openapi.json",
@@ -107,7 +111,7 @@ describe("openapi stub", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.openapi).toMatch(/^3\.1\./);
-    expect(Object.keys(body.paths)).toHaveLength(11);
+    expect(Object.keys(body.paths)).toHaveLength(15);
     expect(res.headers.get("X-Request-Id")).toBeTruthy();
     expect(res.headers.get("Cache-Control")).toContain("s-maxage=86400");
   });
