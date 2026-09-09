@@ -33,6 +33,9 @@ export function lookupHandle(handle: string): string | undefined {
     handleCache.delete(handle);
     return undefined;
   }
+  // Refresh recency on hit so hot handles survive eviction (LRU, not FIFO).
+  handleCache.delete(handle);
+  handleCache.set(handle, entry);
   return entry.id;
 }
 

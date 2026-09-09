@@ -511,11 +511,11 @@ describe("handle -> UC id map cache", () => {
     expect(lookupHandle("@h500")).toBe(UC);
   });
 
-  test("re-store refreshes recency: hot handles survive eviction", () => {
+  test("re-read refreshes recency: hot handles survive eviction", () => {
     for (let i = 0; i < 500; i += 1) {
       storeHandle(`@h${i}`, UC);
     }
-    storeHandle("@h0", UC);
+    expect(lookupHandle("@h0")).toBe(UC);
     storeHandle("@fresh", UC);
     expect(lookupHandle("@h0")).toBe(UC);
     expect(lookupHandle("@h1")).toBeUndefined();
