@@ -596,6 +596,25 @@ describe("music charts", () => {
     ]);
   });
 
+  test("RAW artist row without UC id classifies via ARTIST pageType", async () => {
+    const raw = rawChartsPage([
+      rawCarousel("Top artists", [
+        rawArtistRow("FEmusic_artist_fallback_1", "Fallback Artist", "1M fans"),
+      ]),
+    ]);
+    const res = await handleMusicCharts(req("http://x/api/v1/music/charts"), {
+      fetchCharts: async () => raw,
+    });
+    const body = await res.json();
+    expect(body.data.sections[0].items).toEqual([
+      expect.objectContaining({
+        id: "FEmusic_artist_fallback_1",
+        kind: "artist",
+        title: "Fallback Artist",
+      }),
+    ]);
+  });
+
   test("non-US country echoes with a country_fallback warning", async () => {
     const res = await handleMusicCharts(
       req("http://x/api/v1/music/charts?country=de"),
@@ -754,6 +773,23 @@ describe("artists", () => {
     const body = await res.json();
     expect(body.data.name).toBe("Adele");
     expect(body.data.subscriberCount).toBeUndefined();
+  });
+
+  test("labeled count wins over earlier unrelated bio numbers", async () => {
+    const res = await handleArtist(req(`http://x/api/v1/artists/${UC}`), UC, {
+      fetchArtist: async () => ({
+        header: {
+          title: { text: "Adele" },
+          description:
+            "Won 16 Grammy Awards and sold 12K records, with 5M monthly subscribers.",
+          thumbnail: { contents: [{ url: "https://i/a" }] },
+        },
+        sections: [],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.subscriberCount).toBe(5_000_000);
   });
 
   test("timeout is a 504, generic failure a 502", async () => {

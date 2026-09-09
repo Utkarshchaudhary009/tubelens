@@ -263,19 +263,23 @@ function parseCountText(v: unknown): number | undefined {
 }
 
 /**
- * Audience counts only: like parseCountText but requires an explicit
- * audience/subscriber/follower/listener label in the text, so free-form
- * bios ("16 Grammy Awards…") never leak bare numbers into subscriberCount.
+ * Audience counts only: extracts the number adjacent to an explicit
+ * audience/subscriber/follower/listener label, so free-form bios never leak
+ * unrelated numbers ("sold 12K records, 5M subscribers" must yield 5M, not
+ * the first number in the string).
  */
 function parseLabeledCount(v: unknown): number | undefined {
   const text = textOf(v);
-  if (
-    !text ||
-    !/(subscriber|audience|follower|monthly listener|listener)/i.test(text)
-  ) {
+  if (!text) {
     return undefined;
   }
-  return parseCountText(text);
+  const adjacent = text.match(
+    /([\d.,]+)\s*([KMB])?\s*(?:monthly\s+)?(?:subscribers?|audiences?|followers?|listeners?)/i,
+  );
+  if (!adjacent?.[1]) {
+    return undefined;
+  }
+  return parseCountText(`${adjacent[1]}${adjacent[2] ?? ""}`);
 }
 
 /** Spread an ObservedArray/iterable defensively; non-iterables -> []. */
@@ -898,9 +902,11 @@ function normalizeNavEndpoint(nav: unknown): Record<string, unknown> | null {
 function navPageType(nav: unknown): string {
   return String(
     asRecord(
-      asRecord(asRecord(nav)?.browseEndpoint)
-        ?.browseEndpointContextSupportedConfigs,
-    )?.browseEndpointContextMusicConfig ?? "",
+      asRecord(
+        asRecord(asRecord(nav)?.browseEndpoint)
+          ?.browseEndpointContextSupportedConfigs,
+      )?.browseEndpointContextMusicConfig,
+    )?.pageType ?? "",
   ).toUpperCase();
 }
 
