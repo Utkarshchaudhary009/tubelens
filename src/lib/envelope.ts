@@ -47,6 +47,10 @@ export const CACHE_CONTROL = {
   playlistFeed: "public, s-maxage=600, stale-while-revalidate=3600",
   /** playlist metadata + first items page (Phase 5). */
   playlist: "public, s-maxage=3600, stale-while-revalidate=86400",
+  /** music-native search (Phase 6). */
+  musicSearch: "public, s-maxage=300, stale-while-revalidate=3600",
+  /** music charts snapshot (Phase 6). */
+  musicCharts: "public, s-maxage=600, stale-while-revalidate=3600",
   /** comments: fast-moving (Phase 2). */
   comments: "public, s-maxage=300, stale-while-revalidate=1800",
   /** captions: static-ish track list (Phase 2). */

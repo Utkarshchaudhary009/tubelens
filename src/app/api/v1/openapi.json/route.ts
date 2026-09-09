@@ -3,7 +3,7 @@ import { baseHeaders, CACHE_CONTROL, getRequestId } from "@/lib/envelope";
 
 export const runtime = "nodejs";
 
-// OpenAPI 3.1 stub for Phase 5: documents exactly the 18 shipped endpoints.
+// OpenAPI 3.1 stub for Phase 6: documents exactly the 21 shipped endpoints.
 // Grows each phase; promoted to the full spec in Phase 10. Exported as a
 // pure builder so tests can validate it without HTTP.
 export function buildOpenApiDocument() {
@@ -66,7 +66,7 @@ export function buildOpenApiDocument() {
       // package.json (0.1.0 until the v1 API is declared stable).
       version: "0.1.0",
       description:
-        "API-first YouTube data API. Phase 5 ships playlist reads (metadata plus first items page, paginated items, and a channel's curated playlists), plus Phase 4 channel profiles, uploads, Shorts shelves, and live/upcoming/past streams, Phase 3 discovery (search autocomplete suggestions, hashtag feeds), Phase 2 watch essentials (related rail, comments, captions, transcript) and Phase 1 health, search, video details, URL resolving, and this spec.",
+        "API-first YouTube data API. Phase 6 ships music-native search (typed song vs album vs artist), charts snapshots, and artist profiles with top releases, plus Phase 5 playlist reads (metadata plus first items page, paginated items, and a channel's curated playlists), Phase 4 channel profiles, uploads, Shorts shelves, and live/upcoming/past streams, Phase 3 discovery (search autocomplete suggestions, hashtag feeds), Phase 2 watch essentials (related rail, comments, captions, transcript) and Phase 1 health, search, video details, URL resolving, and this spec.",
     },
     servers: [{ url: "https://tubelens.vercel.app/api/v1" }],
     paths: {
@@ -575,6 +575,123 @@ export function buildOpenApiDocument() {
                 "upstream_timeout; the 8s fail-fast fired. Retry shortly.",
               content: { "application/json": { schema: { $ref: errorRef } } },
             },
+          },
+        },
+      },
+      "/music/search": {
+        get: {
+          operationId: "searchMusic",
+          summary: "Music-native search with typed song/album/artist results",
+          parameters: [
+            {
+              name: "q",
+              in: "query",
+              required: true,
+              schema: { type: "string", minLength: 1 },
+            },
+            {
+              name: "type",
+              in: "query",
+              schema: {
+                type: "string",
+                enum: ["song", "album", "artist", "video", "playlist", "all"],
+                default: "all",
+              },
+              description:
+                "YouTube Music–native typing: every item carries a kind discriminator (song vs album vs artist vs video vs playlist).",
+            },
+            limitParam,
+            cursorParam,
+            regionParam,
+            langParam,
+          ],
+          responses: {
+            200: {
+              description:
+                "Paged music results. meta.cached reflects the origin L0 only — CDN L1 hits replay the stored JSON verbatim (including its meta).",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "missing_query, invalid_type, or invalid_limit.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
+            502: degradedResponse,
+            504: timeoutResponse,
+          },
+        },
+      },
+      "/music/charts": {
+        get: {
+          operationId: "getMusicCharts",
+          summary: "Charts snapshot for top songs, videos, and artists",
+          parameters: [
+            {
+              name: "country",
+              in: "query",
+              schema: { type: "string", default: "US" },
+              description:
+                "Echo-only 2-letter country (defaults to US): the zero-cost shared session serves the default charts snapshot for any value, with a country_fallback warning when it is not US.",
+            },
+            limitParam,
+            regionParam,
+            langParam,
+          ],
+          responses: {
+            200: {
+              description:
+                "Charts snapshot as { country, sections }. Single snapshot, no pagination (page.next is always null); limit caps items per section; an empty upstream yields data sections:[] rather than 404.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "invalid_limit.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
+            502: degradedResponse,
+            504: timeoutResponse,
+          },
+        },
+      },
+      "/artists/{id}": {
+        get: {
+          operationId: "getArtist",
+          summary: "Artist profile with top releases",
+          parameters: [
+            {
+              name: "id",
+              in: "path",
+              required: true,
+              schema: { type: "string", pattern: "^UC[A-Za-z0-9_-]{20,}$" },
+              description:
+                "UC artist id (e.g. UCRw0x9_EfawqmgDI2IgQLLg). Find ids via /music/search?type=artist.",
+            },
+            regionParam,
+            langParam,
+          ],
+          responses: {
+            200: {
+              description:
+                "Artist profile plus topSongs and albums (songs/albums shelves as served upstream).",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "invalid_artist_id.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            404: {
+              description: "artist_not_found.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
+            502: degradedResponse,
+            504: timeoutResponse,
           },
         },
       },
