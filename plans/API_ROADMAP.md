@@ -101,7 +101,7 @@ say, and what is spoken.
 
 **Goal:** Answer "what's popular and what did you mean" beyond raw search.
 
-**Status:** `[~]` in progress — branch `phase-3-discovery`.
+**Status:** `[x]` done — shipped via PR #6 (merged 2026-09-09): search/suggestions + hashtags/:tag live with 241 unit tests + e2e PASS on live upstream (prod build). (`trending` deferred per plan note — no viable $0 upstream.)
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
