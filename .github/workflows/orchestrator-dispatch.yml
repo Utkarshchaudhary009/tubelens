@@ -47,12 +47,16 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.PAT }}
         run: |
+          set -e
+          set -o pipefail
           for wf in phase-runner.yml e2e.yml; do
-            count=$(gh run list --workflow="$wf" --status=in_progress --branch=main --limit 1 --json databaseId --jq 'length')
-            if [ "$count" -gt 0 ]; then
-              echo "NOTICE: $wf has an in_progress run on main; skipping orchestrator-dispatch (exit 0)."
-              echo "SKIP_ORCHESTRATOR=true" >> "$GITHUB_ENV"
-            fi
+            for st in in_progress queued; do
+              count=$(gh run list --workflow="$wf" --status="$st" --branch=main --limit 1 --json databaseId --jq 'length') || exit 1
+              if [ "$count" -gt 0 ]; then
+                echo "NOTICE: $wf has a $st run on main; skipping orchestrator-dispatch (exit 0)."
+                echo "SKIP_ORCHESTRATOR=true" >> "$GITHUB_ENV"
+              fi
+            done
           done
 
       - name: Install OpenCode
@@ -64,10 +68,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.PAT }}
           GITHUB_TOKEN: ${{ secrets.PAT }}
+          PROMPT: ${{ inputs.prompt }}
+          AGENT: ${{ inputs.agent }}
+          MODEL: ${{ inputs.model }}
         run: |
           export PATH="$HOME/.opencode/bin:$PATH"
           set -o pipefail
-          opencode run --agent ${{ inputs.agent }} --auto --model ${{ inputs.model }} "${{ inputs.prompt }}" \
+          opencode run --agent "$AGENT" --auto --model "$MODEL" "$PROMPT" \
             | tee /tmp/orchestrator-result.md
 
       - name: Publish run result
@@ -77,7 +84,7 @@ jobs:
             echo '## Orchestrator dispatch result'
             echo
             if [ "$SKIP_ORCHESTRATOR" = "true" ]; then
-              echo 'Skipped: phase-runner or e2e workflow is in_progress on main.'
+              echo 'Skipped: phase-runner or e2e workflow is in_progress or queued on main.'
             else
               cat /tmp/orchestrator-result.md 2>/dev/null || echo 'No agent report was produced. Check the workflow logs.'
             fi
