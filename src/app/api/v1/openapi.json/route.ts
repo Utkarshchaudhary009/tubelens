@@ -648,6 +648,12 @@ export function buildOpenApiDocument() {
                 "Signed URL JSON ({ url, expiresAt, mimeType, ... }) or audio bytes (Range requests yield 206 with Content-Range + Accept-Ranges). Bytes responses are private, no-store.",
               content: {
                 "application/json": { schema: { $ref: envelopeRef } },
+                "audio/webm": {
+                  schema: { type: "string", format: "binary" },
+                },
+                "audio/mp4": {
+                  schema: { type: "string", format: "binary" },
+                },
               },
             },
             206: {

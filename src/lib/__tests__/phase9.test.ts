@@ -5,20 +5,24 @@ import {
   AUDIO_URL_TTL_MS,
   type AudioDeps,
   type AudioFormatInfo,
+  adaptAutomixPanel,
   assembleRadioQueue,
   type ByteRange,
   classifyAudioError,
   clearAudioBlockedForTests,
+  deriveAudioTotal,
   handleAudio,
   handleLyrics,
   handleRadio,
   isAudioBlocked,
+  isTakedownStatus,
   type LyricsDeps,
   mapLyricsShelf,
   mapRadioTrack,
   markAudioBlocked,
   mintSignedAudioUrl,
   parseRangeHeader,
+  parseRangeSyntax,
   type RadioDeps,
   type RadioTrackDTO,
   signAudioToken,
@@ -95,6 +99,7 @@ describe("phase 9 flag gate (default OFF)", () => {
       bytes: new Uint8Array([1, 2, 3]),
       contentType: "audio/webm",
       totalLength: 3,
+      partial: false,
     }),
   };
   const radioDeps: RadioDeps = {
@@ -180,6 +185,7 @@ describe("phase 9 flag gate (default OFF)", () => {
         bytes: new Uint8Array([1, 2, 3]),
         contentType: "audio/webm",
         totalLength: 3,
+        partial: false,
       }),
     };
     const resJson = await handleAudio(
@@ -269,6 +275,8 @@ function rangeAwareAudioDeps(total = 1000): AudioDeps & { calls: ByteRange[] } {
         bytes: full.slice(start, Math.min(end, total - 1) + 1),
         contentType: "audio/webm",
         totalLength: total,
+        // Mirrors a well-behaved upstream: ranged requests get 206 slices.
+        partial: range !== null,
       };
     },
   };
@@ -393,9 +401,15 @@ describe("phase 9 audio route", () => {
             bytes: full.slice(range.start, range.end ?? 999),
             contentType: "audio/webm",
             totalLength: -1,
+            partial: true,
           };
         }
-        return { bytes: full, contentType: "audio/webm", totalLength: -1 };
+        return {
+          bytes: full,
+          contentType: "audio/webm",
+          totalLength: -1,
+          partial: false,
+        };
       },
     };
     const signed = await handleAudio(
@@ -504,6 +518,73 @@ describe("phase 9 audio route", () => {
     expect((await again.json()).error.code).toBe("audio_blocked");
   });
 
+  test("isTakedownStatus: only 404/410 latch; 403 is recoverable", () => {
+    expect(isTakedownStatus(404)).toBe(true);
+    expect(isTakedownStatus(410)).toBe(true);
+    expect(isTakedownStatus(403)).toBe(false);
+    expect(isTakedownStatus(429)).toBe(false);
+    expect(isTakedownStatus(500)).toBe(false);
+    expect(isTakedownStatus(200)).toBe(false);
+  });
+
+  test("403 upstream -> 502 with NO latch, then recovers on retry", async () => {
+    enableAudio();
+    const forbidden: AudioDeps = {
+      fetchFormat: async () => {
+        throw new Error("Audio upstream responded with status 403");
+      },
+      fetchRange: async () => {
+        throw new Error("Audio upstream responded with status 403");
+      },
+    };
+    const res = await handleAudio(
+      req(`http://x/api/v1/videos/${VID}/audio`),
+      VID,
+      forbidden,
+    );
+    expect(res.status).toBe(502);
+    expect((await res.json()).error.code).toBe("upstream_degraded");
+    // Transient bot-guard must not latch the kill switch: a retry with a
+    // healthy upstream succeeds instead of 410 audio_blocked.
+    expect(isAudioBlocked(VID)).toBe(false);
+    const healthy = rangeAwareAudioDeps();
+    const retry = await handleAudio(
+      req(`http://x/api/v1/videos/${VID}/audio`),
+      VID,
+      healthy,
+    );
+    expect(retry.status).toBe(200);
+  });
+
+  test("upstream ignoring Range (full 200 body) is served as honest 200", async () => {
+    enableAudio();
+    const full = new Uint8Array(1000);
+    const deps: AudioDeps = {
+      fetchFormat: async () => ({ mimeType: "audio/webm" }),
+      // Upstream ignored the Range: full body, known total, not partial.
+      fetchRange: async () => ({
+        bytes: full,
+        contentType: "audio/webm",
+        totalLength: 1000,
+        partial: false,
+      }),
+    };
+    const signed = await handleAudio(
+      req(`http://x/api/v1/videos/${VID}/audio`),
+      VID,
+      deps,
+    );
+    const { url } = (await signed.json()).data as { url: string };
+    const res = await handleAudio(
+      req(url, { headers: { Range: "bytes=0-99" } }),
+      VID,
+      deps,
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Range")).toBeNull();
+    expect((await res.arrayBuffer()).byteLength).toBe(1000);
+  });
+
   test("generic upstream failure -> 502 typed hint, never bare 500", async () => {
     enableAudio();
     const deps: AudioDeps = {
@@ -569,6 +650,39 @@ describe("phase 9 radio mapping", () => {
     ).toMatchObject({ id: "v3", title: "T3" });
     expect(mapRadioTrack({ type: "AdBanner", id: "x" })).toBeNull();
     expect(mapRadioTrack(null)).toBeNull();
+  });
+
+  test("adaptAutomixPanel: token without fetcher is single-page (no phantom continuation)", async () => {
+    const page = adaptAutomixPanel({
+      contents: [node("p1")],
+      continuation: "nextRadioContinuationData-token",
+    });
+    expect(page.results).toHaveLength(1);
+    expect(page.has_continuation).toBe(false);
+    await expect(page.getContinuation()).rejects.toThrow("single-page");
+  });
+
+  test("adaptAutomixPanel: shipped fetchers stay bound to the panel", async () => {
+    const panel = {
+      contents: [{ type: "PlaylistPanelVideo", video_id: "p1", title: "P1" }],
+      continuation: "tok",
+      async getContinuation(this: unknown): Promise<unknown> {
+        const self = this as { continuation?: string } | undefined;
+        if (!self?.continuation) {
+          throw new Error("continuation lost its receiver");
+        }
+        return {
+          contents: [
+            { type: "PlaylistPanelVideo", video_id: "p2", title: "P2" },
+          ],
+        };
+      },
+    };
+    const page = adaptAutomixPanel(panel);
+    expect(page.has_continuation).toBe(true);
+    const next = await page.getContinuation();
+    expect(next.results).toHaveLength(1);
+    expect(next.has_continuation).toBe(false);
   });
 
   test("assembleRadioQueue dedupes, drops the seed, caps at max", () => {
@@ -727,6 +841,34 @@ describe("phase 9 radio route", () => {
     const thirdBody = await third.json();
     expect(thirdBody.data).toHaveLength(10);
     expect(thirdBody.page.next).toBeNull();
+  });
+
+  test("related rail skipped when automix alone reaches target", async () => {
+    enableAudio();
+    const ids = Array.from({ length: 30 }, (_, i) => `track${i}`);
+    let relatedCalls = 0;
+    const base = radioDepsFor(ids, ["fill-should-not-be-needed"]);
+    const deps: RadioDeps = {
+      ...base,
+      fetchRelated: async (id: string) => {
+        relatedCalls += 1;
+        return base.fetchRelated(id);
+      },
+    };
+    const res = await handleRadio(
+      req(`http://x/api/v1/videos/${VID}/radio?limit=20`),
+      VID,
+      deps,
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toHaveLength(20);
+    expect(relatedCalls).toBe(0);
+    expect(
+      (body.warnings as Array<{ code: string }>).some(
+        (w) => w.code === "radio_shortfall",
+      ),
+    ).toBe(false);
   });
 
   test("related rail fills an automix shortfall", async () => {
@@ -933,6 +1075,68 @@ describe("phase 9 range parsing", () => {
     expect(parseRangeHeader("bytes=5000-", 1000)).toEqual({
       kind: "unsatisfiable",
     });
+  });
+
+  test("parseRangeSyntax rejects over-long numerics (no Infinity upstream)", () => {
+    const huge = "9".repeat(400);
+    expect(parseRangeSyntax(`bytes=${huge}-`)).toBeNull();
+    expect(parseRangeSyntax(`bytes=0-${huge}`)).toBeNull();
+    expect(parseRangeSyntax(`bytes=-${huge}`)).toBeNull();
+    expect(parseRangeSyntax("bytes=0-99")).toEqual({
+      kind: "open",
+      start: 0,
+      end: 99,
+    });
+    expect(parseRangeSyntax("bytes=500-")).toEqual({
+      kind: "open",
+      start: 500,
+    });
+  });
+
+  test("over-long numeric Range is ignored -> 200 full body", async () => {
+    enableAudio();
+    const deps = rangeAwareAudioDeps();
+    const signed = await handleAudio(
+      req(`http://x/api/v1/videos/${VID}/audio`),
+      VID,
+      deps,
+    );
+    const { url } = (await signed.json()).data as { url: string };
+    const res = await handleAudio(
+      req(url, { headers: { Range: `bytes=${"9".repeat(400)}-` } }),
+      VID,
+      deps,
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Range")).toBeNull();
+    expect((await res.arrayBuffer()).byteLength).toBe(1000);
+    expect(deps.calls).toEqual([]);
+  });
+
+  test("deriveAudioTotal: 206 Content-Length is slice length, never total", () => {
+    const headers = (pairs: Record<string, string>) => new Headers(pairs);
+    // 206 total comes only from the Content-Range suffix.
+    expect(
+      deriveAudioTotal(
+        206,
+        headers({
+          "content-range": "bytes 0-99/1000",
+          "content-length": "100",
+        }),
+      ),
+    ).toBe(1000);
+    // 206 without a total is unknown — never the slice length.
+    expect(deriveAudioTotal(206, headers({ "content-length": "100" }))).toBe(
+      -1,
+    );
+    expect(
+      deriveAudioTotal(206, headers({ "content-range": "bytes 0-99/*" })),
+    ).toBe(-1);
+    // Full 200 bodies use Content-Length as the total.
+    expect(deriveAudioTotal(200, headers({ "content-length": "1000" }))).toBe(
+      1000,
+    );
+    expect(deriveAudioTotal(200, headers({}))).toBe(-1);
   });
 });
 

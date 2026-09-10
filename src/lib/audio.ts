@@ -246,6 +246,8 @@ export interface AudioBytes {
   contentType: string;
   /** Full stream length (for Content-Range); -1 when unknown. */
   totalLength: number;
+  /** True when upstream honored our Range (HTTP 206 slice). */
+  partial: boolean;
 }
 
 export interface ByteRange {
@@ -265,6 +267,16 @@ export interface AudioDeps {
   fetchRange: (id: string, range: ByteRange | null) => Promise<AudioBytes>;
 }
 
+/**
+ * 404/410 = gone for good (latches the per-video kill switch). Everything
+ * else — including 403, which from googlevideo is usually transient
+ * bot-guard/region/DRM rather than takedown — is recoverable and must NOT
+ * latch.
+ */
+export function isTakedownStatus(status: number): boolean {
+  return status === 404 || status === 410;
+}
+
 function audioTakedownError(status: number): Error {
   return Object.assign(
     new Error(`audio_unavailable: upstream responded with status ${status}`),
@@ -279,6 +291,20 @@ function audioUpstreamError(status: number): Error {
   );
 }
 
+/**
+ * Derives the full stream length from upstream headers. A 206
+ * Content-Length is the SLICE length, never the total — so for 206 the
+ * total comes only from the Content-Range suffix (unknown when absent);
+ * for full 200 bodies Content-Length is the total. Pure for unit tests.
+ */
+export function deriveAudioTotal(status: number, headers: Headers): number {
+  if (status === 206) {
+    const total = /\/(\d+)\s*$/.exec(headers.get("content-range") ?? "");
+    return total?.[1] ? Number(total[1]) : -1;
+  }
+  const len = (headers.get("content-length") ?? "").trim();
+  return /^\d+$/.test(len) ? Number(len) : -1;
+}
 /**
  * Resolves the deciphered audio-only stream URL via youtubei.js
  * getStreamingData (deciphered server-side), then fetches the requested byte
@@ -321,32 +347,18 @@ async function fetchAudioUpstream(
     );
   }
   const res = await fetch(url, { signal: AbortSignal.timeout(8000), headers });
-  if (res.status === 404 || res.status === 410 || res.status === 403) {
+  if (isTakedownStatus(res.status)) {
     throw audioTakedownError(res.status);
   }
   if (!res.ok && res.status !== 206) {
     throw audioUpstreamError(res.status);
   }
   const contentType = res.headers.get("content-type") ?? "audio/webm";
-  let totalLength = -1;
-  const contentRange = res.headers.get("content-range");
-  const totalMatch = contentRange ? /\/(\d+)\s*$/.exec(contentRange) : null;
-  if (totalMatch?.[1]) {
-    totalLength = Number(totalMatch[1]);
-  } else {
-    const len = res.headers.get("content-length");
-    if (len && /^\d+$/.test(len.trim())) {
-      totalLength = Number(len.trim());
-    }
-  }
-  // Range responses carry the slice length; full responses carry the total.
-  if (res.status === 206 && totalLength < 0) {
-    totalLength = -1;
-  }
   return {
     bytes: new Uint8Array(await res.arrayBuffer()),
     contentType,
-    totalLength,
+    totalLength: deriveAudioTotal(res.status, res.headers),
+    partial: res.status === 206,
   };
 }
 
@@ -541,12 +553,17 @@ export function parseRangeSyntax(raw: string | null): RangeSyntax | null {
   const trimmed = raw.trim();
   const open = /^bytes=(\d+)-(\d*)$/.exec(trimmed);
   if (open) {
+    // Over-long digit runs parse to Infinity — reject anything that is not
+    // a safe integer so `bytes=Infinity-` never reaches upstream.
     const start = Number(open[1]);
+    if (!Number.isSafeInteger(start)) {
+      return null;
+    }
     if (open[2] === "") {
       return { kind: "open", start };
     }
     const end = Number(open[2]);
-    if (end < start) {
+    if (!Number.isSafeInteger(end) || end < start) {
       return null;
     }
     return { kind: "open", start, end };
@@ -554,7 +571,7 @@ export function parseRangeSyntax(raw: string | null): RangeSyntax | null {
   const suffix = /^bytes=-(\d+)$/.exec(trimmed);
   if (suffix) {
     const n = Number(suffix[1]);
-    if (!(n > 0)) {
+    if (!Number.isSafeInteger(n) || !(n > 0)) {
       return null;
     }
     return { kind: "suffix", suffix: n };
@@ -640,6 +657,17 @@ async function serveAudioBytes(
       // is a slice (the "none" arm is unreachable — the fallthrough 200
       // below would otherwise risk serving a ranged slice as full body).
       if (parsed.kind === "slice") {
+        if (range !== null && !audio.partial) {
+          // Upstream ignored our Range and sent the full body: serve it as
+          // an honest 200 rather than a fabricated 206.
+          if (total >= 0) {
+            headers.set("Content-Length", String(audio.bytes.length));
+          }
+          return new NextResponse(audio.bytes as BodyInit, {
+            status: 200,
+            headers,
+          });
+        }
         // Suffix ranges fetched full (the total was needed first): carve the
         // tail locally; open ranges arrive pre-sliced from deps.
         const bytes =
@@ -801,26 +829,36 @@ export interface RadioDeps {
   continueRelated: (page: ContinuationSearch) => Promise<ContinuationSearch>;
 }
 
-/** Adapts a music PlaylistPanel (getUpNext) to the continuation-page shape. */
-function adaptAutomixPanel(panel: {
+/**
+ * Adapts a music PlaylistPanel (getUpNext) to the continuation-page shape.
+ * Exported as a test seam (pure — no network).
+ *
+ * Two honest-continuation rules: youtubei.js v18 PlaylistPanel carries only
+ * a continuation TOKEN string (no getContinuation method), and the token is
+ * not redeemable through any typed client call — so has_continuation is true
+ * only when the panel actually ships a fetcher, and the fetcher is invoked
+ * bound to the panel (an extracted `const fn = panel.getContinuation; fn()`
+ * would lose `this` and silently end the automix after page one).
+ */
+export function adaptAutomixPanel(panel: {
   contents?: { [Symbol.iterator](): Iterator<unknown> } | null;
   continuation?: string | null;
   getContinuation?: () => Promise<unknown>;
 }): ContinuationSearch {
   const results = panel.contents ? [...panel.contents] : [];
-  const hasMore = Boolean(
-    panel.continuation && String(panel.continuation) !== "",
-  );
-  const getNext = panel.getContinuation;
+  const fetchNext = panel.getContinuation;
+  const fetchable = typeof fetchNext === "function";
   return {
     results,
-    has_continuation: hasMore,
+    has_continuation: fetchable,
     getContinuation: async () => {
-      if (typeof getNext !== "function") {
-        throw new Error("automix_unavailable: no continuation on panel");
+      if (!fetchable) {
+        throw new Error("automix_unavailable: single-page panel");
       }
       return adaptAutomixPanel(
-        (await getNext()) as Parameters<typeof adaptAutomixPanel>[0],
+        (await fetchNext.call(panel)) as Parameters<
+          typeof adaptAutomixPanel
+        >[0],
       );
     },
   };
@@ -977,25 +1015,28 @@ export async function handleRadio(
         } catch {
           automixRaw = [];
         }
-        let relatedRaw: unknown[] = [];
-        try {
-          const first = await deps.fetchRelated(id);
-          relatedRaw = await collectRaw(
-            first,
-            deps.continueRelated,
-            RADIO_MAX_TRACKS,
-          );
-        } catch {
-          relatedRaw = [];
+        // The related rail costs a second upstream read (getInfo), so it is
+        // fetched only when the mapped automix queue is short of target —
+        // never unconditionally. Behavior when short is unchanged.
+        let queue = assembleRadioQueue([automixRaw], id);
+        if (queue.tracks.length < RADIO_TARGET_TRACKS) {
+          let relatedRaw: unknown[] = [];
+          try {
+            const first = await deps.fetchRelated(id);
+            relatedRaw = await collectRaw(
+              first,
+              deps.continueRelated,
+              RADIO_MAX_TRACKS,
+            );
+          } catch {
+            relatedRaw = [];
+          }
+          queue = assembleRadioQueue([automixRaw, relatedRaw], id);
         }
-        const { tracks, shortfall } = assembleRadioQueue(
-          [automixRaw, relatedRaw],
-          id,
-        );
-        if (tracks.length === 0) {
+        if (queue.tracks.length === 0) {
           throw new Error("radio_unavailable: no continuation tracks");
         }
-        return { tracks, shortfall };
+        return queue;
       },
       RADIO_STALE_MS,
     );
