@@ -1,0 +1,84 @@
+name: orchestrator-dispatch
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: 'Prompt to run'
+        required: true
+        default: 'Advance.'
+        type: string
+      agent:
+        # NOTE: .opencode/agents/orchestrator.md does not exist yet;
+        # defaulting to the phase-runner agent until it does.
+        description: 'OpenCode agent to run'
+        required: false
+        default: 'phase-runner'
+        type: string
+      model:
+        description: 'Model for the agent run'
+        required: false
+        default: 'opencode/muse-spark-1.3-contributor-free'
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+  checks: read
+
+concurrency:
+  group: orchestrator-dispatch-main
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ secrets.PAT }}
+
+      - name: Guard - skip if phase-runner or e2e in progress on main
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          for wf in phase-runner.yml e2e.yml; do
+            count=$(gh run list --workflow="$wf" --status=in_progress --branch=main --limit 1 --json databaseId --jq 'length')
+            if [ "$count" -gt 0 ]; then
+              echo "NOTICE: $wf has an in_progress run on main; skipping orchestrator-dispatch (exit 0)."
+              echo "SKIP_ORCHESTRATOR=true" >> "$GITHUB_ENV"
+            fi
+          done
+
+      - name: Install OpenCode
+        if: env.SKIP_ORCHESTRATOR != 'true'
+        run: curl -fsSL https://opencode.ai/install | bash
+
+      - name: Run orchestrator
+        if: env.SKIP_ORCHESTRATOR != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+          GITHUB_TOKEN: ${{ secrets.PAT }}
+        run: |
+          export PATH="$HOME/.opencode/bin:$PATH"
+          set -o pipefail
+          opencode run --agent ${{ inputs.agent }} --auto --model ${{ inputs.model }} "${{ inputs.prompt }}" \
+            | tee /tmp/orchestrator-result.md
+
+      - name: Publish run result
+        if: always()
+        run: |
+          {
+            echo '## Orchestrator dispatch result'
+            echo
+            if [ "$SKIP_ORCHESTRATOR" = "true" ]; then
+              echo 'Skipped: phase-runner or e2e workflow is in_progress on main.'
+            else
+              cat /tmp/orchestrator-result.md 2>/dev/null || echo 'No agent report was produced. Check the workflow logs.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
