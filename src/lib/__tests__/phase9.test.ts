@@ -1197,7 +1197,7 @@ describe("phase 9 range parsing", () => {
 
 describe("phase 9 openapi registration", () => {
   test("all three audio-first paths documented with operation ids", () => {
-    const doc = buildOpenApiDocument() as {
+    const doc = buildOpenApiDocument() as unknown as {
       paths: Record<
         string,
         {
