@@ -1213,16 +1213,21 @@ export interface LyricsDeps {
 
 /**
  * Lyrics failures: youtubei.js THROWS `InnertubeError: Lyrics not available`
- * for lyric-less videos (it does not return null), so that signal maps to
- * 404 lyrics_unavailable with a transcript-fallback hint. Everything else
- * (private/deleted video, transient failures, timeouts) delegates to
- * classifyFeedError — genuine outages still report 404/502/504 there,
- * never a misleading lyrics_unavailable.
+ * for lyric-less videos (it does not return null), so exactly that signal
+ * maps to 404 lyrics_unavailable with a transcript-fallback hint. The match
+ * is deliberately tight — transient phrasings (`Lyrics service
+ * unavailable`, timeouts) must NOT become permanent 404s — and anything
+ * else (private/deleted video, transient failures, timeouts) delegates to
+ * classifyFeedError, which still reports 404/502/504 there.
  */
 export function classifyLyricsError(err: unknown): ClassifiedVideoError {
-  const raw =
-    err instanceof Error ? `${err.name}: ${err.message}` : String(err);
-  if (/lyrics.{0,40}(not available|unavailable|not found)/i.test(raw)) {
+  const msg = err instanceof Error ? err.message : String(err);
+  const permanent = /\blyrics not available\b/i.test(msg);
+  const transient =
+    /service|timed? ?out|try again|temporar|socket|abort|rate.?limit/i.test(
+      msg,
+    );
+  if (permanent && !transient) {
     return {
       code: "lyrics_unavailable",
       message: "No lyrics are available for this video.",

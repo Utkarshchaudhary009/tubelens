@@ -9,6 +9,7 @@ import {
   assembleRadioQueue,
   type ByteRange,
   classifyAudioError,
+  classifyLyricsError,
   clearAudioBlockedForTests,
   deriveAudioTotal,
   handleAudio,
@@ -1085,6 +1086,23 @@ describe("phase 9 lyrics route", () => {
     );
     expect(res502.status).toBe(502);
     expect((await res502.json()).error.code).toBe("upstream_degraded");
+  });
+
+  test("classifyLyricsError: only the definitive signal is 404", () => {
+    const unavailable = Object.assign(new Error("Lyrics not available"), {
+      name: "InnertubeError",
+    });
+    expect(classifyLyricsError(unavailable)).toMatchObject({
+      code: "lyrics_unavailable",
+      status: 404,
+    });
+    // Transient phrasings must NOT become permanent 404s.
+    expect(
+      classifyLyricsError(new Error("Lyrics service unavailable, try again")),
+    ).toMatchObject({ code: "upstream_degraded", status: 502 });
+    expect(
+      classifyLyricsError(new Error("Lyrics request timed out after 8000ms")),
+    ).toMatchObject({ code: "upstream_timeout", status: 504 });
   });
 });
 
