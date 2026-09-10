@@ -1211,6 +1211,28 @@ export interface LyricsDeps {
   fetchLyrics: (id: string) => Promise<LyricsDTO | null>;
 }
 
+/**
+ * Lyrics failures: youtubei.js THROWS `InnertubeError: Lyrics not available`
+ * for lyric-less videos (it does not return null), so that signal maps to
+ * 404 lyrics_unavailable with a transcript-fallback hint. Everything else
+ * (private/deleted video, transient failures, timeouts) delegates to
+ * classifyFeedError — genuine outages still report 404/502/504 there,
+ * never a misleading lyrics_unavailable.
+ */
+export function classifyLyricsError(err: unknown): ClassifiedVideoError {
+  const raw =
+    err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+  if (/lyrics.{0,40}(not available|unavailable|not found)/i.test(raw)) {
+    return {
+      code: "lyrics_unavailable",
+      message: "No lyrics are available for this video.",
+      hint: "Lyrics are unavailable here; fall back to /videos/:id/transcript for spoken content.",
+      status: 404,
+    };
+  }
+  return classifyFeedError(err);
+}
+
 export const defaultLyricsDeps: LyricsDeps = {
   async fetchLyrics(id) {
     const { getInnertube, withTimeout } = await import("@/lib/youtube");
@@ -1273,6 +1295,6 @@ export async function handleLyrics(
       cacheControl: CACHE_CONTROL.lyrics,
     });
   } catch (err) {
-    return errorResponse(requestId, classifyFeedError(err));
+    return errorResponse(requestId, classifyLyricsError(err));
   }
 }

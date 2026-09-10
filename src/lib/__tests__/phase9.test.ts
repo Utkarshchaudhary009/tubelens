@@ -1049,6 +1049,43 @@ describe("phase 9 lyrics route", () => {
     expect(body.error.code).toBe("lyrics_unavailable");
     expect(body.error.hint).toContain("/videos/:id/transcript");
   });
+
+  test("thrown 'Lyrics not available' InnertubeError -> 404, not 502", async () => {
+    enableAudio();
+    // Live seam behavior: innertube.music.getLyrics() THROWS for lyric-less
+    // videos instead of returning null — the route must still answer the
+    // documented 404 lyrics_unavailable.
+    const throwing: LyricsDeps = {
+      fetchLyrics: async () => {
+        throw Object.assign(new Error("Lyrics not available for this video"), {
+          name: "InnertubeError",
+        });
+      },
+    };
+    const res = await handleLyrics(
+      req(`http://x/api/v1/videos/${VID}/lyrics`),
+      VID,
+      throwing,
+    );
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error.code).toBe("lyrics_unavailable");
+    expect(body.error.hint).toContain("/videos/:id/transcript");
+
+    // Genuine upstream failures still surface as 502, never lyrics_unavailable.
+    const broken: LyricsDeps = {
+      fetchLyrics: async () => {
+        throw new Error("socket hang up");
+      },
+    };
+    const res502 = await handleLyrics(
+      req(`http://x/api/v1/videos/${VID}/lyrics`),
+      VID,
+      broken,
+    );
+    expect(res502.status).toBe(502);
+    expect((await res502.json()).error.code).toBe("upstream_degraded");
+  });
 });
 
 // ---------------------------------------------------------------------------
