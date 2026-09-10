@@ -63,6 +63,14 @@ export const CACHE_CONTROL = {
   captions: "public, s-maxage=3600, stale-while-revalidate=86400",
   /** transcript: aggressive cache, never live-only (Phase 2). */
   transcript: "public, s-maxage=86400, stale-while-revalidate=86400",
+  /** SponsorBlock segments: third-party crowd data (Phase 8). */
+  sponsors: "public, s-maxage=3600, stale-while-revalidate=21600",
+  /** ReturnYouTubeDislike stats: third-party crowd data (Phase 8). */
+  dislikes: "public, s-maxage=3600, stale-while-revalidate=21600",
+  /** DeArrow branding: third-party crowd data (Phase 8). */
+  dearrow: "public, s-maxage=3600, stale-while-revalidate=21600",
+  /** Composed detail + crowd layers (Phase 8). */
+  combined: "public, s-maxage=3600, stale-while-revalidate=21600",
   /** videos/:id + resolve: static-ish metadata. */
   staticish: "public, s-maxage=3600, stale-while-revalidate=86400",
   /** openapi.json: long-lived spec. */
