@@ -140,6 +140,43 @@ describe("phase 8 community mappers", () => {
     expect(mapDeArrowResponse(null, VID)).toBeNull();
   });
 
+  test("branding rows omitting original never override title/thumbnail", () => {
+    expect(
+      mapDeArrowResponse(
+        {
+          titles: [
+            { title: "Original Title", votes: 1, original: true },
+            { title: "Sneaky Title", votes: 999 },
+            { title: "Crowd Title", votes: 5, original: false },
+          ],
+          thumbnails: [
+            { timestamp: 3, votes: 999 },
+            { timestamp: 12.5, votes: 4, original: false },
+          ],
+        },
+        VID,
+      ),
+    ).toEqual({
+      title: "Crowd Title",
+      thumbnails: [
+        {
+          timestamp: 12.5,
+          url: `https://dearrow-thumb.ajay.app/api/v1/getThumbnail?videoID=${VID}&time=12.5`,
+        },
+      ],
+    });
+    // Rows omitting original alone mean no usable crowd data.
+    expect(
+      mapDeArrowResponse(
+        {
+          titles: [{ title: "Sneaky Title", votes: 999 }],
+          thumbnails: [{ timestamp: 3, votes: 999 }],
+        },
+        VID,
+      ),
+    ).toBeNull();
+  });
+
   test("error classifier: timeout is 504, generic failure is 502", () => {
     for (const source of ["sponsors", "dislikes", "dearrow"] as const) {
       expect(classifyCommunityError(source, timeoutErr()).status).toBe(504);

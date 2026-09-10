@@ -602,7 +602,6 @@ export function buildOpenApiDocument() {
               description: "video_not_found.",
               content: { "application/json": { schema: { $ref: errorRef } } },
             },
-            429: rateLimitedResponse,
           },
         },
       },

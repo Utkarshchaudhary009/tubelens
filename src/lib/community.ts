@@ -26,6 +26,7 @@ import {
   type ClassifiedVideoError,
   classifyVideoError,
   isUpstreamTimeout,
+  mapVideoDetails,
   type VideoDetailsDTO,
 } from "@/lib/mappers";
 import { isPlausibleVideoId, parseLang, parseRegion } from "@/lib/validate";
@@ -173,8 +174,9 @@ export function mapDislikesResponse(
 }
 
 /**
- * Maps a DeArrow branding payload: the top-voted non-original title wins
- * (null when only the original — or nothing — is served) and non-original
+ * Maps a DeArrow branding payload: the top-voted explicitly crowd-sourced
+ * title wins (only rows with original === false count — rows omitting
+ * `original` must never override the displayed title) and non-original
  * thumbnails resolve to dearrow-thumb URLs, highest votes first. Returns
  * null when no usable crowd entry exists, so callers serve data:null + a
  * warning instead of a 404.
@@ -195,7 +197,7 @@ export function mapDeArrowResponse(
         continue;
       }
       const e = t as Record<string, unknown>;
-      if (e.original === true) {
+      if (e.original !== false) {
         continue;
       }
       if (typeof e.title !== "string" || e.title.trim() === "") {
@@ -216,7 +218,7 @@ export function mapDeArrowResponse(
         continue;
       }
       const e = t as Record<string, unknown>;
-      if (e.original === true) {
+      if (e.original !== false) {
         continue;
       }
       const timestamp = toFiniteNumber(e.timestamp);
@@ -425,8 +427,16 @@ const defaultDeArrowDeps: DeArrowDeps = {
 export const defaultCombinedDeps: CombinedDeps = {
   async fetchVideo(id) {
     const { getInnertube, withTimeout } = await import("@/lib/youtube");
-    const innertube = await withTimeout(() => getInnertube(), 8000);
-    const info = await withTimeout(() => innertube.getBasicInfo(id), 8000);
+    // One shared 8s budget for session creation + getBasicInfo together
+    // (never two stacked 8s timeouts): the fetcher always settles inside the
+    // outer combined budget, so the inner cached() stale path still wins
+    // when a stale copy exists. The lazy import keeps this module importable
+    // without the server-only singleton (tests inject mocks and never run
+    // this function).
+    const info = await withTimeout(async () => {
+      const innertube = await getInnertube();
+      return innertube.getBasicInfo(id);
+    }, 8000);
     const playability = (info as unknown as Record<string, unknown>)
       .playability_status as Record<string, unknown> | undefined;
     if (playability?.status === "LOGIN_REQUIRED") {
@@ -434,7 +444,6 @@ export const defaultCombinedDeps: CombinedDeps = {
         name: "InnertubeError",
       });
     }
-    const { mapVideoDetails } = await import("@/lib/mappers");
     return mapVideoDetails(info);
   },
   fetchSponsors: (id) => fetchSponsorsUpstream(id),
