@@ -1,7 +1,7 @@
 # TubeLens — Need to Think (great-risk / aggressive-infra gates)
 
 $0-spend lens: default is CDN + in-memory. Anything below needs its phase gate
-cleared before adding infra or shipping. Read with `API_ROADMAP.md` + `CACHING.md`.
+cleared before adding infra or shipping. Read with `plans/PLAN.md` + `CACHING.md`.
 
 ## 1. Transcript hardening (Phase 2)
 - **Why risky:** YouTube hardens caption/transcript access (auth walls, 403/429,
