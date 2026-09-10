@@ -71,6 +71,10 @@ export const CACHE_CONTROL = {
   dearrow: "public, s-maxage=3600, stale-while-revalidate=21600",
   /** Composed detail + crowd layers (Phase 8). */
   combined: "public, s-maxage=3600, stale-while-revalidate=21600",
+  /** radio autoplay queue: fast-moving (Phase 9). */
+  radio: "public, s-maxage=600, stale-while-revalidate=3600",
+  /** lyrics: static-ish text (Phase 9). */
+  lyrics: "public, s-maxage=3600, stale-while-revalidate=86400",
   /** videos/:id + resolve: static-ish metadata. */
   staticish: "public, s-maxage=3600, stale-while-revalidate=86400",
   /** openapi.json: long-lived spec. */
