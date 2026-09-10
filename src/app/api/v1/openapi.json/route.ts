@@ -3,9 +3,8 @@ import { baseHeaders, CACHE_CONTROL, getRequestId } from "@/lib/envelope";
 
 export const runtime = "nodejs";
 
-// OpenAPI 3.1 stub for Phase 9: documents exactly the 31 shipped endpoints.
-// Grows each phase; promoted to the full spec in Phase 10. Exported as a
-// pure builder so tests can validate it without HTTP.
+// OpenAPI 3.1 full spec for Phase 10: documents all 37 shipped endpoints.
+// Exported as a pure builder so tests can validate it without HTTP.
 export function buildOpenApiDocument() {
   const envelopeRef = "#/components/schemas/Envelope";
   const errorRef = "#/components/schemas/ErrorBody";
@@ -66,7 +65,7 @@ export function buildOpenApiDocument() {
       // package.json (0.1.0 until the v1 API is declared stable).
       version: "0.1.0",
       description:
-        "API-first YouTube data API. Phase 9 ships flag-gated audio-first endpoints (signed-URL + Range-gateway audio proxy, autoplay radio continuation with >= 25 deduped tracks, and timed/plain lyrics), plus Phase 8 community-enriched data (SponsorBlock skip segments, ReturnYouTubeDislike stats, DeArrow crowd-sourced titles/thumbnails, and one combined call composing detail with all three layers, each degrading independently), plus Phase 7 explore verticals (Shorts discovery, cross-channel live discovery with viewer counts/scheduled times, and the gaming hub), plus Phase 6 music-native search (typed song vs album vs artist), charts snapshots, and artist profiles with top releases, plus Phase 5 playlist reads (metadata plus first items page, paginated items, and a channel's curated playlists), Phase 4 channel profiles, uploads, Shorts shelves, and live/upcoming/past streams, Phase 3 discovery (search autocomplete suggestions, hashtag feeds), Phase 2 watch essentials (related rail, comments, captions, transcript) and Phase 1 health, search, video details, URL resolving, and this spec.",
+        "API-first YouTube data API. Phase 10 ships utils and polish (channel RSS feeds for readers and webhooks, seed-to-mix id lookup with item reads via playlists, a pure thumbnail URL resolver, peer instance status for failover-aware clients, single-round-trip batch reads with per-item error isolation, and stub quota counters — plus this full spec), Phase 9 ships flag-gated audio-first endpoints (signed-URL + Range-gateway audio proxy, autoplay radio continuation with >= 25 deduped tracks, and timed/plain lyrics), plus Phase 8 community-enriched data (SponsorBlock skip segments, ReturnYouTubeDislike stats, DeArrow crowd-sourced titles/thumbnails, and one combined call composing detail with all three layers, each degrading independently), plus Phase 7 explore verticals (Shorts discovery, cross-channel live discovery with viewer counts/scheduled times, and the gaming hub), plus Phase 6 music-native search (typed song vs album vs artist), charts snapshots, and artist profiles with top releases, plus Phase 5 playlist reads (metadata plus first items page, paginated items, and a channel's curated playlists), Phase 4 channel profiles, uploads, Shorts shelves, and live/upcoming/past streams, Phase 3 discovery (search autocomplete suggestions, hashtag feeds), Phase 2 watch essentials (related rail, comments, captions, transcript) and Phase 1 health, search, video details, URL resolving, and this spec.",
     },
     servers: [{ url: "https://tubelens.vercel.app/api/v1" }],
     paths: {
@@ -1303,6 +1302,35 @@ export function buildOpenApiDocument() {
           },
         },
       },
+      "/channels/{id}/rss": {
+        get: {
+          operationId: "getChannelRss",
+          summary: "Channel RSS feed for readers and webhooks",
+          description:
+            "Raw RSS 2.0 (application/rss+xml, NOT the JSON envelope) built from the channel's latest uploads. X-Request-Id/X-RateLimit-* headers still apply.",
+          parameters: [channelIdParam],
+          responses: {
+            200: {
+              description:
+                "RSS 2.0 feed with up to 20 latest uploads (watch URLs as item links/guids).",
+              content: {
+                "application/rss+xml": { schema: { type: "string" } },
+              },
+            },
+            400: {
+              description: "invalid_channel_id.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            404: {
+              description: "channel_not_found.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
+            502: degradedResponse,
+            504: timeoutResponse,
+          },
+        },
+      },
       "/playlists/{id}": {
         get: {
           operationId: "getPlaylist",
@@ -1363,10 +1391,171 @@ export function buildOpenApiDocument() {
           },
         },
       },
+      "/mixes/{id}": {
+        get: {
+          operationId: "getMix",
+          summary: "Seed to mix id lookup",
+          description:
+            "Pure resolver: RD mix ids pass through, any other mix/playlist-ish id maps to RD+seed. Read items via GET /api/v1/playlists/{mixId}.",
+          parameters: [
+            {
+              name: "id",
+              in: "path",
+              required: true,
+              schema: {
+                type: "string",
+                pattern: "^(RD[A-Za-z0-9_-]{1,62}|[A-Za-z0-9_-]{5,64})$",
+              },
+              description:
+                "Video id seed (e.g. dQw4w9WgXcQ, 5+ chars) or RD mix id (e.g. RDdQw4w9WgXcQ).",
+            },
+          ],
+          responses: {
+            200: {
+              description:
+                "data is { mixId, seedId }. A mix_items_via_playlist warning points at /playlists/{id} for items.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "invalid_mix_id.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
+          },
+        },
+      },
+      "/thumbnails": {
+        get: {
+          operationId: "getThumbnails",
+          summary: "Thumbnail resolver at requested quality",
+          description:
+            "Pure i.ytimg.com pattern resolver (?videoId=&quality=) — no upstream call, and signed/proxied URLs are never involved. standard/maxres renditions do not exist for every video.",
+          parameters: [
+            {
+              name: "videoId",
+              in: "query",
+              required: true,
+              schema: { type: "string" },
+            },
+            {
+              name: "quality",
+              in: "query",
+              schema: {
+                type: "string",
+                enum: ["default", "medium", "high"],
+                default: "medium",
+              },
+            },
+          ],
+          responses: {
+            200: {
+              description:
+                "data is { videoId, quality, urls, best }; urls carries default/medium/high/standard/maxres.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "invalid_video_id or invalid_quality.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
+          },
+        },
+      },
+      "/instances": {
+        get: {
+          operationId: "getInstances",
+          summary: "Peer instance status for failover-aware clients",
+          description:
+            "Static in-code list: the serving instance (self:true) plus TUBELENS_PEER_INSTANCES peers when configured, else a single self entry.",
+          responses: {
+            200: {
+              description: "data is { instances: [{ url, self, status }] }.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            429: rateLimitedResponse,
+          },
+        },
+      },
+      "/batch": {
+        post: {
+          operationId: "postBatch",
+          summary: "Batch multiple resource reads in one round-trip",
+          description:
+            "Body {requests:[{method,path}]} with at most 10 GET-only v1 paths (no nested /batch). Each item returns {status, body} with per-item error isolation — one failing item never fails the whole batch. Private, no-store.",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["requests"],
+                  properties: {
+                    requests: {
+                      type: "array",
+                      minItems: 1,
+                      maxItems: 10,
+                      items: {
+                        type: "object",
+                        required: ["method", "path"],
+                        properties: {
+                          method: { type: "string", example: "GET" },
+                          path: {
+                            type: "string",
+                            example: "/api/v1/health",
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description:
+                "data is { results: [{ status, body }] } in request order.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description:
+                "invalid_batch (malformed body or more than 10 requests).",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
+          },
+        },
+      },
+      "/quota": {
+        get: {
+          operationId: "getQuota",
+          summary: "Current quota usage and rate-limit windows",
+          description:
+            "In-memory stub counters (no durable store): {limit, remaining, reset} mirroring the X-RateLimit-* stub headers, plus per-window notes. Private, no-store.",
+          responses: {
+            200: {
+              description:
+                "data is { limit, remaining, reset, windows }. Counters reset on deploy and differ across instances.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            429: rateLimitedResponse,
+          },
+        },
+      },
       "/openapi.json": {
         get: {
           operationId: "getOpenApi",
-          summary: "This spec stub",
+          summary: "Full machine-readable spec",
           responses: {
             200: {
               description: "OpenAPI 3.1 document.",

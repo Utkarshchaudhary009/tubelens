@@ -251,7 +251,7 @@ feature flag until post-v1 legal review — see `NEED_TO_THINK.md`.
 **Goal:** Interop, performance, and self-description: everything that makes the
 API pleasant to consume and operate.
 
-**Status:** `[ ]` not started
+**Status:** `[~]` in progress — utils + full spec on branch `phase-10-utils` (unmerged).
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |

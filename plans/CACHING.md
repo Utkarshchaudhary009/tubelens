@@ -15,12 +15,15 @@ OPTIONAL and only when a phase explicitly demands it.
 
 | Group | Example routes | s-maxage | SWR |
 | ----- | -------------- | -------- | --- |
-| Static-ish | `videos/:id`, `channels/:id`, `captions` | 3600 | 86400 |
+| Static-ish | `videos/:id`, `channels/:id`, `captions`, `thumbnails` | 3600 | 86400 |
 | Transcripts (aggressive) | `videos/:id/transcript` | 86400 | 86400 |
 | Fast-moving | `trending`, `feed/*`, `music/charts` | 300–900 | 3600 |
 | Autocomplete | `search/suggestions` | 300 | 1800 |
 | Third-party composed | `sponsors`, `dislikes`, `dearrow`, `combined` | 3600–21600 | 21600 |
-| Private/ephemeral | `audio` (signed URLs), `quota` | `private, no-store` | — |
+| Playlist metadata | `playlists/:id`, `mixes/:id` | 3600 | 86400 |
+| Channel feeds | `channels/:id/videos`, `channels/:id/rss` | 600 | 3600 |
+| Short-lived status | `instances` | 60 | 60 |
+| Private/ephemeral | `audio` (signed URLs), `batch`, `quota` | `private, no-store` | — |
 
 > Paginated exception: `videos/:id/related` and `videos/:id/comments` send
 > `private, no-store` whenever the response carries a cursor (`page.next !=

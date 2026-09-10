@@ -12,13 +12,15 @@ describe("openapi stub", () => {
     expect(typeof doc.paths).toBe("object");
   });
 
-  test("lists exactly the 31 Phase 1+2+3+4+5+6+7+8+9 endpoints", () => {
+  test("lists exactly the 37 Phase 1+2+3+4+5+6+7+8+9+10 endpoints", () => {
     const doc = buildOpenApiDocument();
     const paths = Object.keys(doc.paths).sort();
     expect(paths).toEqual([
       "/artists/{id}",
+      "/batch",
       "/channels/{id}",
       "/channels/{id}/playlists",
+      "/channels/{id}/rss",
       "/channels/{id}/shorts",
       "/channels/{id}/streams",
       "/channels/{id}/videos",
@@ -27,14 +29,18 @@ describe("openapi stub", () => {
       "/feed/shorts",
       "/hashtags/{tag}",
       "/health",
+      "/instances",
+      "/mixes/{id}",
       "/music/charts",
       "/music/search",
       "/openapi.json",
       "/playlists/{id}",
       "/playlists/{id}/items",
+      "/quota",
       "/resolve",
       "/search",
       "/search/suggestions",
+      "/thumbnails",
       "/videos/{id}",
       "/videos/{id}/audio",
       "/videos/{id}/captions",
@@ -104,7 +110,7 @@ describe("openapi stub", () => {
 
   test("404 descriptions document disabled/unavailable + not-found codes", () => {
     const doc = buildOpenApiDocument();
-    type Paths = keyof typeof doc.paths;
+    type Paths = Exclude<keyof typeof doc.paths, "/batch">;
     const get404 = (path: Paths) =>
       (
         doc.paths[path].get.responses as Record<string, { description: string }>
@@ -127,7 +133,7 @@ describe("openapi stub", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.openapi).toMatch(/^3\.1\./);
-    expect(Object.keys(body.paths)).toHaveLength(31);
+    expect(Object.keys(body.paths)).toHaveLength(37);
     expect(res.headers.get("X-Request-Id")).toBeTruthy();
     expect(res.headers.get("Cache-Control")).toContain("s-maxage=86400");
   });

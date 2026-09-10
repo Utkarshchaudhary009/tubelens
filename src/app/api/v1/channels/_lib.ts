@@ -82,6 +82,36 @@ interface RawChannel {
 }
 
 /**
+ * Derives an adapted first tab page from an ALREADY-FETCHED Channel object
+ * (no getChannel call inside). Lets single-call routes (e.g. the RSS feed,
+ * which also reads the channel title) serve title + tab from one upstream
+ * fetch instead of paying getChannel twice per cold miss.
+ */
+export async function firstTabFromChannel(
+  channel: RawChannel,
+  kind: ChannelFeedKind,
+): Promise<ContinuationSearch> {
+  // Symmetric guard: only an explicit `false` skips the tab call (missing
+  // tab -> terminal empty page). Unknown flags proceed to the guarded
+  // getTab call below, whose missing-method fallback is the same empty
+  // page rather than a throw.
+  if (!hasChannelTab(channel, kind)) {
+    return emptyChannelTab();
+  }
+  const getTab =
+    kind === "videos"
+      ? channel.getVideos
+      : kind === "shorts"
+        ? channel.getShorts
+        : channel.getLiveStreams;
+  if (typeof getTab !== "function") {
+    return emptyChannelTab();
+  }
+  const tab = (await getTab.call(channel)) as TabShape;
+  return adaptChannelTab(tab);
+}
+
+/**
  * Upstream half of handle resolution (resolveURL -> browseId), separated so
  * the coalescing wrapper below stays unit-testable with an injected mock.
  * Never touches the TTL map — the wrapper stores only successes.
@@ -175,24 +205,7 @@ export async function defaultFetchFirstPage(
   return withTimeout(async () => {
     const innertube = await getInnertube();
     const channel = (await innertube.getChannel(channelId)) as RawChannel;
-    // Symmetric guard: only an explicit `false` skips the tab call (missing
-    // tab -> terminal empty page). Unknown flags proceed to the guarded
-    // getTab call below, whose missing-method fallback is the same empty
-    // page rather than a throw.
-    if (!hasChannelTab(channel, kind)) {
-      return emptyChannelTab();
-    }
-    const getTab =
-      kind === "videos"
-        ? channel.getVideos
-        : kind === "shorts"
-          ? channel.getShorts
-          : channel.getLiveStreams;
-    if (typeof getTab !== "function") {
-      return emptyChannelTab();
-    }
-    const tab = (await getTab.call(channel)) as TabShape;
-    return adaptChannelTab(tab);
+    return firstTabFromChannel(channel, kind);
   }, 8000);
 }
 
