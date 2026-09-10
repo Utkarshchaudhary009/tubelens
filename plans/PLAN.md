@@ -251,7 +251,7 @@ feature flag until post-v1 legal review — see `NEED_TO_THINK.md`.
 **Goal:** Interop, performance, and self-description: everything that makes the
 API pleasant to consume and operate.
 
-**Status:** `[~]` in progress — utils + full spec on branch `phase-10-utils` (unmerged).
+**Status:** `[x]` done — shipped via PR #13 (merged 2026-09-10): channels/:id/rss + mixes/:id + thumbnails + instances + batch + quota live with 536 unit tests + e2e PASS on live upstream (prod build). openapi.json promoted to full 37-path spec.
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
