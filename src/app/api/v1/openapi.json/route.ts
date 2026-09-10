@@ -3,7 +3,7 @@ import { baseHeaders, CACHE_CONTROL, getRequestId } from "@/lib/envelope";
 
 export const runtime = "nodejs";
 
-// OpenAPI 3.1 stub for Phase 8: documents exactly the 28 shipped endpoints.
+// OpenAPI 3.1 stub for Phase 9: documents exactly the 31 shipped endpoints.
 // Grows each phase; promoted to the full spec in Phase 10. Exported as a
 // pure builder so tests can validate it without HTTP.
 export function buildOpenApiDocument() {
@@ -66,7 +66,7 @@ export function buildOpenApiDocument() {
       // package.json (0.1.0 until the v1 API is declared stable).
       version: "0.1.0",
       description:
-        "API-first YouTube data API. Phase 8 ships community-enriched data (SponsorBlock skip segments, ReturnYouTubeDislike stats, DeArrow crowd-sourced titles/thumbnails, and one combined call composing detail with all three layers, each degrading independently), plus Phase 7 explore verticals (Shorts discovery, cross-channel live discovery with viewer counts/scheduled times, and the gaming hub), plus Phase 6 music-native search (typed song vs album vs artist), charts snapshots, and artist profiles with top releases, plus Phase 5 playlist reads (metadata plus first items page, paginated items, and a channel's curated playlists), Phase 4 channel profiles, uploads, Shorts shelves, and live/upcoming/past streams, Phase 3 discovery (search autocomplete suggestions, hashtag feeds), Phase 2 watch essentials (related rail, comments, captions, transcript) and Phase 1 health, search, video details, URL resolving, and this spec.",
+        "API-first YouTube data API. Phase 9 ships flag-gated audio-first endpoints (signed-URL + Range-gateway audio proxy, autoplay radio continuation with >= 25 deduped tracks, and timed/plain lyrics), plus Phase 8 community-enriched data (SponsorBlock skip segments, ReturnYouTubeDislike stats, DeArrow crowd-sourced titles/thumbnails, and one combined call composing detail with all three layers, each degrading independently), plus Phase 7 explore verticals (Shorts discovery, cross-channel live discovery with viewer counts/scheduled times, and the gaming hub), plus Phase 6 music-native search (typed song vs album vs artist), charts snapshots, and artist profiles with top releases, plus Phase 5 playlist reads (metadata plus first items page, paginated items, and a channel's curated playlists), Phase 4 channel profiles, uploads, Shorts shelves, and live/upcoming/past streams, Phase 3 discovery (search autocomplete suggestions, hashtag feeds), Phase 2 watch essentials (related rail, comments, captions, transcript) and Phase 1 health, search, video details, URL resolving, and this spec.",
     },
     servers: [{ url: "https://tubelens.vercel.app/api/v1" }],
     paths: {
@@ -602,6 +602,167 @@ export function buildOpenApiDocument() {
               description: "video_not_found.",
               content: { "application/json": { schema: { $ref: errorRef } } },
             },
+          },
+        },
+      },
+      "/videos/{id}/audio": {
+        get: {
+          operationId: "getAudio",
+          summary: "Signed audio URL or proxied audio bytes (flag-gated)",
+          description:
+            "Flag-gated by TUBELENS_AUDIO_ENABLED (default off): when disabled answers 403 audio_disabled. Without token params returns a same-origin signed expiring URL (raw upstream URLs are never exposed); with valid token+exp params proxies audio bytes with Range support (206 partial content). Blocked/takedown videos answer 410 and are never re-served.",
+          parameters: [
+            {
+              name: "id",
+              in: "path",
+              required: true,
+              schema: { type: "string" },
+            },
+            {
+              name: "token",
+              in: "query",
+              schema: { type: "string" },
+              description:
+                "HMAC token from the signed-URL mode; when present the route proxies bytes instead of JSON.",
+            },
+            {
+              name: "exp",
+              in: "query",
+              schema: { type: "string" },
+              description: "Unix-seconds expiry minted with the token.",
+            },
+            {
+              name: "region",
+              in: "query",
+              schema: { type: "string", default: "US" },
+            },
+            {
+              name: "lang",
+              in: "query",
+              schema: { type: "string", default: "en" },
+            },
+          ],
+          responses: {
+            200: {
+              description:
+                "Signed URL JSON ({ url, expiresAt, mimeType, ... }) or audio bytes (Range requests yield 206 with Content-Range + Accept-Ranges). Bytes responses are private, no-store.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            206: {
+              description:
+                "Partial audio bytes for a satisfiable Range request.",
+            },
+            400: {
+              description: "invalid_video_id.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            403: {
+              description:
+                "audio_disabled (flag off) or audio_invalid_token (bad/expired token).",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            410: {
+              description:
+                "audio_blocked or audio_unavailable; never re-served afterwards.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            416: {
+              description:
+                "invalid_range; the Range start is past the stream length.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
+            502: degradedResponse,
+            504: timeoutResponse,
+          },
+        },
+      },
+      "/videos/{id}/radio": {
+        get: {
+          operationId: "getRadio",
+          summary: "Autoplay radio continuation queue (flag-gated)",
+          description:
+            "Flag-gated by TUBELENS_AUDIO_ENABLED (default off): when disabled answers 403 audio_disabled. Automix up-next first, watch-next continuation chain as fallback, related rail as shortfall fill; >= 25 deduped tracks with no repeats in the first 10.",
+          parameters: [
+            {
+              name: "id",
+              in: "path",
+              required: true,
+              schema: { type: "string" },
+            },
+            limitParam,
+            cursorParam,
+            regionParam,
+            langParam,
+          ],
+          responses: {
+            200: {
+              description:
+                "Paged radio tracks. A shortfall below 25 tracks returns what exists with next:null plus a radio_shortfall warning.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "invalid_video_id or invalid_limit.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            403: {
+              description: "audio_disabled (flag off).",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            404: {
+              description: "radio_unavailable or video_not_found.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
+            502: degradedResponse,
+            504: timeoutResponse,
+          },
+        },
+      },
+      "/videos/{id}/lyrics": {
+        get: {
+          operationId: "getLyrics",
+          summary: "Song lyrics where available (flag-gated)",
+          description:
+            "Flag-gated by TUBELENS_AUDIO_ENABLED (default off): when disabled answers 403 audio_disabled. Timed lines when the source provides them, otherwise plain text ({ lines, text }).",
+          parameters: [
+            {
+              name: "id",
+              in: "path",
+              required: true,
+              schema: { type: "string" },
+            },
+            regionParam,
+            langParam,
+          ],
+          responses: {
+            200: {
+              description:
+                "Lyrics as { lines, text }; lines is null for plain-text lyrics.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "invalid_video_id.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            403: {
+              description: "audio_disabled (flag off).",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            404: {
+              description:
+                "lyrics_unavailable; fall back to /videos/{id}/transcript.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
+            502: degradedResponse,
+            504: timeoutResponse,
           },
         },
       },

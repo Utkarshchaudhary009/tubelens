@@ -925,6 +925,6 @@ describe("openapi lists the phase 8 community routes", () => {
     expect(
       Object.keys(doc.paths["/videos/{id}/combined"].get.responses),
     ).toContain("404");
-    expect(Object.keys(doc.paths)).toHaveLength(28);
+    expect(Object.keys(doc.paths)).toHaveLength(31);
   });
 });
