@@ -24,6 +24,7 @@ import {
   successResponse,
 } from "@/lib/envelope";
 import { errorResponse } from "@/lib/errors";
+import { isUpstreamTimeout, textOf } from "@/lib/mappers";
 import { isPlausibleVideoId } from "@/lib/validate";
 
 // ---------------------------------------------------------------------------
@@ -85,14 +86,13 @@ export function rssChannelTitle(raw: unknown): string | undefined {
   const header = asRecord(root.header);
   const metadata = asRecord(root.metadata);
   const author = asRecord(header?.author);
+  // Mirrors mapChannelProfile: youtubei names are often Text objects/runs,
+  // not plain strings — textOf covers both shapes.
   const title =
     (typeof author?.name === "string" && author.name) ||
-    (typeof header?.title === "string" && header.title
-      ? header.title
-      : undefined) ||
-    (typeof metadata?.title === "string" && metadata.title
-      ? metadata.title
-      : undefined);
+    textOf(author?.name) ||
+    textOf(header?.title) ||
+    textOf(metadata?.title);
   if (typeof title !== "string" || title.trim() === "") {
     return undefined;
   }
@@ -462,6 +462,9 @@ export interface BatchDeps {
 /**
  * GET-only allowlist of existing v1 GET paths (query strings allowed).
  * POST /api/v1/batch itself is never allowlisted — nesting is rejected.
+ * Binary routes are excluded: batch composes JSON bodies, so audio bytes
+ * (/videos/{id}/audio) and the XML feed (/channels/{id}/rss) answer per-item
+ * 400 batch_path_not_allowed — call them directly instead.
  */
 const BATCH_ALLOWLIST: RegExp[] = [
   /^\/api\/v1\/health$/,
@@ -473,9 +476,9 @@ const BATCH_ALLOWLIST: RegExp[] = [
   /^\/api\/v1\/instances$/,
   /^\/api\/v1\/quota$/,
   /^\/api\/v1\/videos\/[^/]+$/,
-  /^\/api\/v1\/videos\/[^/]+\/(related|comments|captions|transcript|sponsors|dislikes|dearrow|combined|audio|radio|lyrics)$/,
+  /^\/api\/v1\/videos\/[^/]+\/(related|comments|captions|transcript|sponsors|dislikes|dearrow|combined|radio|lyrics)$/,
   /^\/api\/v1\/channels\/[^/]+$/,
-  /^\/api\/v1\/channels\/[^/]+\/(videos|shorts|streams|playlists|rss)$/,
+  /^\/api\/v1\/channels\/[^/]+\/(videos|shorts|streams|playlists)$/,
   /^\/api\/v1\/playlists\/[^/]+$/,
   /^\/api\/v1\/playlists\/[^/]+\/items$/,
   /^\/api\/v1\/feed\/(shorts|live|gaming)$/,
@@ -571,11 +574,52 @@ function validateBatchItem(
         400,
         "batch_path_not_allowed",
         `Path "${pathname}" is not batchable.`,
-        "Batch supports GET-only v1 reads; see /api/v1/openapi.json for the path list.",
+        "Batch composes JSON-only v1 reads; binary routes (audio bytes, RSS feed) are excluded — call them directly. See /api/v1/openapi.json for the path list.",
       ),
     };
   }
   return { kind: "run", url: `${origin}${path}`, pathname };
+}
+
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
+const VERCEL_HOST = /^[a-z0-9]([a-z0-9.-]{0,253}[a-z0-9])?$/i;
+
+/**
+ * Trusted sub-request origin for the batch fan-out. NEVER the raw request
+ * Host: Host-header poisoning would turn the server-side fan-out into an
+ * SSRF primitive. Precedence: explicit TUBELENS_PUBLIC_URL, the Vercel
+ * system VERCEL_URL, else loopback-only local dev — anything else fails
+ * closed (null -> 503 batch_not_configured).
+ */
+export function resolveBatchOrigin(req: NextRequest): string | null {
+  const explicit = (process.env.TUBELENS_PUBLIC_URL ?? "").trim();
+  if (explicit !== "") {
+    try {
+      const url = new URL(explicit);
+      if (url.protocol === "http:" || url.protocol === "https:") {
+        return url.origin;
+      }
+    } catch {
+      // Invalid explicit URL: fall through to the next source.
+    }
+  }
+  const vercel = (process.env.VERCEL_URL ?? "").trim();
+  if (vercel !== "" && VERCEL_HOST.test(vercel) && !vercel.includes("..")) {
+    return `https://${vercel.toLowerCase()}`;
+  }
+  // Local dev only: loopback Hosts are not attacker-reachable remotes. On
+  // Vercel the Host is always the deployment domain, so this branch never
+  // fires there.
+  try {
+    const url = new URL(req.url);
+    const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    if (LOOPBACK_HOSTS.has(host)) {
+      return url.origin;
+    }
+  } catch {
+    // Malformed request URL -> fail closed.
+  }
+  return null;
 }
 
 export async function handleBatch(
@@ -611,7 +655,15 @@ export async function handleBatch(
     });
   }
 
-  const origin = req.nextUrl.origin;
+  const origin = resolveBatchOrigin(req);
+  if (!origin) {
+    return errorResponse(requestId, {
+      code: "batch_not_configured",
+      message: "Batch fan-out origin is not configured.",
+      hint: "Set TUBELENS_PUBLIC_URL to the public base URL so sub-requests dispatch to a trusted origin.",
+      status: 503,
+    });
+  }
   const tasks = parsed.data.requests.map((item) =>
     validateBatchItem(item, origin),
   );
@@ -639,9 +691,13 @@ export async function handleBatch(
         const run = (async (): Promise<BatchSubResult> => {
           try {
             return await deps.execute(task.url, requestId, controller.signal);
-          } catch {
-            // Aborted by the shared deadline -> timeout, not upstream failure.
-            if (controller.signal.aborted) {
+          } catch (err) {
+            // Timeouts are timeouts wherever they fire: the shared-deadline
+            // abort AND the per-item fail-fast (AbortSignal.timeout) both
+            // surface here, so classify TimeoutError/AbortError as 504 too —
+            // otherwise the two equal 8s budgets race nondeterministically
+            // between 502 and 504. Anything else stays 502.
+            if (controller.signal.aborted || isUpstreamTimeout(err)) {
               return batchTimeoutError(task.pathname);
             }
             // Per-item isolation: one failing item never fails the whole batch.

@@ -3,10 +3,13 @@ import { type BatchDeps, handleBatch } from "@/lib/utils";
 
 export const runtime = "nodejs";
 
-// Upstream seam: the default implementation re-enters this origin over HTTP
-// (imported lazily-free — plain fetch, no youtubei singleton). Tests inject
-// mocks here. Each item resolves via the GET-only v1 allowlist with per-item
-// error isolation; the batch itself is private, no-store.
+// Upstream seam: the default implementation re-enters a TRUSTED origin over
+// HTTP (pinned via resolveBatchOrigin — explicit TUBELENS_PUBLIC_URL, Vercel
+// VERCEL_URL, or loopback local dev; never the raw request Host, so
+// Host-header poisoning cannot turn the fan-out into SSRF). Plain fetch, no
+// youtubei singleton. Tests inject mocks here. Each item resolves via the
+// JSON-only v1 allowlist with per-item error isolation; the batch itself is
+// private, no-store.
 const defaultDeps: BatchDeps = {
   async execute(url: string, requestId: string, signal?: AbortSignal) {
     // Per-call 8s fail-fast AND the batch shared deadline (whichever fires

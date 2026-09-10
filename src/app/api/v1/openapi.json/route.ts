@@ -1487,7 +1487,7 @@ export function buildOpenApiDocument() {
           operationId: "postBatch",
           summary: "Batch multiple resource reads in one round-trip",
           description:
-            "Body {requests:[{method,path}]} with at most 10 GET-only v1 paths (no nested /batch). Each item returns {status, body} with per-item error isolation — one failing item never fails the whole batch. Private, no-store.",
+            "Body {requests:[{method,path}]} with at most 10 GET-only v1 paths (no nested /batch). Binary routes (audio bytes, RSS feed) are excluded — call them directly. Each item returns {status, body} with per-item error isolation — one failing item never fails the whole batch. Sub-requests dispatch to a trusted origin (never the request Host). Private, no-store.",
           requestBody: {
             required: true,
             content: {

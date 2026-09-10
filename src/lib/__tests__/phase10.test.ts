@@ -21,6 +21,7 @@ import {
   parseThumbnailParams,
   RSS_MAX_ITEMS,
   resetQuotaForTests,
+  resolveBatchOrigin,
   thumbnailUrls,
 } from "../utils";
 
@@ -76,16 +77,34 @@ function rssDeps(overrides?: Partial<ChannelRssDeps>): ChannelRssDeps {
 }
 
 const savedPeers = process.env.TUBELENS_PEER_INSTANCES;
+const savedPublicUrl = process.env.TUBELENS_PUBLIC_URL;
+const savedVercelUrl = process.env.VERCEL_URL;
+
+function restoreEnv(
+  key: string,
+  saved: string | undefined,
+  fallback?: string,
+): void {
+  if (saved === undefined) {
+    if (fallback === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = fallback;
+    }
+  } else {
+    process.env[key] = saved;
+  }
+}
 
 beforeEach(() => {
   clearCache();
   clearContinuations();
   resetQuotaForTests();
-  if (savedPeers === undefined) {
-    delete process.env.TUBELENS_PEER_INSTANCES;
-  } else {
-    process.env.TUBELENS_PEER_INSTANCES = savedPeers;
-  }
+  restoreEnv("TUBELENS_PEER_INSTANCES", savedPeers);
+  // Batch fan-out pins to a trusted origin (never the request Host): point
+  // it at the http://x test origin so fake executors see stable URLs.
+  restoreEnv("TUBELENS_PUBLIC_URL", savedPublicUrl, "http://x");
+  restoreEnv("VERCEL_URL", savedVercelUrl);
 });
 
 // ---------------------------------------------------------------------------
@@ -182,6 +201,33 @@ describe("phase 10 channel rss", () => {
 
   test("escapeXml covers the five entities", () => {
     expect(escapeXml(`a&b<c>d"e'f`)).toBe("a&amp;b&lt;c&gt;d&quot;e&apos;f");
+  });
+
+  test("rssChannelTitle reads Text-object/runs names, not just strings", async () => {
+    const deps = rssDeps({
+      fetchChannel: async () => ({
+        profile: {
+          header: {
+            author: { name: { runs: [{ text: "Obj " }, { text: "Title" }] } },
+          },
+          metadata: {},
+        },
+        firstPage: {
+          results: [],
+          has_continuation: false,
+          getContinuation: async () => {
+            throw new Error("exhausted");
+          },
+        },
+      }),
+    });
+    const res = await handleChannelRss(
+      req(`http://x/api/v1/channels/${UC}/rss`),
+      UC,
+      deps,
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("<title>Obj Title</title>");
   });
 
   test("buildChannelRss caps items and escapes channel text", () => {
@@ -518,6 +564,153 @@ describe("phase 10 batch", () => {
     expect(body.data.results[0].status).toBe(504);
     expect(body.data.results[0].body.error.code).toBe("batch_timeout");
     expect(seen?.aborted).toBe(true);
+  });
+
+  test("binary routes (audio bytes, rss feed) are not batchable", async () => {
+    const res = await handleBatch(
+      jsonReq("http://x/api/v1/batch", {
+        requests: [
+          { method: "GET", path: `/api/v1/videos/${VID}/audio` },
+          { method: "GET", path: `/api/v1/channels/${UC}/rss` },
+        ],
+      }),
+      fakeBatchDeps,
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    for (const item of body.data.results as Array<{
+      status: number;
+      body: { error: { code: string } };
+    }>) {
+      expect(item.status).toBe(400);
+      expect(item.body.error.code).toBe("batch_path_not_allowed");
+    }
+  });
+
+  test("per-item fail-fast timeout classifies as 504, generic errors as 502", async () => {
+    const flaky: BatchDeps = {
+      execute: async (url: string) => {
+        if (url.includes("timeout")) {
+          const err = new Error("Upstream timed out after 8000ms");
+          err.name = "TimeoutError";
+          throw err;
+        }
+        throw new Error("boom");
+      },
+    };
+    const res = await handleBatch(
+      jsonReq("http://x/api/v1/batch", {
+        requests: [
+          { method: "GET", path: "/api/v1/videos/timeout12345" },
+          { method: "GET", path: "/api/v1/videos/fail12345" },
+        ],
+      }),
+      flaky,
+    );
+    const body = await res.json();
+    const [timedOut, failed] = body.data.results as Array<{
+      status: number;
+      body: { error: { code: string } };
+    }>;
+    expect(timedOut.status).toBe(504);
+    expect(timedOut.body.error.code).toBe("batch_timeout");
+    expect(failed.status).toBe(502);
+    expect(failed.body.error.code).toBe("batch_upstream_failed");
+  });
+});
+
+describe("phase 10 batch trusted origin (SSRF pinning)", () => {
+  async function withBatchEnv(
+    vars: Record<string, string | undefined>,
+    fn: () => Promise<void>,
+  ): Promise<void> {
+    const prev: Record<string, string | undefined> = {};
+    for (const key of Object.keys(vars)) {
+      prev[key] = process.env[key];
+    }
+    try {
+      for (const [key, value] of Object.entries(vars)) {
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+      await fn();
+    } finally {
+      for (const [key, value] of Object.entries(prev)) {
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+    }
+  }
+
+  test("explicit TUBELENS_PUBLIC_URL wins and is origin-normalized", async () => {
+    await withBatchEnv(
+      {
+        TUBELENS_PUBLIC_URL: "https://api.example.com/base?x=1",
+        VERCEL_URL: "x.vercel.app",
+      },
+      async () => {
+        expect(
+          resolveBatchOrigin(req("https://evil.example/api/v1/batch")),
+        ).toBe("https://api.example.com");
+      },
+    );
+  });
+
+  test("invalid explicit URL falls through to VERCEL_URL", async () => {
+    await withBatchEnv(
+      {
+        TUBELENS_PUBLIC_URL: "ftp://nope",
+        VERCEL_URL: "my-app-abc123.vercel.app",
+      },
+      async () => {
+        expect(
+          resolveBatchOrigin(req("https://evil.example/api/v1/batch")),
+        ).toBe("https://my-app-abc123.vercel.app");
+      },
+    );
+  });
+
+  test("malicious VERCEL_URL is rejected; loopback dev still works", async () => {
+    await withBatchEnv(
+      { TUBELENS_PUBLIC_URL: undefined, VERCEL_URL: "evil.example/pwn" },
+      async () => {
+        expect(
+          resolveBatchOrigin(req("https://evil.example/api/v1/batch")),
+        ).toBeNull();
+        expect(
+          resolveBatchOrigin(req("http://localhost:3000/api/v1/batch")),
+        ).toBe("http://localhost:3000");
+      },
+    );
+  });
+
+  test("untrusted origin fails closed with 503, never the raw Host", async () => {
+    await withBatchEnv(
+      { TUBELENS_PUBLIC_URL: undefined, VERCEL_URL: undefined },
+      async () => {
+        const seen: string[] = [];
+        const res = await handleBatch(
+          jsonReq("https://evil.example/api/v1/batch", {
+            requests: [{ method: "GET", path: "/api/v1/health" }],
+          }),
+          {
+            execute: async (url: string) => {
+              seen.push(url);
+              return { status: 200, body: {} };
+            },
+          },
+        );
+        expect(res.status).toBe(503);
+        expect((await res.json()).error.code).toBe("batch_not_configured");
+        expect(seen).toEqual([]);
+      },
+    );
   });
 });
 
