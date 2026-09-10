@@ -69,15 +69,29 @@ function audioDisabledError(): ClassifiedVideoError {
 /** Signed audio URLs live 10 minutes. */
 export const AUDIO_URL_TTL_MS = 10 * 60 * 1000;
 
-export function audioSecret(): string {
+/**
+ * Signing secret. No dev fallback: when the flag is on but this is unset,
+ * handleAudio fails closed with 503 audio_not_configured (a shared default
+ * would let anyone forge tokens in production).
+ */
+export function audioSecret(): string | null {
   const fromEnv = (process.env.TUBELENS_AUDIO_SECRET ?? "").trim();
-  return fromEnv !== "" ? fromEnv : "tubelens-dev-audio-secret";
+  return fromEnv !== "" ? fromEnv : null;
+}
+
+function audioNotConfiguredError(): ClassifiedVideoError {
+  return {
+    code: "audio_not_configured",
+    message: "Audio proxy is not configured.",
+    hint: "Set TUBELENS_AUDIO_SECRET on the server to enable signed audio URLs.",
+    status: 503,
+  };
 }
 
 export function signAudioToken(
   id: string,
   exp: string,
-  secret: string = audioSecret(),
+  secret: string = audioSecret() ?? "",
 ): string {
   return createHmac("sha256", secret).update(`${id}.${exp}`).digest("hex");
 }
@@ -91,7 +105,7 @@ export function verifyAudioToken(
   expRaw: string | null,
   token: string | null,
   nowMs: number = Date.now(),
-  secret: string = audioSecret(),
+  secret: string = audioSecret() ?? "",
 ): boolean {
   if (typeof expRaw !== "string" || typeof token !== "string") {
     return false;
@@ -242,7 +256,12 @@ export interface ByteRange {
 export interface AudioDeps {
   /** Audio-only format metadata (mime/bitrate) — NEVER returns a URL. */
   fetchFormat: (id: string) => Promise<AudioFormatInfo>;
-  /** Byte slice for the range (null = full body). Resolves + fetches upstream. */
+  /**
+   * Byte slice for the range (null = full body). Open ranges must return
+   * exactly the requested slice; totalLength is the full stream length, or
+   * -1 when the upstream reports neither Content-Range totals nor
+   * Content-Length (the handler then re-fetches full and serves 200).
+   */
   fetchRange: (id: string, range: ByteRange | null) => Promise<AudioBytes>;
 }
 
@@ -438,7 +457,7 @@ export function mintSignedAudioUrl(
   origin: string,
   id: string,
   nowMs: number = Date.now(),
-  secret: string = audioSecret(),
+  secret: string = audioSecret() ?? "",
 ): { url: string; expiresAt: string } {
   const exp = String(Math.floor((nowMs + AUDIO_URL_TTL_MS) / 1000));
   const token = signAudioToken(id, exp, secret);
@@ -461,6 +480,12 @@ export async function handleAudio(
   if (!isAudioEnabled()) {
     return errorResponse(requestId, audioDisabledError());
   }
+  // Fail closed: no shared-secret fallback exists (see audioSecret), so an
+  // enabled flag without TUBELENS_AUDIO_SECRET is a 503, never forged URLs.
+  const secret = audioSecret();
+  if (!secret) {
+    return errorResponse(requestId, audioNotConfiguredError());
+  }
   if (!id || !isPlausibleVideoId(id)) {
     return errorResponse(requestId, invalidVideoIdHint("audio"));
   }
@@ -470,12 +495,17 @@ export async function handleAudio(
 
   // Bytes mode iff a token is presented; otherwise JSON signed-URL mode.
   if (params.get("token") !== null) {
-    return serveAudioBytes(req, requestId, id, deps);
+    return serveAudioBytes(req, requestId, id, deps, secret);
   }
 
   try {
     const format = await deps.fetchFormat(id);
-    const { url, expiresAt } = mintSignedAudioUrl(req.nextUrl.origin, id);
+    const { url, expiresAt } = mintSignedAudioUrl(
+      req.nextUrl.origin,
+      id,
+      Date.now(),
+      secret,
+    );
     const data: SignedAudioDTO = { url, expiresAt, mimeType: format.mimeType };
     if (format.bitrate !== undefined) {
       data.bitrate = format.bitrate;
@@ -499,14 +529,56 @@ export async function handleAudio(
   }
 }
 
+/** Syntactic range (no total needed): null = absent, garbage, reversed, or zero-length. */
+export type RangeSyntax =
+  | { kind: "open"; start: number; end?: number }
+  | { kind: "suffix"; suffix: number };
+
+export function parseRangeSyntax(raw: string | null): RangeSyntax | null {
+  if (!raw) {
+    return null;
+  }
+  const trimmed = raw.trim();
+  const open = /^bytes=(\d+)-(\d*)$/.exec(trimmed);
+  if (open) {
+    const start = Number(open[1]);
+    if (open[2] === "") {
+      return { kind: "open", start };
+    }
+    const end = Number(open[2]);
+    if (end < start) {
+      return null;
+    }
+    return { kind: "open", start, end };
+  }
+  const suffix = /^bytes=-(\d+)$/.exec(trimmed);
+  if (suffix) {
+    const n = Number(suffix[1]);
+    if (!(n > 0)) {
+      return null;
+    }
+    return { kind: "suffix", suffix: n };
+  }
+  return null;
+}
+
 async function serveAudioBytes(
   req: NextRequest,
   requestId: string,
   id: string,
   deps: AudioDeps,
+  secret: string,
 ): Promise<NextResponse> {
   const params = req.nextUrl.searchParams;
-  if (!verifyAudioToken(id, params.get("exp"), params.get("token"))) {
+  if (
+    !verifyAudioToken(
+      id,
+      params.get("exp"),
+      params.get("token"),
+      Date.now(),
+      secret,
+    )
+  ) {
     return errorResponse(requestId, {
       code: "audio_invalid_token",
       message: "Invalid or expired audio token.",
@@ -516,37 +588,39 @@ async function serveAudioBytes(
   }
 
   const rangeHeader = req.headers.get("range");
-  // Unknown totals still proxy: request the open-ended slice and serve 200
-  // when the length cannot be proven (Range is best-effort here).
-  let range: ByteRange | null = null;
-  let needsPartial = false;
-  if (rangeHeader) {
-    const trimmed = rangeHeader.trim();
-    const open = /^bytes=(\d+)-(\d*)$/.exec(trimmed);
-    const suffix = /^bytes=-(\d+)$/.exec(trimmed);
-    if (open) {
-      const start = Number(open[1]);
-      range = { start };
-      if (open[2] !== "") {
-        range.end = Number(open[2]);
-      }
-      needsPartial = true;
-    } else if (suffix) {
-      // Suffix ranges need the total first: fetch full, then slice below.
-      range = null;
-      needsPartial = true;
-    }
-  }
+  // Syntactic validation first (no total needed): garbage, reversed
+  // (end < start), and zero-length suffix ranges are ignored outright — the
+  // upstream fetch goes out WITHOUT a Range header and the full body is
+  // served as 200 below, never a 206 for an invalid range. Suffix ranges
+  // resolve against the total (known only post-fetch), so they also fetch
+  // full and carve the tail locally below.
+  const wanted = parseRangeSyntax(rangeHeader);
+  const range: ByteRange | null =
+    wanted?.kind === "open"
+      ? {
+          start: wanted.start,
+          ...(wanted.end !== undefined ? { end: wanted.end } : {}),
+        }
+      : null;
 
   try {
-    const audio = await deps.fetchRange(id, range);
-    const total = audio.totalLength;
+    let audio = await deps.fetchRange(id, range);
+    let total = audio.totalLength;
+    // Unknown total with a requested range: a slice served as 200 would be
+    // mislabeled, and 206 requires Content-Range (RFC 9110), which needs the
+    // total. Drop the range and re-serve the full upstream body as 200
+    // instead — a second fetch only in the rare case where upstream omits
+    // both Content-Range totals and Content-Length.
+    if (wanted && total < 0 && range !== null) {
+      audio = await deps.fetchRange(id, null);
+      total = audio.totalLength;
+    }
     const headers = baseHeaders(requestId);
     headers.set("Content-Type", audio.contentType);
     headers.set("Accept-Ranges", "bytes");
     headers.set("Cache-Control", CACHE_CONTROL.noStore);
 
-    if (needsPartial && total >= 0) {
+    if (wanted && total >= 0) {
       const parsed = parseRangeHeader(rangeHeader, total);
       if (parsed.kind === "unsatisfiable") {
         headers.set("Content-Range", `bytes */${total}`);
@@ -561,24 +635,29 @@ async function serveAudioBytes(
         errRes.headers.set("Accept-Ranges", "bytes");
         return errRes;
       }
+      // Only a genuine slice reaches 206: the syntax pre-check above already
+      // rejected garbage/reversed ranges, so anything non-unsatisfiable here
+      // is a slice (the "none" arm is unreachable — the fallthrough 200
+      // below would otherwise risk serving a ranged slice as full body).
+      if (parsed.kind === "slice") {
+        // Suffix ranges fetched full (the total was needed first): carve the
+        // tail locally; open ranges arrive pre-sliced from deps.
+        const bytes =
+          wanted.kind === "suffix"
+            ? audio.bytes.slice(parsed.start)
+            : audio.bytes;
+        const end = parsed.start + bytes.length - 1;
+        headers.set("Content-Range", `bytes ${parsed.start}-${end}/${total}`);
+        headers.set("Content-Length", String(bytes.length));
+        return new NextResponse(bytes as BodyInit, {
+          status: 206,
+          headers,
+        });
+      }
     }
-
-    if (needsPartial && total >= 0) {
-      // Deps return the upstream slice; derive the served span from the
-      // requested start and the actual returned length.
-      const parsed = parseRangeHeader(rangeHeader, total);
-      const start =
-        parsed.kind === "slice"
-          ? parsed.start
-          : Math.max(0, total - audio.bytes.length);
-      const end = start + audio.bytes.length - 1;
-      headers.set("Content-Range", `bytes ${start}-${end}/${total}`);
-      headers.set("Content-Length", String(audio.bytes.length));
-      return new NextResponse(audio.bytes as BodyInit, {
-        status: 206,
-        headers,
-      });
-    }
+    // Full-body 200. Bytes are guaranteed complete here: ranged fetches
+    // either satisfied a 206/416 above or were re-fetched full when the
+    // total was unknown, and invalid ranges never sent Range upstream.
     if (total >= 0) {
       headers.set("Content-Length", String(audio.bytes.length));
     }
@@ -875,13 +954,14 @@ export async function handleRadio(
 
   try {
     // The full queue is limit-independent (assembled once, sliced per page),
-    // so the L0 key is just the seed id. Fork semantics mirror related: the
-    // stored source is never served directly — every caller gets a fresh
-    // fork, so concurrent users never share mutable cursor state.
+    // so the L0 key is just the seed id. The fork source cursor is re-stored
+    // FRESH on every serve (hit or miss): continuation entries live 5 min
+    // while the queue stays fresh 10, so reusing the miss-time cursor would
+    // dangle on late L0 hits. Fork semantics still mirror related — the
+    // stored source is never served directly; every caller gets its own fork.
     const result = await cached<{
       tracks: RadioTrackDTO[];
       shortfall: boolean;
-      forkFrom: string | null;
     }>(
       `radio:v1:${id}`,
       RADIO_FRESH_MS,
@@ -915,13 +995,15 @@ export async function handleRadio(
         if (tracks.length === 0) {
           throw new Error("radio_unavailable: no continuation tracks");
         }
-        const forkFrom = storeContinuation(dtoPage(tracks), limit, scope);
-        return { tracks, shortfall, forkFrom };
+        return { tracks, shortfall };
       },
       RADIO_STALE_MS,
     );
     const items = result.value.tracks.slice(0, limit);
-    const next = forkContinuation(result.value.forkFrom, scope);
+    const next = forkContinuation(
+      storeContinuation(dtoPage(result.value.tracks), limit, scope),
+      scope,
+    );
     const warnings: Array<{ code: string; message: string }> = [];
     if (result.stale) {
       warnings.push({
@@ -1052,16 +1134,20 @@ export function mapLyricsShelf(shelf: unknown): LyricsDTO | null {
         if (!text || text.trim() === "") {
           continue;
         }
-        const startRaw =
-          c.start ?? c.start_seconds ?? c.startSeconds ?? c.start_ms;
-        const start =
-          typeof startRaw === "number" && Number.isFinite(startRaw)
-            ? startRaw > 1000
-              ? Math.round(startRaw / 1000)
-              : startRaw
-            : typeof startRaw === "string" && startRaw.trim() !== ""
-              ? Number(startRaw)
+        // Start units come from the source KEY, never magnitude: only
+        // explicitly-ms keys (start_ms/startMs) are divided by 1000; second
+        // keys pass through untouched (an 1800s cue must stay 1800, not 2).
+        const num = (v: unknown): number | undefined =>
+          typeof v === "number" && Number.isFinite(v)
+            ? v
+            : typeof v === "string" &&
+                v.trim() !== "" &&
+                Number.isFinite(Number(v))
+              ? Number(v)
               : undefined;
+        const ms = num(c.start_ms ?? c.startMs);
+        const secs = num(c.start ?? c.start_seconds ?? c.startSeconds);
+        const start = ms !== undefined ? ms / 1000 : secs;
         const line: LyricsLineDTO = { text };
         if (typeof start === "number" && Number.isFinite(start) && start >= 0) {
           line.start = start;

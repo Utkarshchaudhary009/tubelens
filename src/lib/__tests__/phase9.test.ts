@@ -25,7 +25,11 @@ import {
   verifyAudioToken,
 } from "../audio";
 import { clearCache } from "../cache";
-import { type ContinuationSearch, clearContinuations } from "../continuations";
+import {
+  type ContinuationSearch,
+  clearContinuations,
+  dropContinuation,
+} from "../continuations";
 
 const VID = "dQw4w9WgXcQ";
 const OTHER = "9bZkp7q19f0";
@@ -50,8 +54,10 @@ beforeEach(() => {
   savedEnv.secret = process.env.TUBELENS_AUDIO_SECRET;
   savedEnv.blocked = process.env.TUBELENS_AUDIO_BLOCKED_IDS;
   delete process.env.TUBELENS_AUDIO_ENABLED;
-  delete process.env.TUBELENS_AUDIO_SECRET;
   delete process.env.TUBELENS_AUDIO_BLOCKED_IDS;
+  // Every test gets a signing secret unless it explicitly deletes it (the
+  // no-secret case must fail closed — see the audio_not_configured test).
+  process.env.TUBELENS_AUDIO_SECRET = "phase9-test-secret";
   clearCache();
   clearContinuations();
   clearAudioBlockedForTests();
@@ -163,6 +169,37 @@ describe("phase 9 flag gate (default OFF)", () => {
     );
     expect(res.status).toBe(403);
     expect((await res.json()).error.code).toBe("audio_disabled");
+  });
+
+  test("flag ON but no secret -> 503 audio_not_configured (both modes)", async () => {
+    enableAudio();
+    delete process.env.TUBELENS_AUDIO_SECRET;
+    const deps: AudioDeps = {
+      fetchFormat: async () => ({ mimeType: "audio/webm" }),
+      fetchRange: async () => ({
+        bytes: new Uint8Array([1, 2, 3]),
+        contentType: "audio/webm",
+        totalLength: 3,
+      }),
+    };
+    const resJson = await handleAudio(
+      req(`http://x/api/v1/videos/${VID}/audio`),
+      VID,
+      deps,
+    );
+    expect(resJson.status).toBe(503);
+    const bodyJson = await resJson.json();
+    expect(bodyJson.error.code).toBe("audio_not_configured");
+    expect(typeof bodyJson.error.hint).toBe("string");
+
+    // A token minted under a previous secret must not validate either —
+    // the configured gate fires before any token check.
+    process.env.TUBELENS_AUDIO_SECRET = "earlier-secret";
+    const { url } = mintSignedAudioUrl("http://x", VID);
+    delete process.env.TUBELENS_AUDIO_SECRET;
+    const resBytes = await handleAudio(req(url), VID, deps);
+    expect(resBytes.status).toBe(503);
+    expect((await resBytes.json()).error.code).toBe("audio_not_configured");
   });
 });
 
@@ -317,6 +354,67 @@ describe("phase 9 audio route", () => {
     const body = await res.json();
     expect(body.error.code).toBe("invalid_range");
     expect(res.headers.get("Content-Range")).toBe("bytes */1000");
+  });
+
+  test("invalid ranges are ignored -> 200 full body, Range never sent upstream", async () => {
+    enableAudio();
+    const deps = rangeAwareAudioDeps();
+    const signed = await handleAudio(
+      req(`http://x/api/v1/videos/${VID}/audio`),
+      VID,
+      deps,
+    );
+    const { url } = (await signed.json()).data as { url: string };
+    for (const range of ["bytes=100-50", "bytes=-0", "garbage"]) {
+      const res = await handleAudio(
+        req(url, { headers: { Range: range } }),
+        VID,
+        deps,
+      );
+      expect(res.status).toBe(200);
+      expect(res.headers.get("Content-Range")).toBeNull();
+      expect((await res.arrayBuffer()).byteLength).toBe(1000);
+    }
+    // No ranged upstream fetch happened for any of them.
+    expect(deps.calls).toEqual([]);
+  });
+
+  test("unknown total with a requested range -> full body as 200, no Content-Range", async () => {
+    enableAudio();
+    const full = new Uint8Array(1000);
+    const seen: Array<ByteRange | null> = [];
+    const deps: AudioDeps = {
+      fetchFormat: async () => ({ mimeType: "audio/webm" }),
+      fetchRange: async (_id: string, range: ByteRange | null) => {
+        seen.push(range);
+        if (range) {
+          // Upstream honored the range but reported no total.
+          return {
+            bytes: full.slice(range.start, range.end ?? 999),
+            contentType: "audio/webm",
+            totalLength: -1,
+          };
+        }
+        return { bytes: full, contentType: "audio/webm", totalLength: -1 };
+      },
+    };
+    const signed = await handleAudio(
+      req(`http://x/api/v1/videos/${VID}/audio`),
+      VID,
+      deps,
+    );
+    const { url } = (await signed.json()).data as { url: string };
+    const res = await handleAudio(
+      req(url, { headers: { Range: "bytes=0-99" } }),
+      VID,
+      deps,
+    );
+    // 206 is impossible without a total (Content-Range needs one), so the
+    // range is dropped and the full body re-served as 200.
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Range")).toBeNull();
+    expect((await res.arrayBuffer()).byteLength).toBe(1000);
+    expect(seen).toEqual([{ start: 0, end: 99 }, null]);
   });
 
   test("expired and tampered tokens -> 403 audio_invalid_token", async () => {
@@ -594,6 +692,43 @@ describe("phase 9 radio route", () => {
     }
   });
 
+  test("L0-hit path re-stores a fresh cursor (no 5-min dangle on a 10-min queue)", async () => {
+    enableAudio();
+    const ids = Array.from({ length: 30 }, (_, i) => `track${i}`);
+    const deps = radioDepsFor(ids);
+    const first = await handleRadio(
+      req(`http://x/api/v1/videos/${VID}/radio?limit=20`),
+      VID,
+      deps,
+    );
+    const staleCursor = (await first.json()).page.next as string;
+    expect(typeof staleCursor).toBe("string");
+
+    // Simulate the stored fork expiring while the queue is still L0-fresh.
+    dropContinuation(staleCursor);
+    const second = await handleRadio(
+      req(`http://x/api/v1/videos/${VID}/radio?limit=20`),
+      VID,
+      deps,
+    );
+    expect(second.status).toBe(200);
+    const secondBody = await second.json();
+    expect(secondBody.meta.cached).toBe(true);
+    const freshCursor = secondBody.page.next as string;
+    expect(typeof freshCursor).toBe("string");
+    expect(freshCursor).not.toBe(staleCursor);
+
+    // The refreshed cursor resolves the remainder.
+    const third = await handleRadio(
+      req(`http://x/api/v1/videos/${VID}/radio?limit=20&cursor=${freshCursor}`),
+      VID,
+      deps,
+    );
+    const thirdBody = await third.json();
+    expect(thirdBody.data).toHaveLength(10);
+    expect(thirdBody.page.next).toBeNull();
+  });
+
   test("related rail fills an automix shortfall", async () => {
     enableAudio();
     const deps: RadioDeps = {
@@ -697,6 +832,23 @@ describe("phase 9 lyrics route", () => {
     expect(dto?.text).toContain("hello");
     expect(mapLyricsShelf({ description: { text: "" } })).toBeNull();
     expect(mapLyricsShelf(null)).toBeNull();
+  });
+
+  test("mapLyricsShelf: units come from the key, never magnitude", () => {
+    // A long second-valued cue must stay seconds (1800, not 2).
+    const secs = mapLyricsShelf({
+      timed_lyrics: [{ start: 1800, text: "late verse" }],
+    });
+    expect(secs?.lines?.[0]).toMatchObject({ start: 1800 });
+    // Explicit ms keys divide; numeric strings work on both key kinds.
+    const ms = mapLyricsShelf({
+      timed_lyrics: [
+        { start_ms: 5000, text: "five" },
+        { startMs: "9000", text: "nine" },
+        { start: "12", text: "twelve seconds" },
+      ],
+    });
+    expect(ms?.lines?.map((l) => l.start)).toEqual([5, 9, 12]);
   });
 
   test("timed lyrics served with lines + text", async () => {
@@ -814,6 +966,7 @@ describe("phase 9 openapi registration", () => {
     );
     expect(audioCodes).toContain("410");
     expect(audioCodes).toContain("416");
+    expect(audioCodes).toContain("503");
     expect(
       Object.keys(doc.paths["/videos/{id}/lyrics"].get.responses),
     ).toContain("404");

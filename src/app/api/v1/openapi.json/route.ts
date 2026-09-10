@@ -673,6 +673,11 @@ export function buildOpenApiDocument() {
                 "invalid_range; the Range start is past the stream length.",
               content: { "application/json": { schema: { $ref: errorRef } } },
             },
+            503: {
+              description:
+                "audio_not_configured; the flag is on but TUBELENS_AUDIO_SECRET is unset.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
             429: rateLimitedResponse,
             502: degradedResponse,
             504: timeoutResponse,
