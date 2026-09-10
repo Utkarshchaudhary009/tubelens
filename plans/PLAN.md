@@ -226,7 +226,7 @@ plus one combined call that makes the frontend trivial. Durable persist
 **Goal:** Background listening and karaoke-style experiences. Stays behind a
 feature flag until post-v1 legal review — see `NEED_TO_THINK.md`.
 
-**Status:** `[x]` done — shipped via PR #12 (merged 2026-09-10): audio (signed-URL + Range-gateway, fail-closed without secret, per-video kill switch) + radio (dedupe queue, cursor paging) + lyrics (timed/plain, 404 lyrics_unavailable) live with 497 unit tests + e2e PASS on live upstream. All three behind `TUBELENS_AUDIO_ENABLED` (default OFF until post-v1 legal review); CDN + in-memory only, no durable store.
+**Status:** `[x]` done — shipped via PR #12 (merged 2026-09-10): audio (signed-URL + Range-gateway, fail-closed without secret, per-video kill switch) + radio (dedupe queue, cursor paging) + lyrics (timed/plain, 404 lyrics_unavailable) live with 497 unit tests + e2e PASS on live upstream. All three behind `TUBELENS_AUDIO_ENABLED` (default OFF until post-v1 legal review); CDN + in-memory only, no durable store. Production deployment green at merge head; direct prod curl blocked by Vercel SSO Deployment Protection (needs owner bypass to re-verify).
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
