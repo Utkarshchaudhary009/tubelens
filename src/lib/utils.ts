@@ -588,8 +588,8 @@ const VERCEL_HOST = /^[a-z0-9]([a-z0-9.-]{0,253}[a-z0-9])?$/i;
  * Trusted sub-request origin for the batch fan-out. NEVER the raw request
  * Host: Host-header poisoning would turn the server-side fan-out into an
  * SSRF primitive. Precedence: explicit TUBELENS_PUBLIC_URL, the Vercel
- * system VERCEL_URL, else loopback-only local dev — anything else fails
- * closed (null -> 503 batch_not_configured).
+ * system VERCEL_URL, else loopback-only local dev (non-production only) —
+ * anything else fails closed (null -> 503 batch_not_configured).
  */
 export function resolveBatchOrigin(req: NextRequest): string | null {
   const explicit = (process.env.TUBELENS_PUBLIC_URL ?? "").trim();
@@ -607,17 +607,21 @@ export function resolveBatchOrigin(req: NextRequest): string | null {
   if (vercel !== "" && VERCEL_HOST.test(vercel) && !vercel.includes("..")) {
     return `https://${vercel.toLowerCase()}`;
   }
-  // Local dev only: loopback Hosts are not attacker-reachable remotes. On
-  // Vercel the Host is always the deployment domain, so this branch never
-  // fires there.
-  try {
-    const url = new URL(req.url);
-    const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-    if (LOOPBACK_HOSTS.has(host)) {
-      return url.origin;
+  // Local dev only and NEVER in production: a loopback Host proves nothing
+  // about trust — the port is attacker-chosen via Host (e.g. an internal
+  // service on 127.0.0.1:<port>), so production without a configured origin
+  // fails closed instead. Vercel prod always sets VERCEL_URL, so behavior
+  // there is unchanged.
+  if (process.env.NODE_ENV !== "production") {
+    try {
+      const url = new URL(req.url);
+      const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+      if (LOOPBACK_HOSTS.has(host)) {
+        return url.origin;
+      }
+    } catch {
+      // Malformed request URL -> fail closed.
     }
-  } catch {
-    // Malformed request URL -> fail closed.
   }
   return null;
 }

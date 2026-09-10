@@ -77,20 +77,11 @@ function rssDeps(overrides?: Partial<ChannelRssDeps>): ChannelRssDeps {
 }
 
 const savedPeers = process.env.TUBELENS_PEER_INSTANCES;
-const savedPublicUrl = process.env.TUBELENS_PUBLIC_URL;
 const savedVercelUrl = process.env.VERCEL_URL;
 
-function restoreEnv(
-  key: string,
-  saved: string | undefined,
-  fallback?: string,
-): void {
+function restoreEnv(key: string, saved: string | undefined): void {
   if (saved === undefined) {
-    if (fallback === undefined) {
-      delete process.env[key];
-    } else {
-      process.env[key] = fallback;
-    }
+    delete process.env[key];
   } else {
     process.env[key] = saved;
   }
@@ -101,10 +92,11 @@ beforeEach(() => {
   clearContinuations();
   resetQuotaForTests();
   restoreEnv("TUBELENS_PEER_INSTANCES", savedPeers);
-  // Batch fan-out pins to a trusted origin (never the request Host): point
-  // it at the http://x test origin so fake executors see stable URLs.
-  restoreEnv("TUBELENS_PUBLIC_URL", savedPublicUrl, "http://x");
   restoreEnv("VERCEL_URL", savedVercelUrl);
+  // Batch fan-out pins to a trusted origin (never the request Host): always
+  // force the http://x test origin so fake executors see stable URLs — even
+  // when the suite itself runs with TUBELENS_PUBLIC_URL exported.
+  process.env.TUBELENS_PUBLIC_URL = "http://x";
 });
 
 // ---------------------------------------------------------------------------
@@ -686,6 +678,37 @@ describe("phase 10 batch trusted origin (SSRF pinning)", () => {
         expect(
           resolveBatchOrigin(req("http://localhost:3000/api/v1/batch")),
         ).toBe("http://localhost:3000");
+      },
+    );
+  });
+
+  test("production ignores the loopback fallback and fails closed", async () => {
+    await withBatchEnv(
+      {
+        TUBELENS_PUBLIC_URL: undefined,
+        VERCEL_URL: undefined,
+        NODE_ENV: "production",
+      },
+      async () => {
+        // Attacker-chosen loopback port must not become a fan-out target.
+        expect(
+          resolveBatchOrigin(req("http://127.0.0.1:9999/api/v1/batch")),
+        ).toBeNull();
+        const seen: string[] = [];
+        const res = await handleBatch(
+          jsonReq("http://127.0.0.1:9999/api/v1/batch", {
+            requests: [{ method: "GET", path: "/api/v1/health" }],
+          }),
+          {
+            execute: async (url: string) => {
+              seen.push(url);
+              return { status: 200, body: {} };
+            },
+          },
+        );
+        expect(res.status).toBe(503);
+        expect((await res.json()).error.code).toBe("batch_not_configured");
+        expect(seen).toEqual([]);
       },
     );
   });
