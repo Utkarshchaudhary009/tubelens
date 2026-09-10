@@ -205,7 +205,7 @@ say, and what is spoken.
 plus one combined call that makes the frontend trivial. Durable persist
 (Upstash/R2 free tier) is OPTIONAL here only — default stays CDN + in-memory.
 
-**Status:** `[x]` done — shipped via PR #11 (merged 2026-09-10): sponsors + dislikes + dearrow + combined live with 450 unit tests + e2e PASS on live upstream. CDN + in-memory only, no durable store.
+**Status:** `[x]` done — shipped via PR #11 (merged 2026-09-10): sponsors + dislikes + dearrow + combined live with 450 unit tests + e2e PASS on live upstream. CDN + in-memory only, no durable store. Production deployment green at main head; direct prod curl blocked by Vercel SSO Deployment Protection (needs owner bypass to re-verify).
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
