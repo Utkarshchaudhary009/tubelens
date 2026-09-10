@@ -3,7 +3,7 @@ import { baseHeaders, CACHE_CONTROL, getRequestId } from "@/lib/envelope";
 
 export const runtime = "nodejs";
 
-// OpenAPI 3.1 stub for Phase 7: documents exactly the 24 shipped endpoints.
+// OpenAPI 3.1 stub for Phase 8: documents exactly the 28 shipped endpoints.
 // Grows each phase; promoted to the full spec in Phase 10. Exported as a
 // pure builder so tests can validate it without HTTP.
 export function buildOpenApiDocument() {
@@ -66,7 +66,7 @@ export function buildOpenApiDocument() {
       // package.json (0.1.0 until the v1 API is declared stable).
       version: "0.1.0",
       description:
-        "API-first YouTube data API. Phase 7 ships explore verticals (Shorts discovery, cross-channel live discovery with viewer counts/scheduled times, and the gaming hub), plus Phase 6 music-native search (typed song vs album vs artist), charts snapshots, and artist profiles with top releases, plus Phase 5 playlist reads (metadata plus first items page, paginated items, and a channel's curated playlists), Phase 4 channel profiles, uploads, Shorts shelves, and live/upcoming/past streams, Phase 3 discovery (search autocomplete suggestions, hashtag feeds), Phase 2 watch essentials (related rail, comments, captions, transcript) and Phase 1 health, search, video details, URL resolving, and this spec.",
+        "API-first YouTube data API. Phase 8 ships community-enriched data (SponsorBlock skip segments, ReturnYouTubeDislike stats, DeArrow crowd-sourced titles/thumbnails, and one combined call composing detail with all three layers, each degrading independently), plus Phase 7 explore verticals (Shorts discovery, cross-channel live discovery with viewer counts/scheduled times, and the gaming hub), plus Phase 6 music-native search (typed song vs album vs artist), charts snapshots, and artist profiles with top releases, plus Phase 5 playlist reads (metadata plus first items page, paginated items, and a channel's curated playlists), Phase 4 channel profiles, uploads, Shorts shelves, and live/upcoming/past streams, Phase 3 discovery (search autocomplete suggestions, hashtag feeds), Phase 2 watch essentials (related rail, comments, captions, transcript) and Phase 1 health, search, video details, URL resolving, and this spec.",
     },
     servers: [{ url: "https://tubelens.vercel.app/api/v1" }],
     paths: {
@@ -441,6 +441,168 @@ export function buildOpenApiDocument() {
                 "upstream_timeout; the 8s fail-fast fired. Retry shortly.",
               content: { "application/json": { schema: { $ref: errorRef } } },
             },
+          },
+        },
+      },
+      "/videos/{id}/sponsors": {
+        get: {
+          operationId: "getSponsors",
+          summary: "SponsorBlock crowd-sourced skip segments",
+          parameters: [
+            {
+              name: "id",
+              in: "path",
+              required: true,
+              schema: { type: "string" },
+            },
+            {
+              name: "region",
+              in: "query",
+              schema: { type: "string", default: "US" },
+            },
+            {
+              name: "lang",
+              in: "query",
+              schema: { type: "string", default: "en" },
+            },
+          ],
+          responses: {
+            200: {
+              description:
+                "Skip segments as [{ start, end, category }]. A video with no submitted segments yields data:[] rather than 404.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "invalid_video_id.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
+            502: degradedResponse,
+            504: timeoutResponse,
+          },
+        },
+      },
+      "/videos/{id}/dislikes": {
+        get: {
+          operationId: "getDislikes",
+          summary: "ReturnYouTubeDislike estimated dislike stats",
+          parameters: [
+            {
+              name: "id",
+              in: "path",
+              required: true,
+              schema: { type: "string" },
+            },
+            {
+              name: "region",
+              in: "query",
+              schema: { type: "string", default: "US" },
+            },
+            {
+              name: "lang",
+              in: "query",
+              schema: { type: "string", default: "en" },
+            },
+          ],
+          responses: {
+            200: {
+              description:
+                "Estimated likes/dislikes/rating/viewCount, or data:null with a dislikes_unavailable warning when no crowd stats exist.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "invalid_video_id.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
+            502: degradedResponse,
+            504: timeoutResponse,
+          },
+        },
+      },
+      "/videos/{id}/dearrow": {
+        get: {
+          operationId: "getDeArrow",
+          summary: "DeArrow crowd-sourced titles and thumbnails",
+          parameters: [
+            {
+              name: "id",
+              in: "path",
+              required: true,
+              schema: { type: "string" },
+            },
+            {
+              name: "region",
+              in: "query",
+              schema: { type: "string", default: "US" },
+            },
+            {
+              name: "lang",
+              in: "query",
+              schema: { type: "string", default: "en" },
+            },
+          ],
+          responses: {
+            200: {
+              description:
+                "Top-voted crowd title plus thumbnail candidates, or data:null with a dearrow_unavailable warning when no crowd entry exists.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "invalid_video_id.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
+            502: degradedResponse,
+            504: timeoutResponse,
+          },
+        },
+      },
+      "/videos/{id}/combined": {
+        get: {
+          operationId: "getCombinedVideo",
+          summary: "Composed video detail plus all crowd layers",
+          parameters: [
+            {
+              name: "id",
+              in: "path",
+              required: true,
+              schema: { type: "string" },
+            },
+            {
+              name: "region",
+              in: "query",
+              schema: { type: "string", default: "US" },
+            },
+            {
+              name: "lang",
+              in: "query",
+              schema: { type: "string", default: "en" },
+            },
+          ],
+          responses: {
+            200: {
+              description:
+                "Composed { video, sponsors, dislikes, dearrow }. Each crowd part degrades independently to null/[] with a warnings entry; still HTTP 200 — except a nonexistent video id, which returns 404 video_not_found like /videos/{id}.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "invalid_video_id.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            404: {
+              description: "video_not_found.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
           },
         },
       },

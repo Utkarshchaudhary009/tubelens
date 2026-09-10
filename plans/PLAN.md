@@ -205,7 +205,7 @@ say, and what is spoken.
 plus one combined call that makes the frontend trivial. Durable persist
 (Upstash/R2 free tier) is OPTIONAL here only — default stays CDN + in-memory.
 
-**Status:** `[ ]` not started
+**Status:** `[~]` in progress — sponsors + dislikes + dearrow + combined (CDN + in-memory only, no durable store)
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |

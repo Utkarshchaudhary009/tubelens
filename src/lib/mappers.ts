@@ -549,6 +549,8 @@ export interface ClassifiedVideoError {
   message: string;
   hint: string;
   status: number;
+  /** Seconds — set on 429 rate_limited responses (mirrors ApiErrorOptions). */
+  retryAfter?: number;
 }
 
 /**
