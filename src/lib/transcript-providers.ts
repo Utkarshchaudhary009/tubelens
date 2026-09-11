@@ -58,8 +58,10 @@ function langMatches(trackLang: string, want: string): boolean {
  * a single overall 8s budget). When every item reports a language and none
  * matches `lang`, that counts as failure (throws, so the route reports the
  * fast-path error instead of serving the wrong language). Mixed-language
- * payloads are filtered to the requested language before mapping; items with
- * no language tag are kept (nothing to judge them by).
+ * payloads are filtered to the requested language before mapping; absent or
+ * blank tags are kept (nothing to judge them by), malformed non-string tags
+ * are dropped. A bare non-ok status means "no transcript" (never a missing
+ * video); only video-scoped wording propagates as video_not_found.
  */
 export async function fetchTranscriptFallback(
   id: string,
@@ -75,8 +77,9 @@ export async function fetchTranscriptFallback(
     // video — keep the error transcript-scoped so it classifies as
     // transcript_unavailable (the shared `\b404\b` rule would otherwise
     // mislabel an existing-but-captionless video as video_not_found). Only
-    // explicit deleted/private wording propagates as a definitive
-    // video_not_found, which the route must NOT serve stale for.
+    // video-scoped wording (e.g. "this video is private") propagates as a
+    // definitive video_not_found, which the route must NOT serve stale for —
+    // bare words like "removed" may describe the transcript, not the video.
     let detail = "";
     try {
       detail = await res.text();
@@ -84,7 +87,7 @@ export async function fetchTranscriptFallback(
       detail = "";
     }
     if (
-      /private|deleted|removed|video.{0,40}(unavailable|not found)/i.test(
+      /video.{0,40}(private|deleted|removed|unavailable|not found)|(private|deleted|removed|unavailable|not found).{0,40}video/i.test(
         detail,
       )
     ) {
@@ -113,15 +116,25 @@ export async function fetchTranscriptFallback(
   // carries a language tag and none matches — an untagged segment alongside
   // foreign-tagged ones may still be the requested language, so it flows
   // into the filter below instead of throwing the whole payload away.
+  // Untagged means absent or blank-string; a present non-string tag is
+  // malformed — counted as tagged for the guard and dropped by the filter,
+  // never served as a guessed language.
+  const isUntagged = (item: unknown): boolean => {
+    if (typeof item !== "object" || item === null) {
+      return false;
+    }
+    const l = (item as Record<string, unknown>).lang;
+    return l === undefined || (typeof l === "string" && l.trim() === "");
+  };
+  const tagMatches = (item: unknown): boolean => {
+    if (typeof item !== "object" || item === null) {
+      return false;
+    }
+    const l = (item as Record<string, unknown>).lang;
+    return typeof l === "string" && langMatches(l, lang);
+  };
   const everyItemTagged =
-    list.length > 0 &&
-    list.every((item) => {
-      if (typeof item !== "object" || item === null) {
-        return false;
-      }
-      const l = (item as Record<string, unknown>).lang;
-      return typeof l === "string" && l.trim() !== "";
-    });
+    list.length > 0 && list.every((item) => !isUntagged(item));
   if (everyItemTagged && ![...reported].some((l) => langMatches(l, lang))) {
     throw new Error(
       `yttools language mismatch: requested ${lang}, got ${[...reported].join(",")}`,
@@ -129,13 +142,9 @@ export async function fetchTranscriptFallback(
   }
   // Mixed-language payloads serve only the requested language — never leak
   // a wrong-language segment into the response. Untagged items are kept.
-  const candidates = list.filter((item) => {
-    if (typeof item !== "object" || item === null) {
-      return false;
-    }
-    const l = (item as Record<string, unknown>).lang;
-    return typeof l !== "string" || l.trim() === "" || langMatches(l, lang);
-  });
+  const candidates = list.filter(
+    (item) => isUntagged(item) || tagMatches(item),
+  );
   const segments: TranscriptSegmentDTO[] = [];
   for (const item of candidates) {
     if (typeof item !== "object" || item === null) {

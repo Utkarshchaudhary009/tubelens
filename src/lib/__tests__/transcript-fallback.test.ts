@@ -275,6 +275,17 @@ describe("fetchTranscriptFallback (yttools, mocked fetch)", () => {
     expect(result.segments.map((s) => s.text)).toEqual(["hello", "untagged"]);
   });
 
+  test("malformed non-string lang is dropped, never served as a guess", async () => {
+    const fetchFn = mockFetch(() => ({
+      transcript: [
+        { text: "guess", offset: 0, duration: 1000, lang: 42 },
+        { text: "hello", offset: 1000, duration: 1000, lang: "en" },
+      ],
+    }));
+    const result = await fetchTranscriptFallback("dQw4w9WgXcQ", "en", fetchFn);
+    expect(result.segments.map((s) => s.text)).toEqual(["hello"]);
+  });
+
   test("untagged segment alongside foreign-tagged ones is kept, not dropped", async () => {
     const fetchFn = mockFetch(() => ({
       transcript: [
@@ -330,5 +341,16 @@ describe("fetchTranscriptFallback (yttools, mocked fetch)", () => {
     await expect(
       fetchTranscriptFallback("dQw4w9WgXcQ", "en", deleted),
     ).rejects.toThrow(/video_not_found/);
+    // Bare removal wording without video scope stays transcript-scoped —
+    // it may describe the transcript, not the video.
+    const transcriptRemoved: FetchLike = (async () => ({
+      ok: false,
+      status: 404,
+      json: async () => ({}),
+      text: async () => "Transcript removed by the author",
+    })) as FetchLike;
+    await expect(
+      fetchTranscriptFallback("dQw4w9WgXcQ", "en", transcriptRemoved),
+    ).rejects.toThrow(/no transcript/);
   });
 });
