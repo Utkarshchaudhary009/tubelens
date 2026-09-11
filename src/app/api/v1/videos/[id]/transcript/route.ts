@@ -12,27 +12,120 @@ import { isPlausibleVideoId, parseLang, parseRegion } from "@/lib/validate";
 export const runtime = "nodejs";
 
 // Upstream seam: the default implementation talks to youtubei.js (imported
-// lazily so this module stays importable without the server-only singleton).
-// Tests inject mocks here and never touch src/lib/youtube.
+// lazily so this module stays importable without the server-only singleton)
+// with yttools.co as fallback. Tests inject mocks here and never touch
+// src/lib/youtube. The fallback runs only when deps.fetchFallback is
+// present: defaultDeps wires the real yttools fetch, while fast-path-only
+// mocks exercise Innertube alone (no network in unit tests).
+export interface TranscriptFallback {
+  segments: TranscriptSegmentDTO[];
+  provider: string;
+}
+
 export interface TranscriptDeps {
   fetchTranscript: (id: string) => Promise<TranscriptSegmentDTO[]>;
+  fetchFallback?: (id: string, lang: string) => Promise<TranscriptFallback>;
+  /**
+   * Single overall fail-fast budget wrapper (default: lib/youtube
+   * withTimeout, lazily imported). Injectable so unit tests never touch the
+   * server-only singleton.
+   */
+  withTimeout?: <T>(
+    task: (signal: AbortSignal) => Promise<T>,
+    ms: number,
+  ) => Promise<T>;
+}
+
+/**
+ * Default overall-budget wrapper. Lazily imports the server-only singleton
+ * (keeps this module importable without it); outside a server context the
+ * import throws and a local race with identical TimeoutError semantics
+ * applies the budget instead.
+ */
+async function defaultWithTimeout<T>(
+  task: (signal: AbortSignal) => Promise<T>,
+  ms: number,
+): Promise<T> {
+  try {
+    const { withTimeout } = await import("@/lib/youtube");
+    return withTimeout(task, ms);
+  } catch {
+    const signal = AbortSignal.timeout(ms);
+    let onAbort: (() => void) | undefined;
+    const gate = new Promise<never>((_resolve, reject) => {
+      onAbort = () => {
+        const err = new Error(`Upstream timed out after ${ms}ms`);
+        err.name = "TimeoutError";
+        reject(err);
+      };
+      if (signal.aborted) {
+        onAbort();
+      } else {
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+    });
+    try {
+      return await Promise.race([task(signal), gate]);
+    } finally {
+      if (onAbort) {
+        signal.removeEventListener("abort", onAbort);
+      }
+    }
+  }
+}
+
+/** Cached transcript payload: the provider rides in the cached value (not a
+ *  closure), so cache hits and in-flight joins keep the fallback_source
+ *  warning. Absent provider means the Innertube fast path served it. */
+interface CachedTranscript {
+  segments: TranscriptSegmentDTO[];
+  provider?: string;
+}
+
+/**
+ * Legacy entries (plain segment arrays, seeded before the provider field
+ * existed) normalize to fast-path results with no provider. Corrupt entries
+ * normalize to empty, which flows into the 404 path — never a 500.
+ */
+function normalizeCachedTranscript(value: unknown): CachedTranscript {
+  if (Array.isArray(value)) {
+    return { segments: value as TranscriptSegmentDTO[] };
+  }
+  if (typeof value === "object" && value !== null) {
+    const v = value as { segments?: unknown; provider?: unknown };
+    if (Array.isArray(v.segments)) {
+      const entry: CachedTranscript = {
+        segments: v.segments as TranscriptSegmentDTO[],
+      };
+      if (typeof v.provider === "string" && v.provider !== "") {
+        entry.provider = v.provider;
+      }
+      return entry;
+    }
+  }
+  return { segments: [] };
 }
 
 const defaultDeps: TranscriptDeps = {
   async fetchTranscript(id) {
-    const { getInnertube, withTimeout } = await import("@/lib/youtube");
-    // Single 8s budget for the whole fetch (session + info + transcript), so
-    // the worst case stays ~8s instead of stacking per-call timeouts.
-    return withTimeout(async () => {
-      const innertube = await getInnertube();
-      // MUST use getInfo: getTranscript() throws on getBasicInfo payloads
-      // ("Cannot get transcript from basic video info") because the engagement
-      // panels only ride on the full watch-next response. Auto-captioned videos
-      // work the same way — no track-kind filtering here.
-      const info = await innertube.getInfo(id);
-      const transcript = await info.getTranscript();
-      return mapTranscriptInfo(transcript);
-    }, 8000);
+    const { getInnertube } = await import("@/lib/youtube");
+    // Raw fetch with NO per-step timeout here: handleTranscript applies a
+    // single overall withTimeout(8000) around fast-path + fallback combined,
+    // so the worst case stays ~8s instead of stacking per-call timeouts.
+    const innertube = await getInnertube();
+    // MUST use getInfo: getTranscript() throws on getBasicInfo payloads
+    // ("Cannot get transcript from basic video info") because the engagement
+    // panels only ride on the full watch-next response. Auto-captioned videos
+    // work the same way — no track-kind filtering here.
+    const info = await innertube.getInfo(id);
+    const transcript = await info.getTranscript();
+    return mapTranscriptInfo(transcript);
+  },
+  async fetchFallback(id, lang) {
+    const { fetchTranscriptFallback } = await import(
+      "@/lib/transcript-providers"
+    );
+    return fetchTranscriptFallback(id, lang);
   },
 };
 
@@ -44,15 +137,23 @@ export async function GET(
   return handleTranscript(req, id);
 }
 
-// NOTE on region/lang: echo-only request context (meta + CDN cache variance).
-// The upstream session locale is fixed to en/US at singleton creation, so the
-// transcript is locale-independent and the cache key is just the video id.
-// The full segment list is returned in one page (page.next is always null).
+// NOTE on region/lang: region is echo-only request context (meta + CDN cache
+// variance). lang IS honored: it is passed to the yttools fallback
+// (?lang=) and is part of the cache key. The full segment list is returned
+// in one page (page.next is always null).
 // Empty-vs-stale contract (shared with captions): stale wins. An empty fresh
 // fetch never populates the cache (it throws, so `cached` falls back to any
 // stale copy); a stale non-empty copy is served as 200 + `stale_served`
 // regardless of the fresh outcome, and only a cold-miss empty is 404. A
 // legacy stale-empty copy is still 404 — empties are never served as 200.
+// Fallback contract: the Innertube fast path runs first; on failure (or an
+// empty fast path) the yttools.co fallback is tried under a SINGLE overall
+// withTimeout(8000) around fast-path + fallback combined (never stacked
+// per-step budgets). A definitive video_not_found skips the fallback — no
+// provider can resurrect a private/deleted video. Successful fallbacks are
+// cached like fast-path results with the provider persisted in the cached
+// value, and annotated with a `fallback_source` warning naming the provider
+// (survives cache hits and in-flight joins).
 export async function handleTranscript(
   req: NextRequest,
   id: string,
@@ -71,30 +172,62 @@ export async function handleTranscript(
     });
   }
 
-  const cacheKey = `transcript:v1:${id}`;
+  const cacheKey = `transcript:v1:${id}:${lang}`;
+  // Single overall 8s fail-fast budget for fast-path + fallback combined
+  // (injectable; defaults to the lib/youtube wrapper via lazy import).
+  const withTimeout = deps.withTimeout ?? defaultWithTimeout;
   try {
-    const result = await cached<TranscriptSegmentDTO[]>(
+    const result = await cached<CachedTranscript>(
       cacheKey,
       24 * 60 * 60 * 1000, // L0 fresh window; L1 CDN carries the 86400s TTL.
-      async () => {
-        // Throw on empty so empty transcript lists never populate the cache;
-        // classifyTranscriptError maps the marker to 404 transcript_unavailable,
-        // and `cached` falls back to any stale copy (stale wins).
-        const segments = await deps.fetchTranscript(id);
-        if (segments.length === 0) {
-          throw new Error("transcript_unavailable: no transcript segments");
-        }
-        return segments;
-      },
+      async () =>
+        withTimeout(async () => {
+          // Throw on empty so empty transcript lists never populate the cache;
+          // classifyTranscriptError maps the marker to 404 transcript_unavailable,
+          // and `cached` falls back to any stale copy (stale wins).
+          let fastErr: unknown = null;
+          try {
+            const segments = await deps.fetchTranscript(id);
+            if (segments.length > 0) {
+              return { segments };
+            }
+            fastErr = new Error(
+              "transcript_unavailable: no transcript segments",
+            );
+          } catch (err) {
+            // Definitive not-found errors skip the fallback — no provider can
+            // resurrect a private/deleted video (and must NOT serve stale).
+            if (classifyTranscriptError(err).code === "video_not_found") {
+              throw err;
+            }
+            fastErr = err;
+          }
+          if (deps.fetchFallback) {
+            try {
+              const fb = await deps.fetchFallback(id, lang);
+              if (fb.segments.length > 0) {
+                return { segments: fb.segments, provider: fb.provider };
+              }
+              // Empty fallback falls through to the fast-path error below —
+              // an empty list is never served as 200.
+            } catch {
+              // Fall through to the fast-path error below.
+            }
+          }
+          throw fastErr;
+        }, 8000),
       24 * 60 * 60 * 1000, // stale window backs serve-stale-on-error.
       // Definitive not-found errors must NOT serve stale — only transient
       // failures (timeouts, 429s, 5xx) and unavailable-transcript empties may.
       // Mirrors the videos/:id predicate via this route's classifier.
       (err) => classifyTranscriptError(err).code !== "video_not_found",
     );
+    // The provider rides in the cached value (never a closure), so cache
+    // hits and in-flight joins keep the fallback_source warning.
+    const entry = normalizeCachedTranscript(result.value);
     // A stale-empty copy (seeded before this guard) is still a 404 — an
     // empty segment list is never served as 200.
-    if (result.value.length === 0) {
+    if (entry.segments.length === 0) {
       return errorResponse(requestId, {
         code: "transcript_unavailable",
         message: "No transcript is available for this video.",
@@ -102,19 +235,25 @@ export async function handleTranscript(
         status: 404,
       });
     }
-    return successResponse(result.value, {
+    const warnings: Array<{ code: string; message: string }> = [];
+    if (result.stale) {
+      warnings.push({
+        code: "stale_served",
+        message: "Upstream failed; serving a stale cached copy.",
+      });
+    }
+    if (entry.provider) {
+      warnings.push({
+        code: "fallback_source",
+        message: `Innertube transcript unavailable; served via ${entry.provider}.`,
+      });
+    }
+    return successResponse(entry.segments, {
       requestId,
       region,
       lang,
       cached: result.hit,
-      warnings: result.stale
-        ? [
-            {
-              code: "stale_served",
-              message: "Upstream failed; serving a stale cached copy.",
-            },
-          ]
-        : [],
+      warnings,
       cacheControl: CACHE_CONTROL.transcript,
     });
   } catch (err) {

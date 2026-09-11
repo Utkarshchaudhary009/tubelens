@@ -481,7 +481,7 @@ describe("transcript handler (mocked upstream)", () => {
         fetchTranscript: async () => segments,
       })
     ).json();
-    cacheSet(`transcript:v1:${id}`, primed.data, -1, 60 * 60 * 1000);
+    cacheSet(`transcript:v1:${id}:en`, primed.data, -1, 60 * 60 * 1000);
     const res = await handleTranscript(req(url), id, {
       fetchTranscript: async () => {
         throw new Error("429 Too Many Requests");
