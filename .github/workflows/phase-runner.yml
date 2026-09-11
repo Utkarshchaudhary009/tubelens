@@ -1,9 +1,6 @@
 name: phase-runner
 
-on:
-  schedule:
-    - cron: '0 */3 * * *'
-  workflow_dispatch:
+on: {}
 
 permissions:
   contents: write
@@ -17,36 +14,9 @@ concurrency:
 
 jobs:
   advance-phase:
-    # PAT-backed privileged run: only the trusted default branch may execute it,
-    # so a manually dispatched run from any other branch cannot exfiltrate the PAT.
-    if: github.ref == 'refs/heads/main'
+    # No triggers are configured; this job is retained only as a disabled workflow stub.
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: true
-          token: ${{ secrets.PAT }}
-
-      - name: Install OpenCode
-        run: curl -fsSL https://opencode.ai/install | bash
-
-      - name: Run phase runner
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
-          GITHUB_TOKEN: ${{ secrets.PAT }}
-        run: |
-          export PATH="$HOME/.opencode/bin:$PATH"
-          set -o pipefail
-          opencode run --agent phase-runner --auto --model opencode/muse-spark-1.3-contributor-free "Advance the next phase." \
-            | tee /tmp/phase-result.md
-
-      - name: Publish run result
-        if: always()
-        run: |
-          {
-            echo '## Phase runner result'
-            echo
-            cat /tmp/phase-result.md 2>/dev/null || echo 'No agent report was produced. Check the workflow logs.'
-          } >> "$GITHUB_STEP_SUMMARY"
+      - run: echo "phase-runner disabled"
