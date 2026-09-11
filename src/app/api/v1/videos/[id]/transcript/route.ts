@@ -210,8 +210,15 @@ export async function handleTranscript(
               }
               // Empty fallback falls through to the fast-path error below —
               // an empty list is never served as 200.
-            } catch {
-              // Fall through to the fast-path error below.
+            } catch (fbErr) {
+              // A definitive fallback verdict (video_not_found — emitted only
+              // on explicit deleted/private wording) overrides the fast-path
+              // error: no provider can resurrect a deleted video, and it must
+              // NOT serve stale. Anything else falls through to the fast-path
+              // error below.
+              if (classifyTranscriptError(fbErr).code === "video_not_found") {
+                throw fbErr;
+              }
             }
           }
           throw fastErr;

@@ -176,6 +176,25 @@ describe("transcript yttools fallback (mocked)", () => {
     });
   });
 
+  test("definitive fallback video_not_found overrides fast-path error, caches nothing", async () => {
+    const id = "FFFFFFFFFFF";
+    const res = await handleTranscript(
+      req(`http://x/api/v1/videos/${id}/transcript`),
+      id,
+      {
+        fetchTranscript: async () => {
+          throw getTranscriptFailure();
+        },
+        fetchFallback: async () => {
+          throw new Error("Video deleted or removed");
+        },
+      },
+    );
+    expect(res.status).toBe(404);
+    expect((await res.json()).error.code).toBe("video_not_found");
+    expect(cacheGet(`transcript:v1:${id}:en`)).toBeUndefined();
+  });
+
   test("video_not_found fast-path skips the fallback entirely", async () => {
     let fallbackCalls = 0;
     const res = await handleTranscript(
@@ -256,6 +275,17 @@ describe("fetchTranscriptFallback (yttools, mocked fetch)", () => {
     expect(result.segments.map((s) => s.text)).toEqual(["hello", "untagged"]);
   });
 
+  test("untagged segment alongside foreign-tagged ones is kept, not dropped", async () => {
+    const fetchFn = mockFetch(() => ({
+      transcript: [
+        { text: "usable", offset: 0, duration: 1000 },
+        { text: "hola", offset: 1000, duration: 1000, lang: "es" },
+      ],
+    }));
+    const result = await fetchTranscriptFallback("dQw4w9WgXcQ", "en", fetchFn);
+    expect(result.segments.map((s) => s.text)).toEqual(["usable"]);
+  });
+
   test("non-object body throws a shape error, never a TypeError", async () => {
     for (const payload of [null, "oops", 42]) {
       const fetchFn = mockFetch(() => payload);
@@ -279,5 +309,26 @@ describe("fetchTranscriptFallback (yttools, mocked fetch)", () => {
     await expect(
       fetchTranscriptFallback("dQw4w9WgXcQ", "en", empty),
     ).rejects.toThrow(/no transcript segments/);
+  });
+
+  test("plain non-ok stays transcript-scoped; deletion wording is video_not_found", async () => {
+    const plain404: FetchLike = (async () => ({
+      ok: false,
+      status: 404,
+      json: async () => ({}),
+      text: async () => "",
+    })) as FetchLike;
+    await expect(
+      fetchTranscriptFallback("dQw4w9WgXcQ", "en", plain404),
+    ).rejects.toThrow(/no transcript/);
+    const deleted: FetchLike = (async () => ({
+      ok: false,
+      status: 404,
+      json: async () => ({}),
+      text: async () => "This video has been deleted",
+    })) as FetchLike;
+    await expect(
+      fetchTranscriptFallback("dQw4w9WgXcQ", "en", deleted),
+    ).rejects.toThrow(/video_not_found/);
   });
 });

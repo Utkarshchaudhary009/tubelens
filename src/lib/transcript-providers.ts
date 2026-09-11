@@ -71,7 +71,28 @@ export async function fetchTranscriptFallback(
     signal: AbortSignal.timeout(TRANSCRIPT_STEP_TIMEOUT_MS),
   });
   if (!res.ok) {
-    throw new Error(`yttools request failed with status ${res.status}`);
+    // A bare 4xx from yttools means "no transcript here", NOT a missing
+    // video — keep the error transcript-scoped so it classifies as
+    // transcript_unavailable (the shared `\b404\b` rule would otherwise
+    // mislabel an existing-but-captionless video as video_not_found). Only
+    // explicit deleted/private wording propagates as a definitive
+    // video_not_found, which the route must NOT serve stale for.
+    let detail = "";
+    try {
+      detail = await res.text();
+    } catch {
+      detail = "";
+    }
+    if (
+      /private|deleted|removed|video.{0,40}(unavailable|not found)/i.test(
+        detail,
+      )
+    ) {
+      throw new Error(
+        `video_not_found: yttools reports an unavailable video (status ${res.status})`,
+      );
+    }
+    throw new Error(`yttools found no transcript (status ${res.status})`);
   }
   const json: unknown = await res.json();
   if (typeof json !== "object" || json === null) {
@@ -88,7 +109,20 @@ export async function fetchTranscriptFallback(
       }
     }
   }
-  if (reported.size > 0 && ![...reported].some((l) => langMatches(l, lang))) {
+  // A reported-language mismatch counts as failure only when EVERY item
+  // carries a language tag and none matches — an untagged segment alongside
+  // foreign-tagged ones may still be the requested language, so it flows
+  // into the filter below instead of throwing the whole payload away.
+  const everyItemTagged =
+    list.length > 0 &&
+    list.every((item) => {
+      if (typeof item !== "object" || item === null) {
+        return false;
+      }
+      const l = (item as Record<string, unknown>).lang;
+      return typeof l === "string" && l.trim() !== "";
+    });
+  if (everyItemTagged && ![...reported].some((l) => langMatches(l, lang))) {
     throw new Error(
       `yttools language mismatch: requested ${lang}, got ${[...reported].join(",")}`,
     );
