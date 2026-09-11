@@ -271,11 +271,11 @@ API pleasant to consume and operate.
 
 ---
 
-## Part B — MCP (M0 done, M1–M2 pending)
+## Part B — MCP (post-REST, not started)
 
-> **Gate: REST must complete first.** All 10 phases above (37 endpoints) shipped
-> (Phases 1–10 `[x]` done); MCP is a thin read layer over the finished REST
-> surface — never a parallel track.
+> **Gate: REST must complete first.** All 10 phases above (37 endpoints) ship,
+> validate, and reach production health before any MCP work starts. MCP is a
+> thin read layer over the finished REST surface — never a parallel track.
 
 **Framework choice:** `mcp-handler` + `@modelcontextprotocol/server` v2 + `zod` v4
 at `src/app/mcp/route.ts` with `runtime = "nodejs"`, stateless Streamable HTTP, $0
@@ -287,9 +287,10 @@ will reuse the same zod validators as REST routes.
 SSE/Streamable plumbing for zero gain; XMCP is heavyweight (codegen/CLI
 opinions) for what is a thin adapter over existing handlers.
 
-**Outline:**
+**Outline (no implementation yet):**
 
-- **M0 — Spike (2 read-only tools):** `[x]` done — shipped via PR #14 (merged 2026-09-11): `search` + `get_video` behind `mcp-handler` v2 at `src/app/mcp/route.ts` (stateless Streamable HTTP, `runtime = "nodejs"`, $0 no Redis), delegating to existing REST handlers with same envelope/cursor/TTLs; 550 unit tests + e2e PASS on live upstream.
+- **M0 — Spike (2 read-only tools):** `search` + `videos/:id` behind the
+  adapter; same envelope/cursor (`DX_PRINCIPLES.md`) and TTLs (`CACHING.md`).
 - **M1 — Read parity per group:** one tool per remaining read group
   (related/comments/transcript, channels, playlists, music, feeds — M0 tools not duplicated); POST `batch` stays out.
 - **M2 — Harden:** rate-limit + `X-Request-Id` propagation, read-only auth story (no per-user OAuth writes, per gate #4),
