@@ -163,14 +163,26 @@ describe("mcp search tool (mocked upstream)", () => {
     expect(typeof body.error.hint).toBe("string");
   });
 
-  test("limit clamps to [1, 50] instead of erroring", async () => {
-    const hi = (await callTool("search", {
+  test("limit above 50 clamps to 50 instead of erroring", async () => {
+    const many: SearchDeps = {
+      runSearch: async (q) =>
+        fakeSearch([
+          Array.from({ length: 60 }, (_, i) =>
+            node(`${q}-${i + 1}`, `T${i + 1}`),
+          ),
+        ]),
+      continueSearch: async (s) => s.getContinuation(),
+    };
+    const wide = buildMcpHandler({ search: many, video: videoDeps });
+    const hi = (await callToolWith(wide, "search", {
       q: "clamp-hi",
       limit: 200,
     })) as RpcOk;
-    // 200 clamps to 50: all 3 mocked items still served, no invalid_limit.
-    expect(envelopeOf(hi.result).data).toHaveLength(3);
+    // 200 clamps to 50: exactly 50 of the 60 mocked items served.
+    expect(envelopeOf(hi.result).data).toHaveLength(50);
+  });
 
+  test("limit below 1 clamps to 1 instead of erroring", async () => {
     const lo = (await callTool("search", {
       q: "clamp-lo",
       limit: 0,
