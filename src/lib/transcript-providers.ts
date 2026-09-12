@@ -513,8 +513,23 @@ function retryAfterOf(res: Awaited<ReturnType<FetchLike>>): number | undefined {
     if (typeof raw !== "string") {
       return undefined;
     }
-    const n = Number(raw.trim());
-    return Number.isFinite(n) && n >= 0 ? Math.round(n) : undefined;
+    const trimmed = raw.trim();
+    // Empty/blank carries no delay: fall through to the 60s default
+    // (Number("") is 0, which must never become retry-immediately).
+    if (trimmed === "") {
+      return undefined;
+    }
+    const delay = Number(trimmed);
+    if (Number.isFinite(delay) && delay >= 0) {
+      return Math.round(delay);
+    }
+    // Otherwise an HTTP-date: remaining whole seconds until then, clamped
+    // at 0 (a past date is retry-now, not a negative header).
+    const when = Date.parse(trimmed);
+    if (!Number.isNaN(when)) {
+      return Math.max(0, Math.round((when - Date.now()) / 1000));
+    }
+    return undefined;
   } catch {
     return undefined;
   }

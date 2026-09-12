@@ -1021,6 +1021,74 @@ describe("review fixes", () => {
     expect((await res.json()).error.code).toBe("rate_limited");
   });
 
+  test("Retry-After: empty/blank/garbage fall back to the 60s default", async () => {
+    for (const retryAfter of ["", "   ", "soon"]) {
+      const { fetchFn } = makeFetch(() => ({
+        ok: false,
+        status: 429,
+        jsonBody: {},
+        retryAfter,
+      }));
+      const err = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+        fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
+        fetchFn,
+      }).then(
+        () => {
+          throw new Error("must reject");
+        },
+        (e: unknown) => e,
+      );
+      expect(classifyTranscriptError(err)).toMatchObject({
+        code: "rate_limited",
+        status: 429,
+        retryAfter: 60,
+      });
+    }
+  });
+
+  test("Retry-After: HTTP-date becomes remaining seconds, clamped at 0", async () => {
+    const future = new Date(Date.now() + 45_000).toUTCString();
+    const futureFetch = makeFetch(() => ({
+      ok: false,
+      status: 429,
+      jsonBody: {},
+      retryAfter: future,
+    }));
+    const futureErr = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+      fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
+      fetchFn: futureFetch.fetchFn,
+    }).then(
+      () => {
+        throw new Error("must reject");
+      },
+      (e: unknown) => e,
+    );
+    const classified = classifyTranscriptError(futureErr);
+    expect(classified.code).toBe("rate_limited");
+    expect(classified.retryAfter).toBeGreaterThan(0);
+    expect(classified.retryAfter).toBeLessThanOrEqual(45);
+
+    const pastFetch = makeFetch(() => ({
+      ok: false,
+      status: 429,
+      jsonBody: {},
+      retryAfter: "Sun, 06 Nov 1994 08:49:37 GMT",
+    }));
+    const pastErr = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+      fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
+      fetchFn: pastFetch.fetchFn,
+    }).then(
+      () => {
+        throw new Error("must reject");
+      },
+      (e: unknown) => e,
+    );
+    expect(classifyTranscriptError(pastErr)).toMatchObject({
+      code: "rate_limited",
+      retryAfter: 0,
+    });
+  });
+
   test("transient 5xx with video-scoped body falls through; cold miss is 502", async () => {
     const { fetchFn } = makeFetch((url) => {
       if (url.includes("kome.ai")) {
