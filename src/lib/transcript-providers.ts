@@ -7,7 +7,11 @@
 // switch. Pure fetch-based helpers (no server-only imports) stay
 // unit-testable; callers inject fetchNative/fetchFn in tests.
 
-import { classifyTranscriptError, type TranscriptSegmentDTO } from "./mappers";
+import {
+  classifyTranscriptError,
+  isUpstreamTimeout,
+  type TranscriptSegmentDTO,
+} from "./mappers";
 
 export type TranscriptProviderKind = "native" | "json" | "vtt" | "text";
 
@@ -475,6 +479,75 @@ export interface TranscriptWaterfallResult {
 const VIDEO_SCOPED =
   /video.{0,40}(private|deleted|removed|unavailable|not found)|(private|deleted|removed|unavailable|not found).{0,40}video/i;
 
+/** Transient upstreams keep their status (never transcript_unavailable). */
+function isTransientStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+/**
+ * Status-preserving provider HTTP error: the classifier maps the carried
+ * `status` (429 -> rate_limited with Retry-After, 5xx -> 502
+ * upstream_degraded) instead of a misleading 404 transcript_unavailable.
+ */
+function httpError(name: string, status: number, retryAfter?: number): Error {
+  const err = new Error(`${name} upstream responded with status ${status}`);
+  (err as { status?: number }).status = status;
+  if (retryAfter !== undefined) {
+    (err as { retryAfter?: number }).retryAfter = retryAfter;
+  }
+  return err;
+}
+
+/** Upstream Retry-After seconds when the response carries a parseable one. */
+function retryAfterOf(res: Awaited<ReturnType<FetchLike>>): number | undefined {
+  const headers = (res as { headers?: unknown }).headers;
+  if (typeof headers !== "object" || headers === null) {
+    return undefined;
+  }
+  const get = (headers as { get?: unknown }).get;
+  if (typeof get !== "function") {
+    return undefined;
+  }
+  try {
+    const raw = (get as (name: string) => unknown).call(headers, "retry-after");
+    if (typeof raw !== "string") {
+      return undefined;
+    }
+    const n = Number(raw.trim());
+    return Number.isFinite(n) && n >= 0 ? Math.round(n) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Shared !ok mapping for provider and follow-up track fetches. A definitive
+ * video_not_found short-circuits only on video-scoped wording over a
+ * definitive client error (4xx other than 429) — transient bodies never do,
+ * even when they mention the video, so fallback and stale keep working.
+ */
+function throwForHttpStatus(
+  name: string,
+  status: number,
+  detail: string,
+  retryAfter?: number,
+): never {
+  if (
+    !isTransientStatus(status) &&
+    status >= 400 &&
+    status < 500 &&
+    VIDEO_SCOPED.test(detail)
+  ) {
+    throw new Error(
+      `video_not_found: ${name} reports this video is unavailable (status ${status})`,
+    );
+  }
+  if (isTransientStatus(status)) {
+    throw httpError(name, status, retryAfter);
+  }
+  throw new Error(`transcript_unavailable: ${name} returned HTTP ${status}`);
+}
+
 /** kome's "transcripts aren't available" apology: rejected, never emitted. */
 const KOME_APOLOGY =
   /transcripts?\s+(are|is)n'?t\s+available|no\s+transcript\s+available|transcript.{0,60}(unavailable|disabled)|sorry.{0,40}transcript/i;
@@ -536,6 +609,54 @@ function trackLangOf(track: unknown): string | undefined {
     }
   }
   return undefined;
+}
+
+/**
+ * Raw language tag (any type): distinguishes untagged (absent) from
+ * malformed (present but non-string). Malformed tags are dropped before
+ * track selection, never served as a guessed language.
+ */
+function trackTagOf(track: unknown): unknown {
+  if (typeof track !== "object" || track === null) {
+    return undefined;
+  }
+  const t = track as Record<string, unknown>;
+  for (const key of ["lang", "language", "code", "languageCode"]) {
+    const v = t[key];
+    if (v !== undefined) {
+      return v;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Resolve a provider-listed track URL against the listing endpoint. Same
+ * origin + https only: the follow-up fetch is server-side, so an arbitrary
+ * third-party URL (compromised listing, odd CDN) is rejected as a provider
+ * failure and the chain falls through — never fetched, never a 500.
+ */
+function resolveTrackUrl(
+  name: string,
+  trackUrl: string,
+  endpoint: string,
+): string {
+  let absolute: URL;
+  let base: URL;
+  try {
+    absolute = new URL(trackUrl, endpoint);
+    base = new URL(endpoint);
+  } catch {
+    throw new Error(
+      `transcript_unavailable: ${name} returned an unexpected response shape`,
+    );
+  }
+  if (absolute.protocol !== "https:" || absolute.hostname !== base.hostname) {
+    throw new Error(
+      `transcript_unavailable: ${name} returned an unexpected response shape`,
+    );
+  }
+  return absolute.toString();
 }
 
 function trackContentOf(track: unknown): string | undefined {
@@ -630,21 +751,16 @@ async function runHttpProvider(
   const res = await fetchFn(endpoint, init);
   if (!res.ok) {
     // A bare 4xx is transcript-scoped (never video_not_found): only
-    // video-scoped wording short-circuits the chain (and skips stale).
+    // video-scoped wording over a definitive 4xx short-circuits the chain
+    // (and skips stale); transient 429/5xx keep their status and fall
+    // through to the next provider.
     let detail = "";
     try {
       detail = await res.text();
     } catch {
       detail = "";
     }
-    if (VIDEO_SCOPED.test(detail)) {
-      throw new Error(
-        `video_not_found: ${def.name} reports this video is unavailable (status ${res.status})`,
-      );
-    }
-    throw new Error(
-      `transcript_unavailable: ${def.name} returned HTTP ${res.status}`,
-    );
+    throwForHttpStatus(def.name, res.status, detail, retryAfterOf(res));
   }
   if (def.kind === "vtt") {
     // Remaining step budget for the follow-up track fetch: the first fetch
@@ -708,9 +824,20 @@ async function runVttPayload(
   }
   // Best-effort track selection: the requested language track when tagged,
   // else the first available track (untagged tracks keep their order).
-  const tagged = tracks.filter((t) => trackLangOf(t) !== undefined);
+  // Malformed non-string tags are dropped first (mirroring filterByLang);
+  // when nothing well-formed remains the provider counts as empty.
+  const usable = tracks.filter((t) => {
+    const tag = trackTagOf(t);
+    return tag === undefined || typeof tag === "string";
+  });
+  if (usable.length === 0) {
+    throw new Error(
+      `transcript_unavailable: ${def.name} returned no transcript segments`,
+    );
+  }
+  const tagged = usable.filter((t) => trackLangOf(t) !== undefined);
   const match = tagged.find((t) => langMatches(trackLangOf(t) as string, lang));
-  const selected = match ?? tracks[0];
+  const selected = match ?? usable[0];
   const inline = trackContentOf(selected);
   let cues: RawCue[];
   if (inline !== undefined) {
@@ -722,18 +849,22 @@ async function runVttPayload(
         `transcript_unavailable: ${def.name} returned no transcript segments`,
       );
     }
-    let absolute = trackUrl;
-    try {
-      absolute = new URL(trackUrl, endpoint).toString();
-    } catch {
-      absolute = trackUrl;
-    }
+    const absolute = resolveTrackUrl(def.name, trackUrl, endpoint);
     const trackRes = await fetchFn(absolute, {
       signal: AbortSignal.timeout(remainingStepMs()),
     });
     if (!trackRes.ok) {
-      throw new Error(
-        `transcript_unavailable: ${def.name} returned HTTP ${trackRes.status}`,
+      let detail = "";
+      try {
+        detail = await trackRes.text();
+      } catch {
+        detail = "";
+      }
+      throwForHttpStatus(
+        def.name,
+        trackRes.status,
+        detail,
+        retryAfterOf(trackRes),
       );
     }
     const body = await trackRes.text();
@@ -769,9 +900,26 @@ async function runVttPayload(
 }
 
 /**
+ * Transient provider failures (carried 429/5xx status, timeouts/aborts):
+ * "retry later", never a definitive "no transcript".
+ */
+function isTransientError(err: unknown): boolean {
+  if (typeof err === "object" && err !== null) {
+    const status = (err as Record<string, unknown>).status;
+    if (typeof status === "number" && isTransientStatus(status)) {
+      return true;
+    }
+  }
+  return isUpstreamTimeout(err);
+}
+
+/**
  * First non-empty success wins; empty / language-mismatch / apology-text
  * counts as failure and falls through. Disabled or key-missing entries are
  * skipped silently. A definitive video_not_found short-circuits (never stale).
+ * On total failure the first transient error wins over earlier
+ * transcript-scoped ones (a rate-limit/outage means "retry", never a
+ * misleading 404); otherwise the first error stands.
  */
 export async function runTranscriptWaterfall(
   id: string,
@@ -784,6 +932,7 @@ export async function runTranscriptWaterfall(
   const env = deps.env ?? process.env;
   const started = now();
   let firstErr: unknown = null;
+  let firstTransientErr: unknown = null;
   for (const def of providers) {
     if (!def.enabled) {
       continue;
@@ -796,6 +945,7 @@ export async function runTranscriptWaterfall(
       const err = new Error(`Upstream timed out after ${budgetMs}ms`);
       err.name = "TimeoutError";
       firstErr ??= err;
+      firstTransientErr ??= err;
       break;
     }
     const stepMs = Math.min(def.timeoutMs, remaining);
@@ -819,7 +969,13 @@ export async function runTranscriptWaterfall(
         throw err;
       }
       firstErr ??= err;
+      if (isTransientError(err)) {
+        firstTransientErr ??= err;
+      }
     }
+  }
+  if (firstTransientErr) {
+    throw firstTransientErr;
   }
   if (firstErr) {
     throw firstErr;

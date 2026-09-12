@@ -129,18 +129,32 @@ async function localWithTimeout<T>(
 /**
  * Default overall-budget wrapper. Lazily imports the server-only singleton
  * (keeps this module importable without it); outside a server context the
- * import throws and the local race applies the budget instead.
+ * import throws and the local race applies the budget instead. The loader is
+ * injectable so unit tests cover both branches without importing the
+ * server-only singleton (that import stalls ~20s under bun before throwing).
  */
-async function defaultWithTimeout<T>(
+export type WithTimeoutLoader = () => Promise<{
+  withTimeout: <T>(
+    task: (signal: AbortSignal) => Promise<T>,
+    ms?: number,
+  ) => Promise<T>;
+}>;
+
+export async function defaultWithTimeout<T>(
   task: (signal: AbortSignal) => Promise<T>,
   ms: number,
+  load: WithTimeoutLoader = () => import("@/lib/youtube"),
 ): Promise<T> {
+  let lib: Awaited<ReturnType<WithTimeoutLoader>>;
   try {
-    const { withTimeout } = await import("@/lib/youtube");
-    return withTimeout(task, ms);
+    // Scoped to the dynamic import ONLY: a waterfall rejection must
+    // propagate as-is. Catching it here would re-run the whole waterfall
+    // under the local budget (double upstream calls, double the 8s budget).
+    lib = await load();
   } catch {
     return localWithTimeout(task, ms);
   }
+  return lib.withTimeout(task, ms);
 }
 
 /** Cached transcript payload: the provider rides in the cached value (not a

@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { NextRequest } from "next/server";
-import { handleTranscript } from "../../app/api/v1/videos/[id]/transcript/route";
+import {
+  defaultWithTimeout,
+  handleTranscript,
+} from "../../app/api/v1/videos/[id]/transcript/route";
 import { cacheGet, cacheSet, clearCache } from "../cache";
 import { classifyTranscriptError } from "../mappers";
 import {
@@ -29,10 +32,11 @@ interface StubResponse {
   jsonBody?: unknown;
   textBody?: string;
   jsonThrows?: boolean;
+  retryAfter?: string;
 }
 
 function stubRes(s: StubResponse): Awaited<ReturnType<FetchLike>> {
-  return {
+  const res: Awaited<ReturnType<FetchLike>> = {
     ok: s.ok,
     status: s.status,
     json: async () => {
@@ -43,6 +47,14 @@ function stubRes(s: StubResponse): Awaited<ReturnType<FetchLike>> {
     },
     text: async () => s.textBody ?? JSON.stringify(s.jsonBody ?? null),
   };
+  if (s.retryAfter !== undefined) {
+    const retryAfter = s.retryAfter;
+    (res as { headers?: unknown }).headers = {
+      get: (name: string) =>
+        name.toLowerCase() === "retry-after" ? retryAfter : null,
+    };
+  }
+  return res;
 }
 
 interface CallLog {
@@ -920,5 +932,214 @@ describe("follow-up edge cases", () => {
       | Record<string, string>
       | undefined;
     expect(headers?.["x-api-key"]).toBe("secret-key");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round-1 review fixes: single-run budget, transient status preservation,
+// malformed track tags, and track-URL validation.
+// ---------------------------------------------------------------------------
+
+describe("review fixes", () => {
+  test("defaultWithTimeout: import failure falls back to the local budget", async () => {
+    let runs = 0;
+    const out = await defaultWithTimeout(
+      async () => {
+        runs += 1;
+        return "ok";
+      },
+      1000,
+      async () => {
+        throw new Error("Cannot find module '@/lib/youtube'");
+      },
+    );
+    expect(out).toBe("ok");
+    expect(runs).toBe(1);
+  });
+
+  test("defaultWithTimeout: waterfall rejection propagates without re-running", async () => {
+    let runs = 0;
+    const failure = new Error("transcript_unavailable: nothing anywhere");
+    const err = await defaultWithTimeout(
+      async () => {
+        runs += 1;
+        throw failure;
+      },
+      1000,
+      async () => ({
+        withTimeout: async <T>(task: (signal: AbortSignal) => Promise<T>) =>
+          task(AbortSignal.timeout(1000)),
+      }),
+    ).then(
+      () => {
+        throw new Error("must reject");
+      },
+      (e: unknown) => e,
+    );
+    expect(err).toBe(failure);
+    expect(runs).toBe(1);
+  });
+
+  test("429 keeps rate_limited + Retry-After instead of 404", async () => {
+    const { fetchFn } = makeFetch(() => ({
+      ok: false,
+      status: 429,
+      jsonBody: {},
+      retryAfter: "120",
+    }));
+    const err = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+      fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
+      fetchFn,
+    }).then(
+      () => {
+        throw new Error("must reject");
+      },
+      (e: unknown) => e,
+    );
+    expect(classifyTranscriptError(err)).toMatchObject({
+      code: "rate_limited",
+      status: 429,
+      retryAfter: 120,
+    });
+  });
+
+  test("route: all-429 cold miss is 429 with a Retry-After header", async () => {
+    const id = "Ff000000429";
+    const { fetchFn } = makeFetch(() => ({
+      ok: false,
+      status: 429,
+      jsonBody: {},
+      retryAfter: "120",
+    }));
+    const res = await handleTranscript(
+      req(`http://x/api/v1/videos/${id}/transcript`),
+      id,
+      { fetchNative: nativeThrow(GET_TRANSCRIPT_400.message), fetchFn },
+    );
+    expect(res.status).toBe(429);
+    expect(res.headers.get("Retry-After")).toBe("120");
+    expect((await res.json()).error.code).toBe("rate_limited");
+  });
+
+  test("transient 5xx with video-scoped body falls through; cold miss is 502", async () => {
+    const { fetchFn } = makeFetch((url) => {
+      if (url.includes("kome.ai")) {
+        return { ok: true, status: 200, jsonBody: KOME_FIXTURE };
+      }
+      return {
+        ok: false,
+        status: 503,
+        jsonBody: {},
+        textBody: "This video is unavailable right now",
+      };
+    });
+    const out = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+      fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
+      fetchFn,
+    });
+    expect(out.provider).toBe("kome");
+
+    const allDown: FetchLike = async () =>
+      stubRes({
+        ok: false,
+        status: 503,
+        jsonBody: {},
+        textBody: "This video is unavailable right now",
+      });
+    const err = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+      fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
+      fetchFn: allDown,
+    }).then(
+      () => {
+        throw new Error("must reject");
+      },
+      (e: unknown) => e,
+    );
+    expect(classifyTranscriptError(err)).toMatchObject({
+      code: "upstream_degraded",
+      status: 502,
+    });
+  });
+
+  test("malformed non-string track tags are dropped before selection", async () => {
+    const { fetchFn } = makeFetch((url) => {
+      if (url.includes("/api/subtitles")) {
+        return {
+          ok: true,
+          status: 200,
+          jsonBody: {
+            tracks: [
+              {
+                lang: 42,
+                vttContent:
+                  "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nMALFORMED",
+              },
+              { lang: "en", vttContent: VTT_SAMPLE },
+            ],
+          },
+        };
+      }
+      return { ok: false, status: 422, jsonBody: {} };
+    });
+    // Requested French is untagged anywhere: the malformed first track is
+    // dropped, so the well-formed English track serves (never MALFORMED).
+    const out = await runTranscriptWaterfall("dQw4w9WgXcQ", "fr", {
+      fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
+      fetchFn,
+    });
+    expect(out.provider).toBe("youtube-transcript-ai");
+    expect(out.segments).toEqual([
+      { startSeconds: 1.5, durationSeconds: 2.5, text: "Hello world" },
+      { startSeconds: 6.25, durationSeconds: 2.5, text: "Second line" },
+    ]);
+  });
+
+  test("all-malformed track list counts as empty and falls through", async () => {
+    const { fetchFn } = makeFetch((url) => {
+      if (url.includes("/api/subtitles")) {
+        return {
+          ok: true,
+          status: 200,
+          jsonBody: { tracks: [{ lang: 42, vttUrl: "/dl/xx.vtt" }] },
+        };
+      }
+      if (url.includes("kome.ai")) {
+        return { ok: true, status: 200, jsonBody: KOME_FIXTURE };
+      }
+      return { ok: false, status: 422, jsonBody: {} };
+    });
+    const out = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+      fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
+      fetchFn,
+    });
+    expect(out.provider).toBe("kome");
+  });
+
+  test("off-origin and http track URLs are never fetched", async () => {
+    const { fetchFn, calls } = makeFetch((url) => {
+      if (url.includes("/api/subtitles")) {
+        return {
+          ok: true,
+          status: 200,
+          jsonBody: {
+            tracks: [
+              { lang: "en", vttUrl: "https://evil.example/x.vtt" },
+              { lang: "en", vttUrl: "http://youtube-transcript.ai/x.vtt" },
+            ],
+          },
+        };
+      }
+      if (url.includes("kome.ai")) {
+        return { ok: true, status: 200, jsonBody: KOME_FIXTURE };
+      }
+      return { ok: false, status: 422, jsonBody: {} };
+    });
+    const out = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+      fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
+      fetchFn,
+    });
+    // The untrusted listing fails the provider; the chain falls through.
+    expect(out.provider).toBe("kome");
+    expect(calls.map((c) => c.url).join(" ")).not.toContain("evil.example");
   });
 });
