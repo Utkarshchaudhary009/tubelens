@@ -86,6 +86,79 @@ say, and what is spoken.
 > may add OPTIONAL free-tier DB persist (Neon free / Upstash free / R2 free
 > tier) — not before its gate in `NEED_TO_THINK.md`. TTLs in `CACHING.md`.
 
+> **Transcript provider registry (dictionary-driven — adding a provider is one
+> dict entry, no route edits):** the route chains the ordered
+> `TRANSCRIPT_PROVIDERS` dict below (Innertube fast path first, then the
+> `youtube-cli` `doc/plan.md:28-35` waterfall). Each entry declares everything
+> the generic runner needs — request, parse mapping, lang handling, budget,
+> key, and kill switch — so a new source never touches
+> `videos/[id]/transcript/route.ts`.
+>
+> | # | name (warning tag) | kind | request | parse → `TranscriptSegmentDTO[]` | lang handling | key / enabled |
+> | - | ------------------ | ---- | ------- | -------------------------------- | ------------- | ------------- |
+> | 0 | `innertube` (fast path, absent tag) | native | `getInfo(id).getTranscript()` via singleton | `mapTranscriptInfo()` | track-agnostic (no kind filter) | always on |
+> | 1 | `yttools` | `json` | `GET https://yttools.co/api/transcript?url=<watch url>&lang=<lang>` | `{transcript: [{text, offset(ms), duration(ms), lang}]}` → ms/1000 round3 | strict: all-tagged-but-none-match = failure (fall through); untagged kept, malformed non-string dropped | always on |
+> | 2 | `youtube-transcript-ai` | `vtt` | `GET /api/subtitles?v=<id>` | tracks `{vttContent/vttUrl/json3Url}` → VTT/json3 parse | best-effort: requested track, else first available | always on |
+> | 3 | `kome` | `text` | `POST /api/transcript {video_id: <full url>, format: true}` + `origin: https://kome.ai` | `{transcript: "<plain text>"}` → single zero-timestamp segment (dedupe); apology text rejected, never emitted | language-agnostic plain text | always on |
+> | 4 | `supadata` | `json` | `GET /v1/youtube/transcript?url=...` + `x-api-key: $SUPADATA_API_KEY` (Whisper fallback for caption-less videos) | provider JSON → shared normalize | best-effort | `apiKeyEnv: "SUPADATA_API_KEY"`; skipped when unset |
+>
+> ```ts
+> type TranscriptProviderKind = "native" | "json" | "vtt" | "text";
+> interface TranscriptProviderDef {
+>   name: string;                    // stable id, surfaced in `fallback_source` warning
+>   kind: TranscriptProviderKind;    // which shared parser runs (native fast path | json path | VTT/json3 | plain text)
+>   method: "GET" | "POST";
+>   url: (id: string, lang: string) => string;
+>   params?: (id: string, lang: string) => Record<string, string>;
+>   body?: (id: string, lang: string) => unknown;
+>   headers?: Record<string, string> | ((id: string) => Record<string, string>);
+>   parse: { segmentsPath?: string; textField: string; offsetField: string; durationField: string };
+>   lang: "strict" | "best-effort";  // strict = mismatch fails over; best-effort = first available
+>   timeoutMs: number;               // per-provider cap, clamped to remaining overall budget
+>   apiKeyEnv?: string;              // when set, entry is skipped if `process.env[apiKeyEnv]` is unset
+>   enabled: boolean;                // per-provider kill switch, no route edit to flip
+> }
+> const TRANSCRIPT_PROVIDERS: TranscriptProviderDef[] = [ /* one entry per table row above */ ];
+> ```
+>
+> - **Ordering / fallback chaining:** array order is chain order
+>   (`innertube → yttools → youtube-transcript-ai → kome → supadata`); first
+>   non-empty success wins; empty / language-mismatch / apology-text counts as
+>   failure and falls through to the next enabled entry; disabled or
+>   key-missing entries are skipped silently.
+> - **Timeouts (remaining-budget):** one overall 8s fail-fast budget
+>   (`AbortSignal.timeout(8000)`, route checklist) wraps fast-path + chain
+>   combined — never stacked per-step budgets; each provider runs with
+>   `min(timeoutMs, remainingMs)` and fails fast/independently.
+> - **Shared helpers:** `normalizeSegments()` (ms→s round3, drop empty text /
+>   negative offsets, plain-text → zero-timestamp deduped segment) and
+>   `filterByLang()` (case/`_`/`-`-insensitive prefix match; untagged/blank
+>   kept, malformed non-string dropped) run for every `json`/`vtt` entry.
+> - **Typed errors:** `video_not_found` only on video-scoped wording
+>   (`video … private|deleted|removed|unavailable|not found` or reverse) —
+>   short-circuits the chain and must NOT serve stale; bare provider 4xx is
+>   transcript-scoped (`transcript_unavailable`); timeouts/429s/5xx are
+>   transient (stale-eligible). Mapped via `classifyTranscriptError()`, never a
+>   bare 500 — cold-miss failures return a `code` + one-sentence `hint`.
+> - **Cache key + attribution:** key `transcript:v1:{id}:{lang}` (lang is part
+>   of the key); provider persists in the cached value
+>   (`{segments, provider?}`) so hits/joins keep `warnings:
+>   [{code: "fallback_source", message: "… via ${provider}"}]` (plus
+>   `stale_served` when stale); absent provider = Innertube fast path.
+> - **Tests:** one fixture test per provider (response → normalize → lang
+>   filter), plus a contract test (every def has
+>   name/kind/method/url/parse/lang/timeoutMs/enabled; new entry needs no
+>   route edit) and waterfall tests (order, fallback on failure, disabled /
+>   key-unset skip, `video_not_found` short-circuit, kome apology rejection).
+> - **Caching TTLs (unchanged):** aggressive per `CACHING.md` —
+>   `s-maxage=86400` + SWR `86400`, L0 fresh 24h + stale 24h,
+>   cache-first + serve-stale-on-error, never live-only; empty results throw
+>   so they never populate the cache.
+> - **Envelope/headers (unchanged):** `{data, page: {next: null}, meta,
+>   warnings}` per `DX_PRINCIPLES.md`; `X-Request-Id` (+ `meta.requestId`) and
+>   `X-RateLimit-*` on every response; 429s carry `Retry-After` +
+>   `code: rate_limited`.
+
 **Exit criteria / validate before Phase 3:**
 - Watch-page demo renders related + comments + transcript from API alone.
 - `transcript` succeeds on videos with auto-captions and returns a clear
