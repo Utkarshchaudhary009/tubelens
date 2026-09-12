@@ -1068,6 +1068,36 @@ describe("review fixes", () => {
     expect(classified.retryAfter).toBeGreaterThan(0);
     expect(classified.retryAfter).toBeLessThanOrEqual(45);
 
+    // Fractional remainder never advertises an early retry: with the clock
+    // pinned 600ms past a second boundary, now+2500ms truncates on the wire
+    // to a 2.4s remainder — ceil advertises 3 where round would have said 2.
+    const realNow = Date.now;
+    const pinned = 1_700_000_000_600;
+    Date.now = () => pinned;
+    try {
+      const fracFetch = makeFetch(() => ({
+        ok: false,
+        status: 429,
+        jsonBody: {},
+        retryAfter: new Date(pinned + 2500).toUTCString(),
+      }));
+      const fracErr = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+        fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
+        fetchFn: fracFetch.fetchFn,
+      }).then(
+        () => {
+          throw new Error("must reject");
+        },
+        (e: unknown) => e,
+      );
+      expect(classifyTranscriptError(fracErr)).toMatchObject({
+        code: "rate_limited",
+        retryAfter: 3,
+      });
+    } finally {
+      Date.now = realNow;
+    }
+
     const pastFetch = makeFetch(() => ({
       ok: false,
       status: 429,

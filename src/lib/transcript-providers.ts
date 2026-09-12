@@ -524,10 +524,12 @@ function retryAfterOf(res: Awaited<ReturnType<FetchLike>>): number | undefined {
       return Math.round(delay);
     }
     // Otherwise an HTTP-date: remaining whole seconds until then, clamped
-    // at 0 (a past date is retry-now, not a negative header).
+    // at 0 (a past date is retry-now, not a negative header). Ceiling, not
+    // rounding: a fractional remainder must never advertise a retry time
+    // before the date the upstream named.
     const when = Date.parse(trimmed);
     if (!Number.isNaN(when)) {
-      return Math.max(0, Math.round((when - Date.now()) / 1000));
+      return Math.max(0, Math.ceil((when - Date.now()) / 1000));
     }
     return undefined;
   } catch {
