@@ -29,10 +29,12 @@ const defaultDeps: HealthDeps = {
 // skips only the limiter check (context creation, request ids, and headers
 // still apply). This option exists ONLY for liveness — never for data
 // routes, which must always face rate-limit/quota enforcement; the pipeline
-// enforces that invariant by path. Accepted risk is bounded at the origin:
-// the probe response carries CACHE_CONTROL.health (`public, s-maxage=60`),
-// so CDN caching limits upstream session checks to roughly one origin hit
-// per minute.
+// enforces that invariant by path. Accepted risk is bounded at the origin
+// by CDN caching: ready probes carry CACHE_CONTROL.health
+// (`public, s-maxage=60`, roughly one origin hit per minute), while the
+// degraded path carries CACHE_CONTROL.healthDegraded (`s-maxage=10`,
+// roughly six origin hits per minute during a sustained outage, each
+// possibly hitting the 8s upstream timeout).
 export async function GET(req: NextRequest) {
   return withRequestContext(
     async (_r, ctx) => handleHealth(ctx.requestId, defaultDeps),
