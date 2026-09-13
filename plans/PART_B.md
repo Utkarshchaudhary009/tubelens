@@ -11,6 +11,8 @@ Part B is the product/account platform layer that sits between the completed RES
 - **Datadog** — backend observability: traces/APM, structured logs, metrics, error monitoring, service health, latency, and infrastructure correlation.
 - **Vercel** — application/runtime deployment.
 
+> **Plans/tiers source of truth:** see [`PLANS_AND_USAGE.md`](./PLANS_AND_USAGE.md) for the canonical Free/default tier, future tier definitions, Clerk session-token claim, tier-management endpoint, weighted credits, quota semantics, and audit/accounting model. Do not duplicate those policies in individual phases.
+
 > **Deferred:** PostHog is intentionally not part of Part B. Add PostHog after the UI/marketing/product surface exists, when funnels, feature adoption, experiments, and user-journey analytics become more valuable.
 
 > **Architecture rule:** authentication, authorization, rate limiting, quota, observability, durable product state, and transcript caching are separate concerns. Datadog is observability, not the source of truth for security/billing/usage. Redis is not the durable product database. Do not introduce Postgres merely to persist cache entries that can remain in CDN/in-memory storage.
@@ -113,6 +115,7 @@ Part B is the product/account platform layer that sits between the completed RES
 **Goal:** separate short-term rate limiting from durable product usage and prepare for pricing without hard-coding a billing system.
 
 **Implementation:**
+- Follow [`PLANS_AND_USAGE.md`](./PLANS_AND_USAGE.md) as the source of truth for tiers, the default Free policy, weighted-credit definitions, usage windows, and audit/accounting semantics.
 - Define plans/entitlements independently from Clerk user records.
 - Use **weighted credits/units instead of raw request count** so quota reflects the actual cost/value of operations.
 - **Credit: Utkarsh's weighted-credit model idea** — TubeLens should meter API consumption with a common credit system, where cheap and expensive operations consume different numbers of credits.
@@ -200,7 +203,7 @@ Part B is the product/account platform layer that sits between the completed RES
 **Implementation:**
 - Developer account area backed by Clerk identity.
 - API-key creation, listing, rotation, and revocation using Clerk-backed credentials.
-- Current plan and entitlement display.
+- Current plan and entitlement display; follow [`PLANS_AND_USAGE.md`](./PLANS_AND_USAGE.md) for tier names and semantics.
 - Quota/usage summary and reset information.
 - Recent request/usage summary where durable data is available.
 - Clear rate-limit and quota error explanations.
@@ -219,7 +222,7 @@ A developer can sign in, create a credential, make an API request, see usage, un
 **Implementation:**
 - Define an authorization matrix for read vs write operations.
 - Establish role/permission checks at the resource/service boundary, not only in UI code.
-- Add an audit-event model for security-sensitive mutations such as credential creation/revocation and future posting actions.
+- Add an audit-event model for security-sensitive mutations as defined in [`PLANS_AND_USAGE.md`](./PLANS_AND_USAGE.md), including credential lifecycle and tier changes.
 - Add idempotency requirements for future POST operations where retries could duplicate effects.
 - Define CSRF/origin requirements for browser-authenticated mutation endpoints.
 - Separate user-generated content from observability telemetry.
@@ -259,6 +262,7 @@ A developer can sign in, create a credential, make an API request, see usage, un
 - Redis outage follows the documented safety policy;
 - Postgres restart/reconnect preserves durable product state where Postgres is enabled;
 - API key creation/revocation reflected in authorization;
+- tier change through the admin endpoint is reflected in authoritative entitlements and eventually in the session claim;
 - no credential leakage into logs or telemetry;
 - existing Part A REST regression suite remains green.
 
