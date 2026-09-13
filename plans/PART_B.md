@@ -7,13 +7,13 @@ Part B is the product/account platform layer that sits between the completed RES
 **Primary systems:**
 - **Clerk** — user identity, sessions, API keys, organizations/roles where needed, and machine authentication.
 - **Upstash Redis** — distributed rate limiting, short-lived counters, abuse controls, and optional ephemeral usage state.
-- **Postgres** — durable product data: plans, entitlements, API-key/product metadata, usage summaries, audit records, and future posting-related state. Clerk remains authoritative for Clerk-managed credentials.
-- **Datadog** — backend observability: traces/APM, structured logs, metrics, error monitoring, service health, latency, and infrastructure correlation. Datadog's current Next.js integration supports the App Router and can correlate frontend RUM with backend traces/logs; server-side Node instrumentation uses `dd-trace`. citeturn164837search0turn164837search1
+- **Postgres** — durable product data only: plans, entitlements, durable usage summaries/ledger data, audit records, project metadata, and future posting-related state. **Postgres is not the default transcript cache.** Part A transcript caching remains CDN + in-memory by default; a durable transcript store is a separate, explicitly gated decision.
+- **Datadog** — backend observability: traces/APM, structured logs, metrics, error monitoring, service health, latency, and infrastructure correlation.
 - **Vercel** — application/runtime deployment.
 
 > **Deferred:** PostHog is intentionally not part of Part B. Add PostHog after the UI/marketing/product surface exists, when funnels, feature adoption, experiments, and user-journey analytics become more valuable.
 
-> **Architecture rule:** authentication, authorization, rate limiting, quota, observability, and durable product state are separate concerns. Datadog is observability, not the source of truth for security/billing/usage. Redis is not the durable product database.
+> **Architecture rule:** authentication, authorization, rate limiting, quota, observability, durable product state, and transcript caching are separate concerns. Datadog is observability, not the source of truth for security/billing/usage. Redis is not the durable product database. Do not introduce Postgres merely to persist cache entries that can remain in CDN/in-memory storage.
 
 > **Testing rule:** local/CI E2E may run Redis, Postgres, Datadog-compatible telemetry stubs/collectors, and other required dependencies in isolated Docker containers/networks. Production architecture must not inherit test-only dependencies or state.
 
@@ -28,7 +28,7 @@ Part B is the product/account platform layer that sits between the completed RES
 - Establish explicit layers: `auth` → `authorization` → `rate-limit/quota` → `service` → `observability` → response.
 - Keep provider-specific code isolated under `src/lib/auth`, `src/lib/rate-limit`, `src/lib/observability`, and `src/lib/product`.
 - Do not put provider calls directly in individual endpoint business logic.
-- Define environment/config validation for Clerk, Redis, Datadog, and Postgres.
+- Define environment/config validation for Clerk, Redis, Datadog, and Postgres only when the feature requiring Postgres is enabled.
 - Define fail-open/fail-closed rules per dependency before implementation.
 
 **Exit criteria:**
@@ -63,10 +63,10 @@ Part B is the product/account platform layer that sits between the completed RES
 **Goal:** make TubeLens usable by scripts, backend services, and future MCP clients without tying machine access to a browser session.
 
 **Implementation:**
-- Prefer **Clerk API Keys** for developer credentials where they fit the product model. Clerk currently provides API-key creation for users/organizations and client/backend management components/hooks; use those primitives instead of inventing a parallel credential authority. citeturn226502search6turn226502search9turn226502search10
-- Define TubeLens-specific metadata around each Clerk API key: internal key reference, owner, environment/label, plan/entitlement binding, created time, last-used time, status, and optional project/application association.
-- If a future requirement cannot be satisfied by Clerk API Keys, introduce a dedicated opaque TubeLens key model only after documenting the reason; do not maintain two independent key authorities by default.
-- Never store plaintext secrets in Postgres. The application should only receive/display a newly created secret according to Clerk's supported API-key lifecycle and never persist a copy itself.
+- Prefer **Clerk API Keys** for developer credentials where they fit the product model. Clerk provides API-key creation and management for users/organizations; use those primitives instead of inventing a parallel credential authority.
+- Treat Clerk as the authoritative credential system. TubeLens stores only metadata needed for product behavior: Clerk API-key reference, owner/project, environment/label, plan binding, creation time, last-used time, and status.
+- **Do not store plaintext API-key secrets in Postgres or anywhere else.** The newly created secret is shown/returned according to Clerk's supported lifecycle and is not persisted by TubeLens.
+- Only introduce a separate TubeLens key vault/hash model if a concrete requirement cannot be satisfied by Clerk API Keys; document that decision before implementation.
 - Support immediate revocation/rotation through the authoritative credential provider.
 - Ensure API credentials work consistently with REST and remain compatible with the future Part C MCP endpoint.
 
@@ -83,7 +83,7 @@ Part B is the product/account platform layer that sits between the completed RES
 **Goal:** build a genuinely strong serverless-safe rate-limit layer rather than a per-process counter.
 
 **Implementation:**
-- Use Upstash Redis through its HTTP-based rate-limit tooling so limits work across Vercel/serverless instances. Upstash's TypeScript limiter supports identifiers, sliding windows, token buckets, request costs, analytics, and dynamic limits. citeturn226502search2turn226502search4turn226502search7turn226502search8
+- Use Upstash Redis through its HTTP-based rate-limit tooling so limits work across Vercel/serverless instances.
 - Centralize all policy in `src/lib/rate-limit/policies.ts`; routes declare cost/class, not raw algorithms.
 - Apply multiple dimensions where appropriate: anonymous IP, authenticated user, API key, organization/project, and protected endpoint class.
 - Use endpoint/request costs instead of treating every request as equal.
@@ -106,7 +106,7 @@ Part B is the product/account platform layer that sits between the completed RES
 - Burst traffic is controlled without punishing normal short bursts of legitimate use.
 - 429 responses include `Retry-After` and the existing `X-RateLimit-*` metadata.
 
-## B5 — Quota, plans, entitlements and usage accounting
+## B5 — Quota, plans, entitlements and weighted-credit accounting
 
 **Status:** `[ ]` not started.
 
@@ -114,18 +114,28 @@ Part B is the product/account platform layer that sits between the completed RES
 
 **Implementation:**
 - Define plans/entitlements independently from Clerk user records.
-- Represent usage as weighted credits/units rather than raw request count.
-- Redis handles hot-window enforcement; Postgres records data that must survive restarts or support account-level reporting.
+- Use **weighted credits/units instead of raw request count** so quota reflects the actual cost/value of operations.
+- **Credit: Utkarsh's weighted-credit model idea** — TubeLens should meter API consumption with a common credit system, where cheap and expensive operations consume different numbers of credits.
+- Example starting policy: `search=1`, `video=1`, `comments=2`, `transcript=3`, `combined=4`, and `batch=sum(subrequest costs)` with a hard ceiling. Treat these as policy defaults to validate with real traffic, not permanent pricing.
+- Redis handles hot-window enforcement and short-lived counters.
+- **Postgres is introduced only where durable product state is actually required**: plan configuration, durable usage/credit ledger or summaries, account/project metadata, audits, or future billing/posting state. It is not required merely because transcript caching exists.
+- Keep Part A transcript cache separate: CDN + in-memory remains the default; durable transcript persistence requires its own risk/cost gate.
 - Define monthly/daily windows, rollover/reset behavior, and the authoritative source for each metric.
-- Record enough durable metadata to explain why a request was accepted or denied.
+- Record enough durable metadata to explain why a request was accepted or denied when durable accounting is enabled.
 - Expose the existing `/api/v1/quota` semantics consistently for authenticated developers.
 - Make batch quota accounting deterministic and resistant to partial-request abuse.
+
+**Important distinction:**
+- **Rate limit:** "Can this principal make this request right now?" → primarily Redis.
+- **Quota/credits:** "How much of this plan's allowance has this principal consumed?" → durable accounting when required, with Redis used for fast enforcement.
+- **Cache:** "Can we avoid repeating an upstream fetch?" → Part A CDN/in-memory first; do not force Postgres into this path.
 
 **Exit criteria:**
 - A user can understand remaining allowance and reset time.
 - Rate-limit and quota decisions are reproducible from server state.
 - Usage cannot be inflated by switching credentials or deployment instances.
 - The system can later add paid plans without changing every route.
+- Postgres is not required in environments that do not enable durable product accounting.
 
 ## B6 — Datadog observability foundation
 
@@ -134,7 +144,7 @@ Part B is the product/account platform layer that sits between the completed RES
 **Goal:** make backend behavior visible enough to operate the API reliably before a full UI/product analytics stack exists.
 
 **Implementation:**
-- Integrate Datadog's current Node/Next.js tracing path using `dd-trace` for Node runtime code; keep tracing initialization isolated from application business logic. Datadog's current Next.js guidance supports Next.js 13.4+ and recommends Node-only initialization for server instrumentation. citeturn164837search1turn164837search2
+- Integrate Datadog's current Node/Next.js tracing path using `dd-trace` for Node runtime code; keep tracing initialization isolated from application business logic.
 - Add structured application logging with request ID, route, status, latency, auth type, rate-limit result, cache result, and upstream dependency context.
 - Capture traces for REST Route Handlers and important service/upstream operations.
 - Define service/environment/version tags so deploys and incidents can be correlated.
@@ -175,7 +185,7 @@ Part B is the product/account platform layer that sits between the completed RES
 **Rules:**
 - Prefer server-side operational telemetry over product-behavior analytics at this stage.
 - Use bounded/sanitized attributes instead of raw request content.
-- Correlate logs and traces using request/trace identifiers. Datadog's Node integration can automatically inject trace and service context into logs when configured through its APM instrumentation. citeturn164837search4
+- Correlate logs and traces using request/trace identifiers.
 
 **Exit criteria:**
 - An engineer can answer "what is broken?", "where?", and "since which deploy?" from Datadog without reproducing the incident locally.
@@ -247,7 +257,7 @@ A developer can sign in, create a credential, make an API request, see usage, un
 - Datadog server trace/log/metric emission;
 - Datadog outage does not break API responses;
 - Redis outage follows the documented safety policy;
-- Postgres restart/reconnect preserves durable product state;
+- Postgres restart/reconnect preserves durable product state where Postgres is enabled;
 - API key creation/revocation reflected in authorization;
 - no credential leakage into logs or telemetry;
 - existing Part A REST regression suite remains green.
@@ -264,4 +274,4 @@ A developer can sign in, create a credential, make an API request, see usage, un
 - Rollback and key-revocation procedures are tested.
 
 **Definition of done:**
-TubeLens has a production-ready identity and platform layer: users can authenticate with Clerk, machines can authenticate safely, distributed rate limits protect the API, durable quota/usage rules support future plans, Datadog provides actionable backend observability, and future posting/mutation capabilities have a secure foundation — without coupling security or billing truth to observability telemetry.
+TubeLens has a production-ready identity and platform layer: users can authenticate with Clerk, machines can authenticate safely, distributed rate limits protect the API, weighted-credit quota rules support future plans, Datadog provides actionable backend observability, and future posting/mutation capabilities have a secure foundation — without coupling security, billing, or cache truth to observability tooling or an unnecessary Postgres dependency.
