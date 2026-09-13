@@ -368,7 +368,7 @@ Part B is the platform/security layer between the completed REST API (Part A) an
 
 ## Phase 00 — Neon Postgres infrastructure for future durable state
 
-**Status:** `[ ]` not started.
+**Status:** `[~]` in progress.
 
 **Build:** Create the Neon project with branch-per-env (`dev`/`preview`/`prod`) and wire pooled + direct connection strings via env vars (`DATABASE_URL` pooled, `DATABASE_DIRECT_URL` direct for migrations). Set up Drizzle ORM with `drizzle/` schema + migrations folder and a `db:migrate` script. Add a `src/lib/db/client.ts` singleton with `import "server-only"` on the Neon serverless driver for Vercel. Define the local-dev story (Neon `dev` branch or PGlite/proxy). Add a `SELECT 1` health-check query behind the 8s fail-fast budget. Keep transcript caching out of Postgres (CDN + in-memory default). Keep all URLs/secrets in env/Vercel envs only — no plaintext credentials in the repo.
 
