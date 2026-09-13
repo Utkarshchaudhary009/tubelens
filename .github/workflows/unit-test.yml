@@ -32,7 +32,7 @@ jobs:
       - name: Find PR for branch
         id: pr
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PAT }}
         run: |
           PR_NUMBER="$(gh pr list --head "${GITHUB_REPOSITORY_OWNER}:${GITHUB_REF_NAME}" --state open --json number --jq '.[0].number')"
           if [ -z "$PR_NUMBER" ]; then
@@ -43,7 +43,7 @@ jobs:
       - name: Request CodeRabbit review
         if: steps.pr.outputs.number != ''
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PAT }}
         run: gh pr comment "${{ steps.pr.outputs.number }}" --body "@coderabbitai review"
 
       - name: Install deps
