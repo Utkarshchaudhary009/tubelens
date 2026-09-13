@@ -28,7 +28,11 @@ const defaultDeps: HealthDeps = {
 // Liveness must never be rejected by request providers: bypassRateLimit
 // skips only the limiter check (context creation, request ids, and headers
 // still apply). This option exists ONLY for liveness — never for data
-// routes, which must always face rate-limit/quota enforcement.
+// routes, which must always face rate-limit/quota enforcement; the pipeline
+// enforces that invariant by path. Accepted risk is bounded at the origin:
+// the probe response carries CACHE_CONTROL.health (`public, s-maxage=60`),
+// so CDN caching limits upstream session checks to roughly one origin hit
+// per minute.
 export async function GET(req: NextRequest) {
   return withRequestContext(
     async (_r, ctx) => handleHealth(ctx.requestId, defaultDeps),
