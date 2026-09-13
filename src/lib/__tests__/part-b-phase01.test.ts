@@ -1,7 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { NextRequest, NextResponse } from "next/server";
 import { handleHealth } from "../../app/api/v1/health/route";
 import {
+  anonymousAuthContext,
   anonymousAuthProvider,
   getAuthProvider,
   resetAuthProvider,
@@ -18,6 +19,7 @@ import {
 import { createRequestContext, withRequestContext } from "../pipeline";
 import {
   getProductPolicyProvider,
+  normalizeTier,
   resetProductPolicyProvider,
 } from "../product";
 import {
@@ -39,6 +41,16 @@ function req(url: string, requestId?: string): NextRequest {
   }
   return new NextRequest(url, { headers });
 }
+
+// Global provider swaps must never leak across tests: a failed assertion
+// mid-test must not contaminate later ones.
+afterEach(() => {
+  resetAuthProvider();
+  resetRateLimitProvider();
+  resetObservabilityProvider();
+  resetUsageRecorder();
+  resetProductPolicyProvider();
+});
 
 describe("request context (Phase 01)", () => {
   test("echoes caller X-Request-Id into typed context", async () => {
@@ -286,6 +298,10 @@ describe("review hardening (Phase 01)", () => {
       expect(pipelined.headers.get(name)).toBe(direct.headers.get(name));
     }
     expect(pipelined.headers.get("X-RateLimit-Reset")).toMatch(/^\d+$/);
+    // Success headers come from the limiter decision; the Phase 01
+    // allow-all default matches the Part A stubs.
+    expect(pipelined.headers.get("X-RateLimit-Limit")).toBe("100");
+    expect(pipelined.headers.get("X-RateLimit-Remaining")).toBe("99");
   });
 
   test("throwing auth/product providers fail safe with typed 503 JSON", async () => {
@@ -445,5 +461,127 @@ describe("review hardening (Phase 01)", () => {
     const res = await run(req("http://x/api/v1/health", "obs-1"));
     expect(res.status).toBe(200);
     expect((await res.json()).meta.requestId).toBe("obs-1");
+  });
+});
+
+describe("cubic review findings", () => {
+  test("anonymous defaults are frozen against mutation", () => {
+    expect(Object.isFrozen(anonymousAuthContext)).toBe(true);
+    expect(Object.isFrozen(anonymousAuthProvider)).toBe(true);
+    expect(() => {
+      (anonymousAuthContext as { type: string }).type = "user";
+    }).toThrow();
+    expect(anonymousAuthContext.type).toBe("anonymous");
+  });
+
+  test("normalizeTier only honors active tiers; reserved fall back to free", () => {
+    expect(normalizeTier("free")).toBe("free");
+    for (const reserved of [
+      "pro",
+      "team",
+      "enterprise",
+      "admin",
+      "",
+      null,
+      undefined,
+      42,
+    ]) {
+      expect(normalizeTier(reserved)).toBe("free");
+    }
+  });
+
+  test("unknown TUBELENS_AUTH_ENFORCEMENT fails closed, not fail-open", () => {
+    expect(() => getConfig({ TUBELENS_AUTH_ENFORCEMENT: "yes" })).toThrow(
+      ConfigError,
+    );
+    expect(getConfig({}).authEnforcement).toBe("off");
+    expect(
+      getConfig({ TUBELENS_AUTH_ENFORCEMENT: "off" }).authEnforcement,
+    ).toBe("off");
+  });
+
+  test("whitespace-only CLERK_SECRET_KEY is rejected like a missing one", () => {
+    expect(() =>
+      getConfig({
+        TUBELENS_AUTH_ENFORCEMENT: "required",
+        CLERK_SECRET_KEY: "   ",
+      }),
+    ).toThrow(ConfigError);
+  });
+
+  test("anonymous rate-limit identity ignores X-Forwarded-For", async () => {
+    const forwarded = req("http://x/api/v1/health", "anon-1");
+    forwarded.headers.set("x-forwarded-for", "1.2.3.4, 5.6.7.8");
+    const ctx = await createRequestContext(forwarded);
+    expect(ctx.rateLimitIdentity).toBe("anonymous");
+  });
+
+  test("bypassRateLimit serves liveness despite a deny-all limiter", async () => {
+    let ran = false;
+    const run = withRequestContext(
+      async (_r, ctx) => {
+        ran = true;
+        return successResponse({ ok: true }, { requestId: ctx.requestId });
+      },
+      {
+        rateLimit: {
+          check: () => ({
+            allowed: false,
+            limit: 1,
+            remaining: 0,
+            reset: 1,
+            retryAfter: 1,
+          }),
+        },
+      },
+      "health",
+      { bypassRateLimit: true },
+    );
+    const res = await run(req("http://x/api/v1/health", "live-1"));
+    expect(ran).toBe(true);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-Request-Id")).toBe("live-1");
+  });
+
+  test("success responses carry the limiter decision's header values", async () => {
+    const reset = Math.floor(Date.now() / 1000) + 30;
+    const run = withRequestContext(
+      async (_r, ctx) =>
+        successResponse({ ok: true }, { requestId: ctx.requestId }),
+      {
+        rateLimit: {
+          check: () => ({ allowed: true, limit: 7, remaining: 3, reset }),
+        },
+      },
+      "health",
+    );
+    const res = await run(req("http://x/api/v1/health", "dec-1"));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-RateLimit-Limit")).toBe("7");
+    expect(res.headers.get("X-RateLimit-Remaining")).toBe("3");
+    expect(res.headers.get("X-RateLimit-Reset")).toBe(String(reset));
+    expect((await res.json()).meta.requestId).toBe("dec-1");
+  });
+
+  test("slow or failing accounting never delays or breaks the response", async () => {
+    const recorders = [
+      { record: () => new Promise<void>(() => {}) },
+      {
+        record: () => Promise.reject(new Error("ledger down")),
+      },
+    ];
+    for (const usage of recorders) {
+      const run = withRequestContext(
+        async (_r, ctx) =>
+          successResponse({ ok: true }, { requestId: ctx.requestId }),
+        { usage },
+        "health",
+      );
+      const started = Date.now();
+      const res = await run(req("http://x/api/v1/health", "acc-1"));
+      expect(Date.now() - started).toBeLessThan(2000);
+      expect(res.status).toBe(200);
+      expect((await res.json()).meta.requestId).toBe("acc-1");
+    }
   });
 });

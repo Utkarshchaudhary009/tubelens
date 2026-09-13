@@ -47,9 +47,20 @@ export function getConfig(env: Env = process.env): PlatformConfig {
     ? { enabled: true }
     : { enabled: false, reason: "missing_datadog_api_key" };
 
+  const rawEnforcement = env.TUBELENS_AUTH_ENFORCEMENT;
+  if (
+    rawEnforcement !== undefined &&
+    rawEnforcement !== "off" &&
+    rawEnforcement !== "required"
+  ) {
+    throw new ConfigError(
+      "Unknown TUBELENS_AUTH_ENFORCEMENT value.",
+      "Set TUBELENS_AUTH_ENFORCEMENT to off or required, or unset it.",
+    );
+  }
   const authEnforcement: AuthEnforcement =
-    env.TUBELENS_AUTH_ENFORCEMENT === "required" ? "required" : "off";
-  if (authEnforcement === "required" && !env.CLERK_SECRET_KEY) {
+    rawEnforcement === "required" ? "required" : "off";
+  if (authEnforcement === "required" && !(env.CLERK_SECRET_KEY ?? "").trim()) {
     throw new ConfigError(
       "CLERK_SECRET_KEY is required when TUBELENS_AUTH_ENFORCEMENT=required.",
       "Set CLERK_SECRET_KEY in the deployment secret store; refusing to serve unprotected.",
