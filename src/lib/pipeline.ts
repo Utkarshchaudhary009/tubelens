@@ -133,10 +133,10 @@ export function withRequestContext(
     // Liveness-only invariant: bypassRateLimit is honored exclusively on
     // the approved liveness path. Any other route requesting it is a
     // programmer error and fails closed here (typed, never silent).
-    if (
-      options.bypassRateLimit &&
-      req.nextUrl.pathname !== LIVENESS_BYPASS_PATH
-    ) {
+    // Trailing slashes are normalized so /api/v1/health/ still matches;
+    // Next may route either spelling to the same handler.
+    const normalizedPath = req.nextUrl.pathname.replace(/\/+$/, "") || "/";
+    if (options.bypassRateLimit && normalizedPath !== LIVENESS_BYPASS_PATH) {
       throw new ConfigError(
         "bypassRateLimit is reserved for the liveness probe.",
         "Remove bypassRateLimit from this route; only /api/v1/health may bypass the limiter.",
