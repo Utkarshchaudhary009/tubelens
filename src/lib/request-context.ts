@@ -37,6 +37,24 @@ export interface ContextInputs {
 }
 
 /**
+ * Caller-supplied ids must be short opaque tokens; anything else is
+ * minted. (Headers.get is case-insensitive, so one lookup covers all
+ * casings of X-Request-Id.)
+ */
+const REQUEST_ID_PATTERN = /^[A-Za-z0-9-_:.]{1,128}$/;
+
+/**
+ * Resolve the request id: echo a valid caller-supplied X-Request-Id
+ * (trimmed first), otherwise mint a UUID. Validation keeps oversized or
+ * exotic values from flowing into logs, cache keys, and traces.
+ */
+export function resolveRequestId(req: NextRequest | Request): string {
+  const raw = req.headers.get("x-request-id");
+  const id = (raw ?? "").trim();
+  return REQUEST_ID_PATTERN.test(id) ? id : crypto.randomUUID();
+}
+
+/**
  * Build a RequestContext for an incoming request. Pure factory: callers
  * pass the already-resolved auth/tier pieces (see createRequestContext in
  * ./pipeline for the provider-wired version). The traceId defaults to the
@@ -46,10 +64,7 @@ export function buildRequestContext(
   req: NextRequest | Request,
   inputs: ContextInputs,
 ): RequestContext {
-  const headerId =
-    req.headers.get("x-request-id") ?? req.headers.get("X-Request-Id") ?? null;
-  const requestId =
-    headerId && headerId.trim() !== "" ? headerId : mintRequestId();
+  const requestId = resolveRequestId(req);
   const rateLimitIdentity = deriveRateLimitIdentity(req, inputs.auth);
   return {
     requestId,
@@ -63,10 +78,6 @@ export function buildRequestContext(
     route: inputs.route,
     startedAt: Date.now(),
   };
-}
-
-function mintRequestId(): string {
-  return crypto.randomUUID();
 }
 
 /**

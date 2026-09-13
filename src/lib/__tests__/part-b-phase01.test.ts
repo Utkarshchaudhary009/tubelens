@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { NextRequest, NextResponse } from "next/server";
+import { handleHealth } from "../../app/api/v1/health/route";
 import {
   anonymousAuthProvider,
   getAuthProvider,
@@ -260,5 +261,189 @@ describe("provider boundaries (Phase 01)", () => {
     const body = await res.json();
     expect(body.error.code).toBe("service_unavailable");
     expect(body.meta.requestId).toBe("lim-1");
+  });
+});
+
+describe("review hardening (Phase 01)", () => {
+  test("pipelined health is byte/shape compatible with direct handleHealth", async () => {
+    const deps = { checkSession: async () => {} };
+    const direct = await handleHealth("byte-1", deps);
+    const run = withRequestContext(
+      async (_r, ctx) => handleHealth(ctx.requestId, deps),
+      {},
+      "health",
+    );
+    const pipelined = await run(req("http://x/api/v1/health", "byte-1"));
+    expect(pipelined.status).toBe(direct.status);
+    expect(await pipelined.json()).toEqual(await direct.json());
+    for (const name of [
+      "X-Request-Id",
+      "X-RateLimit-Limit",
+      "X-RateLimit-Remaining",
+      "Cache-Control",
+      "Content-Type",
+    ]) {
+      expect(pipelined.headers.get(name)).toBe(direct.headers.get(name));
+    }
+    expect(pipelined.headers.get("X-RateLimit-Reset")).toMatch(/^\d+$/);
+  });
+
+  test("throwing auth/product providers fail safe with typed 503 JSON", async () => {
+    const unreachable = async () => NextResponse.json({ unreachable: true });
+    const failing = [
+      {
+        auth: {
+          resolve: () => {
+            throw new Error("clerk down");
+          },
+        },
+      },
+      {
+        product: {
+          resolveTier: () => {
+            throw new Error("policy store down");
+          },
+          entitlementsFor: () => {
+            throw new Error("unreachable");
+          },
+        },
+      },
+    ];
+    for (const providers of failing) {
+      const run = withRequestContext(unreachable, providers, "health");
+      const res = await run(req("http://x/api/v1/health", "auth-1"));
+      expect(res.status).toBe(503);
+      expect(res.headers.get("Content-Type")).toContain("application/json");
+      expect(res.headers.get("X-Request-Id")).toBe("auth-1");
+      const body = await res.json();
+      expect(body.error.code).toBe("dependency_unavailable");
+      expect(typeof body.error.hint).toBe("string");
+      expect(JSON.stringify(body)).not.toContain("clerk down");
+      expect(JSON.stringify(body)).not.toContain("policy store down");
+      expect(body.meta.requestId).toBe("auth-1");
+    }
+  });
+
+  test("throwing handler returns typed 500 JSON, never a stack leak", async () => {
+    const run = withRequestContext(
+      async () => {
+        throw new Error("secret boom");
+      },
+      {},
+      "health",
+    );
+    const res = await run(req("http://x/api/v1/health", "h-500"));
+    expect(res.status).toBe(500);
+    expect(res.headers.get("Content-Type")).toContain("application/json");
+    expect(res.headers.get("X-Request-Id")).toBe("h-500");
+    const body = await res.json();
+    expect(body.error.code).toBe("internal");
+    expect(typeof body.error.hint).toBe("string");
+    expect("stack" in body.error).toBe(false);
+    expect(JSON.stringify(body)).not.toContain("secret boom");
+    expect(body.meta.requestId).toBe("h-500");
+  });
+
+  test("oversized/invalid x-request-id values are replaced with a minted id", async () => {
+    for (const bad of ["x".repeat(200), "has spaces!", "a/b?c", ""]) {
+      const ctx = await createRequestContext(
+        req("http://x/api/v1/health", bad),
+      );
+      expect(ctx.requestId).toMatch(/^[0-9a-f-]{36}$/i);
+      expect(ctx.requestId).not.toBe(bad);
+    }
+    // Boundary: a 128-char token stays echoed.
+    const edge = "y".repeat(128);
+    const kept = await createRequestContext(
+      req("http://x/api/v1/health", edge),
+    );
+    expect(kept.requestId).toBe(edge);
+  });
+
+  test("429 responses carry the limiter decision's header values", async () => {
+    const run = withRequestContext(
+      async (_r, ctx) =>
+        successResponse({ ok: true }, { requestId: ctx.requestId }),
+      {
+        rateLimit: {
+          check: () => ({
+            allowed: false,
+            limit: 10,
+            remaining: 0,
+            reset: 123,
+            retryAfter: 5,
+          }),
+        },
+      },
+      "health",
+    );
+    const res = await run(req("http://x/api/v1/health", "d-429"));
+    expect(res.status).toBe(429);
+    expect(res.headers.get("X-RateLimit-Limit")).toBe("10");
+    expect(res.headers.get("X-RateLimit-Remaining")).toBe("0");
+    expect(res.headers.get("X-RateLimit-Reset")).toBe("123");
+    expect(res.headers.get("X-Request-Id")).toBe("d-429");
+  });
+
+  test("missing security config maps to typed 503 without running the handler", async () => {
+    let ran = false;
+    const run = withRequestContext(
+      async (_r, ctx) => {
+        ran = true;
+        return successResponse({ ok: true }, { requestId: ctx.requestId });
+      },
+      { env: { TUBELENS_AUTH_ENFORCEMENT: "required" } },
+      "health",
+    );
+    const res = await run(req("http://x/api/v1/health", "cfg-1"));
+    expect(ran).toBe(false);
+    expect(res.status).toBe(503);
+    const body = await res.json();
+    expect(body.error.code).toBe("missing_security_config");
+    expect(typeof body.error.hint).toBe("string");
+    expect(body.meta.requestId).toBe("cfg-1");
+    expect(res.headers.get("X-Request-Id")).toBe("cfg-1");
+  });
+
+  test("pipeline serves when the required secret is present", async () => {
+    const run = withRequestContext(
+      async (_r, ctx) =>
+        successResponse({ ok: true }, { requestId: ctx.requestId }),
+      {
+        env: {
+          TUBELENS_AUTH_ENFORCEMENT: "required",
+          CLERK_SECRET_KEY: "sk_test_123",
+        },
+      },
+      "health",
+    );
+    expect((await run(req("http://x/api/v1/health"))).status).toBe(200);
+  });
+
+  test("a throwing observability provider never breaks the response", async () => {
+    const run = withRequestContext(
+      async (_r, ctx) =>
+        successResponse({ ok: true }, { requestId: ctx.requestId }),
+      {
+        observability: {
+          startSpan: () => {
+            throw new Error("otel down");
+          },
+          log: () => {
+            throw new Error("log down");
+          },
+          increment: () => {
+            throw new Error("metric down");
+          },
+          captureError: () => {
+            throw new Error("report down");
+          },
+        },
+      },
+      "health",
+    );
+    const res = await run(req("http://x/api/v1/health", "obs-1"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).meta.requestId).toBe("obs-1");
   });
 });
