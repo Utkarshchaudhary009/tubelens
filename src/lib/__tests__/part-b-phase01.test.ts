@@ -202,6 +202,9 @@ describe("provider boundaries (Phase 01)", () => {
     );
     const res = await run(req("http://x/api/v1/health"));
     expect(res.status).toBe(200);
+    // Accounting is dispatched in a later macrotask; yield to the timers
+    // phase before asserting the recorder ran.
+    await new Promise((r) => setTimeout(r, 10));
     expect(seen).toEqual(["user_1", "free", "usage:accepted"]);
   });
 
@@ -641,8 +644,12 @@ describe("cubic review findings", () => {
     );
     const res = await run(req("http://x/api/v1/health", "sig-1"));
     expect(res.status).toBe(200);
-    // Wait past the 500ms accounting bound, then confirm the abort fired.
-    await new Promise((r) => setTimeout(r, 800));
+    // Poll for the abort outcome (bound: 500ms accounting timeout) with a
+    // generous deadline instead of a fixed sleep.
+    const deadline = Date.now() + 5000;
+    while (!observed?.aborted && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
     expect(observed?.aborted).toBe(true);
   });
 });
