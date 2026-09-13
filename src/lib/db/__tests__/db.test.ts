@@ -204,8 +204,13 @@ describe("checkDbHealth", () => {
   });
 
   test("driver-side abort maps to typed db_timeout (never a bare 500)", async () => {
-    // Mirror a driver that cancels the underlying fetch when the probe's
-    // timeout signal aborts: reject with AbortError on abort.
+    // Simulate a driver that already observed cancellation: reject
+    // immediately with an AbortError-named error instead of waiting for the
+    // signal's abort event. Waiting for the event would register this mock's
+    // listener AFTER withDbTimeout's internal gate listener on the same
+    // AbortSignal.timeout() signal, so the gate's TimeoutError would always
+    // settle the Promise.race first and the AbortError branch would never be
+    // covered. Immediate rejection wins the race deterministically.
     const captured: { signal?: AbortSignal } = {};
     const deps = mockDeps({
       createSql: (_url: string) => {
@@ -219,17 +224,9 @@ describe("checkDbHealth", () => {
             ): Promise<unknown> => {
               const signal = queryOpts?.fetchOptions?.signal;
               captured.signal = signal;
-              return new Promise<unknown>((_resolve, reject) => {
-                signal?.addEventListener(
-                  "abort",
-                  () => {
-                    const err = new Error("The operation was aborted.");
-                    err.name = "AbortError";
-                    reject(err);
-                  },
-                  { once: true },
-                );
-              });
+              const err = new Error("The operation was aborted.");
+              err.name = "AbortError";
+              throw err;
             },
           },
         );
