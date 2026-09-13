@@ -27,6 +27,7 @@ import {
   type ProductPolicyProvider,
 } from "./product";
 import {
+  defaultRateLimitDecision,
   getRateLimitProvider,
   type RateLimitDecision,
   type RateLimitProvider,
@@ -57,13 +58,22 @@ export interface PipelineProviders {
 export interface PipelineOptions {
   /**
    * Skip the rate-limit check. Liveness probes ONLY — a probe must never
-   * 429/503 because of request providers. Never use for data routes.
+   * 429/503 because of request providers. Enforced by pathname: honored
+   * exclusively on /api/v1/health, and any other route requesting it
+   * throws a programmer-error ConfigError. Never use for data routes.
    */
   bypassRateLimit?: boolean;
 }
 
 /** Bound for best-effort usage accounting: never delay the response. */
 const ACCOUNTING_TIMEOUT_MS = 500;
+
+/**
+ * The single approved liveness path allowed to bypass rate limiting.
+ * Enforced by pathname (not by the route label) so a miswired
+ * `bypassRateLimit: true` on any other route fails closed.
+ */
+const LIVENESS_BYPASS_PATH = "/api/v1/health";
 
 function pick<T>(override: T | undefined, current: T): T {
   return override ?? current;
@@ -93,7 +103,8 @@ export async function createRequestContext(
  * Wrap a route handler with the Phase 01 pipeline. The wrapper:
  *  1. validates config (missing security config → typed 503),
  *  2. builds the typed RequestContext (throwing provider → typed 503),
- *  3. runs the rate-limit check (deny → 429 with decision headers),
+ *  3. runs the rate-limit check (deny → 429 with decision headers;
+ *     liveness bypass honored only on /api/v1/health, else throws),
  *  4. invokes the handler (throw → typed 500, never a stack leak),
  *  5. stamps X-Request-Id / X-RateLimit-* from the limiter decision,
  *     preserving the Part A wire contract (defaults match the old stubs),
@@ -118,6 +129,19 @@ export function withRequestContext(
     // Pre-derive the id so even config/auth failures carry request-id
     // headers and meta.
     const requestId = resolveRequestId(req);
+
+    // Liveness-only invariant: bypassRateLimit is honored exclusively on
+    // the approved liveness path. Any other route requesting it is a
+    // programmer error and fails closed here (typed, never silent).
+    if (
+      options.bypassRateLimit &&
+      req.nextUrl.pathname !== LIVENESS_BYPASS_PATH
+    ) {
+      throw new ConfigError(
+        "bypassRateLimit is reserved for the liveness probe.",
+        "Remove bypassRateLimit from this route; only /api/v1/health may bypass the limiter.",
+      );
+    }
 
     // Config stage: security-critical validation fails safely with a typed
     // error; missing optional observability config degrades to no-op.
@@ -157,7 +181,7 @@ export function withRequestContext(
     const rateLimit = pick(providers.rateLimit, getRateLimitProvider());
     let decision: RateLimitDecision;
     if (options.bypassRateLimit) {
-      decision = allowDecision();
+      decision = defaultRateLimitDecision();
     } else {
       try {
         decision = await rateLimit.check({
@@ -204,25 +228,31 @@ export function withRequestContext(
       safe(() => observability.captureError(err, { requestId: ctx.requestId }));
       span.recordError(err);
       span.end();
-      return errorResponse(ctx.requestId, {
+      const res = errorResponse(ctx.requestId, {
         code: "internal",
         message: "Internal server error.",
         hint: "Retry the request; report the X-Request-Id if the failure persists.",
         status: 500,
       });
+      stampRateLimitHeaders(res, ctx, decision);
+      return res;
     }
 
     stampRateLimitHeaders(res, ctx, decision);
 
     // Accounting stage (Phase 01: no-op recorder). Best-effort and bounded:
-    // dispatched without delaying the response; a slow recorder is cut off
-    // after ACCOUNTING_TIMEOUT_MS and failures vanish through safe().
+    // recorder invocation is deferred off the request path, then raced
+    // against ACCOUNTING_TIMEOUT_MS; a hung recorder observes an abort via
+    // its optional signal, and timeouts/failures vanish through safe().
     const usage = pick(providers.usage, getUsageRecorder());
     safe(() =>
-      Promise.race([
-        usageRecord(usage, ctx, route, res.ok),
-        accountingTimeout(),
-      ]),
+      Promise.resolve().then(() => {
+        const controller = new AbortController();
+        return Promise.race([
+          usageRecord(usage, ctx, route, res.ok, controller.signal),
+          accountingTimeout(controller),
+        ]);
+      }),
     );
 
     safe(() =>
@@ -258,40 +288,38 @@ function stampRateLimitHeaders(
   res.headers.set("X-RateLimit-Reset", String(decision.reset));
 }
 
-/** Allow decision used when liveness bypasses the limiter check. */
-function allowDecision(): RateLimitDecision {
-  return {
-    allowed: true,
-    limit: 100,
-    remaining: 99,
-    reset: Math.floor(Date.now() / 1000) + 60,
-  };
-}
-
 function usageRecord(
   usage: UsageRecorder,
   ctx: RequestContext,
   route: string | undefined,
   ok: boolean,
+  signal: AbortSignal,
 ): Promise<void> | void {
-  return usage.record({
-    requestId: ctx.requestId,
-    route: route ?? "unknown",
-    operation: route ?? "unknown",
-    cost: 1,
-    policyVersion: ctx.entitlements.policyVersion,
-    outcome: ok ? "accepted" : "rejected",
-    principal: ctx.auth.userId ?? ctx.auth.keyId,
-  });
+  return usage.record(
+    {
+      requestId: ctx.requestId,
+      route: route ?? "unknown",
+      operation: route ?? "unknown",
+      cost: 1,
+      policyVersion: ctx.entitlements.policyVersion,
+      outcome: ok ? "accepted" : "rejected",
+      principal: ctx.auth.userId ?? ctx.auth.keyId,
+    },
+    { signal },
+  );
 }
 
 /**
- * Bounded cutoff for best-effort accounting. Unref'd so the timer itself
- * never holds the process open after the response is served.
+ * Bounded cutoff for best-effort accounting: aborts the recorder's signal
+ * so hung work can stop, then resolves the race. Unref'd so the timer
+ * itself never holds the process open after the response is served.
  */
-function accountingTimeout(): Promise<void> {
+function accountingTimeout(controller: AbortController): Promise<void> {
   return new Promise<void>((resolve) => {
-    const timer = setTimeout(resolve, ACCOUNTING_TIMEOUT_MS);
+    const timer = setTimeout(() => {
+      controller.abort();
+      resolve();
+    }, ACCOUNTING_TIMEOUT_MS);
     const unrefable = timer as unknown as { unref?: () => void };
     if (typeof unrefable.unref === "function") {
       unrefable.unref();

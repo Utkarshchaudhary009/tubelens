@@ -584,4 +584,65 @@ describe("cubic review findings", () => {
       expect((await res.json()).meta.requestId).toBe("acc-1");
     }
   });
+
+  test("bypassRateLimit outside liveness throws a programmer-error ConfigError", async () => {
+    const run = withRequestContext(
+      async (_r, ctx) =>
+        successResponse({ ok: true }, { requestId: ctx.requestId }),
+      {},
+      "search",
+      { bypassRateLimit: true },
+    );
+    await expect(
+      run(req("http://x/api/v1/search?q=x", "bad-1")),
+    ).rejects.toThrow(ConfigError);
+  });
+
+  test("500 responses carry the limiter decision's header values", async () => {
+    const reset = Math.floor(Date.now() / 1000) + 30;
+    const run = withRequestContext(
+      async () => {
+        throw new Error("kaboom");
+      },
+      {
+        rateLimit: {
+          check: () => ({ allowed: true, limit: 7, remaining: 3, reset }),
+        },
+      },
+      "health",
+    );
+    const res = await run(req("http://x/api/v1/health", "e-500"));
+    expect(res.status).toBe(500);
+    expect(res.headers.get("X-RateLimit-Limit")).toBe("7");
+    expect(res.headers.get("X-RateLimit-Remaining")).toBe("3");
+    expect(res.headers.get("X-RateLimit-Reset")).toBe(String(reset));
+    expect(res.headers.get("X-Request-Id")).toBe("e-500");
+    expect((await res.json()).error.code).toBe("internal");
+  });
+
+  test("hung accounting observes abort after the timeout", async () => {
+    let observed: AbortSignal | undefined;
+    const run = withRequestContext(
+      async (_r, ctx) =>
+        successResponse({ ok: true }, { requestId: ctx.requestId }),
+      {
+        usage: {
+          record: (_e, options) => {
+            observed = options?.signal;
+            return new Promise<void>((resolve) => {
+              options?.signal?.addEventListener("abort", () => resolve(), {
+                once: true,
+              });
+            });
+          },
+        },
+      },
+      "health",
+    );
+    const res = await run(req("http://x/api/v1/health", "sig-1"));
+    expect(res.status).toBe(200);
+    // Wait past the 500ms accounting bound, then confirm the abort fired.
+    await new Promise((r) => setTimeout(r, 800));
+    expect(observed?.aborted).toBe(true);
+  });
 });

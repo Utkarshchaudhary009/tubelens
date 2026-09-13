@@ -20,8 +20,17 @@ export interface UsageEvent {
   cached?: boolean;
 }
 
+export interface UsageRecordOptions {
+  /**
+   * Aborted when best-effort accounting exceeds its time bound. Optional
+   * so existing recorders stay compatible; recorders that honor it should
+   * stop work promptly on abort.
+   */
+  signal?: AbortSignal;
+}
+
 export interface UsageRecorder {
-  record(event: UsageEvent): Promise<void> | void;
+  record(event: UsageEvent, options?: UsageRecordOptions): Promise<void> | void;
 }
 
 /** Phase 01 default: accept the event and persist nothing. Never throws. */

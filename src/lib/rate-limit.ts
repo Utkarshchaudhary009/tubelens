@@ -35,6 +35,15 @@ function allowDecision(): RateLimitDecision {
   };
 }
 
+/**
+ * Shared default allow decision (matches the Part A stub headers: 100/99).
+ * Used by the allow-all provider and by the pipeline's liveness bypass so
+ * both paths stamp identical values.
+ */
+export function defaultRateLimitDecision(): RateLimitDecision {
+  return allowDecision();
+}
+
 /** Phase 01 default: allow everything (matches the Part A stub headers). */
 export const allowAllRateLimitProvider: RateLimitProvider = {
   check(): RateLimitDecision {
