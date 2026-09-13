@@ -8,6 +8,7 @@
   schema (`0 tables, nothing to migrate`): a journal with `entries: []`,
   no snapshot, no `.sql`. `bun run db:migrate` against it is a clean no-op.
 - Workflow for the first real table: add it to `schema.ts`, run
-  `bun run db:generate` (requires `DATABASE_DIRECT_URL` per
-  `drizzle.config.ts`), review the diff, then `bun run db:migrate`
-  against a preview/dev branch before prod. Migrations are forward-only.
+  `bun run db:generate` (offline schema diff — works without credentials),
+  review the diff, then `bun run db:migrate` (requires `DATABASE_DIRECT_URL`
+  per `drizzle.config.ts`) against a preview/dev branch before prod.
+  Migrations are forward-only.
