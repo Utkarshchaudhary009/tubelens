@@ -36,11 +36,13 @@ export const FREE_ENTITLEMENTS: EntitlementSnapshot = {
 };
 
 /**
- * Normalize an untrusted tier value. Unknown/missing/invalid values fall
- * back to `free` — a tier can never be self-escalated via a forged claim.
+ * Normalize an untrusted tier value. Only ACTIVE_TIERS are effective —
+ * reserved tiers (pro/team/enterprise) are defined but not active, so they
+ * fall back to `free` like any unknown value. A tier can never be
+ * self-escalated via a forged claim.
  */
 export function normalizeTier(raw: unknown): Tier {
-  return raw === "pro" || raw === "team" || raw === "enterprise" ? raw : "free";
+  return ACTIVE_TIERS.includes(raw as Tier) ? (raw as Tier) : "free";
 }
 
 export interface ProductPolicyProvider {

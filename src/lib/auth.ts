@@ -25,17 +25,17 @@ export interface AuthProvider {
   resolve(req: Request): Promise<AuthContext> | AuthContext;
 }
 
-export const anonymousAuthContext: AuthContext = {
+export const anonymousAuthContext: AuthContext = Object.freeze({
   type: "anonymous",
   authenticated: false,
-};
+});
 
 /** Phase 01 default: every request is anonymous. */
-export const anonymousAuthProvider: AuthProvider = {
+export const anonymousAuthProvider: AuthProvider = Object.freeze({
   resolve(): AuthContext {
     return { ...anonymousAuthContext };
   },
-};
+});
 
 let current: AuthProvider = anonymousAuthProvider;
 
