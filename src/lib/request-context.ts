@@ -84,8 +84,12 @@ export function buildRequestContext(
  * Rate-limit identity: authenticated user > api key > stable anonymous key.
  * Anonymous callers deliberately share one key: X-Forwarded-For is
  * attacker-rotatable, so trusting it would let a caller mint unlimited
- * limiter buckets. Trusted-proxy handling (if any) is defined in Phase 12
- * alongside the Redis engine.
+ * limiter buckets. Trade-off: one shared "anonymous" bucket means a burst
+ * from one anonymous client counts against all of them — per-IP anonymous
+ * buckets require trusted-ingress configuration and land with the
+ * distributed limiter in Phase 12. Until then the allow-all default means
+ * no bucket exhaustion is possible, so sharing is safe and no X-Forwarded-
+ * For trust is introduced here.
  */
 function deriveRateLimitIdentity(auth: AuthContext): string {
   if (auth.userId) {
