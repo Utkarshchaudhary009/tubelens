@@ -25,11 +25,16 @@ const defaultDeps: HealthDeps = {
 // Phase 01 (Part B): GET runs through the shared request pipeline
 // (withRequestContext) so every call gets a typed RequestContext; the
 // envelope output is unchanged (Part A wire contract preserved).
+// Liveness must never be rejected by request providers: bypassRateLimit
+// skips only the limiter check (context creation, request ids, and headers
+// still apply). This option exists ONLY for liveness — never for data
+// routes, which must always face rate-limit/quota enforcement.
 export async function GET(req: NextRequest) {
   return withRequestContext(
     async (_r, ctx) => handleHealth(ctx.requestId, defaultDeps),
     {},
     "health",
+    { bypassRateLimit: true },
   )(req);
 }
 

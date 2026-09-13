@@ -65,7 +65,7 @@ export function buildRequestContext(
   inputs: ContextInputs,
 ): RequestContext {
   const requestId = resolveRequestId(req);
-  const rateLimitIdentity = deriveRateLimitIdentity(req, inputs.auth);
+  const rateLimitIdentity = deriveRateLimitIdentity(inputs.auth);
   return {
     requestId,
     traceId: requestId,
@@ -81,21 +81,18 @@ export function buildRequestContext(
 }
 
 /**
- * Best-effort rate-limit identity: authenticated user > api key > caller
- * IP placeholder. IP extraction stays coarse in Phase 01 (no proxy-trust
- * chain yet); the Redis engine in Phase 12 refines dimensions.
+ * Rate-limit identity: authenticated user > api key > stable anonymous key.
+ * Anonymous callers deliberately share one key: X-Forwarded-For is
+ * attacker-rotatable, so trusting it would let a caller mint unlimited
+ * limiter buckets. Trusted-proxy handling (if any) is defined in Phase 12
+ * alongside the Redis engine.
  */
-function deriveRateLimitIdentity(
-  req: NextRequest | Request,
-  auth: AuthContext,
-): string {
+function deriveRateLimitIdentity(auth: AuthContext): string {
   if (auth.userId) {
     return `user:${auth.userId}`;
   }
   if (auth.keyId) {
     return `key:${auth.keyId}`;
   }
-  const forwarded = req.headers.get("x-forwarded-for");
-  const ip = forwarded?.split(",")[0]?.trim() || "unknown";
-  return `anon:${ip}`;
+  return "anonymous";
 }

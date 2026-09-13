@@ -54,6 +54,17 @@ export interface PipelineProviders {
   env?: Record<string, string | undefined>;
 }
 
+export interface PipelineOptions {
+  /**
+   * Skip the rate-limit check. Liveness probes ONLY — a probe must never
+   * 429/503 because of request providers. Never use for data routes.
+   */
+  bypassRateLimit?: boolean;
+}
+
+/** Bound for best-effort usage accounting: never delay the response. */
+const ACCOUNTING_TIMEOUT_MS = 500;
+
 function pick<T>(override: T | undefined, current: T): T {
   return override ?? current;
 }
@@ -84,8 +95,8 @@ export async function createRequestContext(
  *  2. builds the typed RequestContext (throwing provider → typed 503),
  *  3. runs the rate-limit check (deny → 429 with decision headers),
  *  4. invokes the handler (throw → typed 500, never a stack leak),
- *  5. backfills X-Request-Id / X-RateLimit-* when the handler did not set
- *     them, preserving the Part A wire contract byte-for-byte,
+ *  5. stamps X-Request-Id / X-RateLimit-* from the limiter decision,
+ *     preserving the Part A wire contract (defaults match the old stubs),
  *  6. records a usage event via the (no-op) recorder (accounting stage),
  *  7. emits trace/log hooks via best-effort observability (never throws).
  */
@@ -93,6 +104,7 @@ export function withRequestContext(
   handler: RouteHandler,
   providers: PipelineProviders = {},
   route?: string,
+  options: PipelineOptions = {},
 ): (req: NextRequest) => Promise<NextResponse> {
   return async (req: NextRequest) => {
     const observability = pick(
@@ -140,27 +152,34 @@ export function withRequestContext(
       });
     }
 
-    // Rate-limit stage (Phase 01: allow-all default).
+    // Rate-limit stage (Phase 01: allow-all default). Liveness bypasses
+    // only this check; context, ids, and headers still apply.
     const rateLimit = pick(providers.rateLimit, getRateLimitProvider());
     let decision: RateLimitDecision;
-    try {
-      decision = await rateLimit.check({
-        identity: ctx.rateLimitIdentity,
-        endpointClass: route ?? "default",
-        cost: 1,
-      });
-    } catch (err) {
-      // A broken limiter must never silently fail open into unprotected
-      // serving nor crash the route: report and fail safely with 503.
-      safe(() => observability.captureError(err, { requestId: ctx.requestId }));
-      span.recordError(err);
-      span.end();
-      return errorResponse(ctx.requestId, {
-        code: "service_unavailable",
-        message: "Rate limiter unavailable.",
-        hint: "Retry shortly; the request was not served without protection.",
-        status: 503,
-      });
+    if (options.bypassRateLimit) {
+      decision = allowDecision();
+    } else {
+      try {
+        decision = await rateLimit.check({
+          identity: ctx.rateLimitIdentity,
+          endpointClass: route ?? "default",
+          cost: 1,
+        });
+      } catch (err) {
+        // A broken limiter must never silently fail open into unprotected
+        // serving nor crash the route: report and fail safely with 503.
+        safe(() =>
+          observability.captureError(err, { requestId: ctx.requestId }),
+        );
+        span.recordError(err);
+        span.end();
+        return errorResponse(ctx.requestId, {
+          code: "service_unavailable",
+          message: "Rate limiter unavailable.",
+          hint: "Retry shortly; the request was not served without protection.",
+          status: 503,
+        });
+      }
     }
     if (!decision.allowed) {
       span.end();
@@ -193,24 +212,18 @@ export function withRequestContext(
       });
     }
 
-    applyRateLimitHeaders(res, ctx, decision);
+    stampRateLimitHeaders(res, ctx, decision);
 
-    // Accounting stage (Phase 01: no-op recorder).
+    // Accounting stage (Phase 01: no-op recorder). Best-effort and bounded:
+    // dispatched without delaying the response; a slow recorder is cut off
+    // after ACCOUNTING_TIMEOUT_MS and failures vanish through safe().
     const usage = pick(providers.usage, getUsageRecorder());
-    try {
-      await usage.record({
-        requestId: ctx.requestId,
-        route: route ?? "unknown",
-        operation: route ?? "unknown",
-        cost: 1,
-        policyVersion: ctx.entitlements.policyVersion,
-        outcome: res.ok ? "accepted" : "rejected",
-        principal: ctx.auth.userId ?? ctx.auth.keyId,
-      });
-    } catch (err) {
-      // Accounting must never break a served response.
-      safe(() => observability.captureError(err, { requestId: ctx.requestId }));
-    }
+    safe(() =>
+      Promise.race([
+        usageRecord(usage, ctx, route, res.ok),
+        accountingTimeout(),
+      ]),
+    );
 
     safe(() =>
       observability.log("info", "request served", {
@@ -226,11 +239,13 @@ export function withRequestContext(
 
 /**
  * Preserve the Part A wire contract: every response carries X-Request-Id
- * (+ meta.requestId, set by the envelope helpers) and X-RateLimit-*. Only
- * backfill headers the handler did not already set, so routes using
- * successResponse/errorResponse keep byte-identical output.
+ * (+ meta.requestId, set by the envelope helpers) and X-RateLimit-*.
+ * The request id is backfilled only when the handler omitted it; the
+ * rate-limit values always come from the limiter decision so success and
+ * error responses agree. The Phase 01 allow-all default (100/99) matches
+ * the Part A stubs, keeping existing responses byte-identical.
  */
-function applyRateLimitHeaders(
+function stampRateLimitHeaders(
   res: NextResponse,
   ctx: RequestContext,
   decision: RateLimitDecision,
@@ -238,21 +253,61 @@ function applyRateLimitHeaders(
   if (!res.headers.get("X-Request-Id")) {
     res.headers.set("X-Request-Id", ctx.requestId);
   }
-  if (!res.headers.get("X-RateLimit-Limit")) {
-    res.headers.set("X-RateLimit-Limit", String(decision.limit));
-  }
-  if (!res.headers.get("X-RateLimit-Remaining")) {
-    res.headers.set("X-RateLimit-Remaining", String(decision.remaining));
-  }
-  if (!res.headers.get("X-RateLimit-Reset")) {
-    res.headers.set("X-RateLimit-Reset", String(decision.reset));
-  }
+  res.headers.set("X-RateLimit-Limit", String(decision.limit));
+  res.headers.set("X-RateLimit-Remaining", String(decision.remaining));
+  res.headers.set("X-RateLimit-Reset", String(decision.reset));
+}
+
+/** Allow decision used when liveness bypasses the limiter check. */
+function allowDecision(): RateLimitDecision {
+  return {
+    allowed: true,
+    limit: 100,
+    remaining: 99,
+    reset: Math.floor(Date.now() / 1000) + 60,
+  };
+}
+
+function usageRecord(
+  usage: UsageRecorder,
+  ctx: RequestContext,
+  route: string | undefined,
+  ok: boolean,
+): Promise<void> | void {
+  return usage.record({
+    requestId: ctx.requestId,
+    route: route ?? "unknown",
+    operation: route ?? "unknown",
+    cost: 1,
+    policyVersion: ctx.entitlements.policyVersion,
+    outcome: ok ? "accepted" : "rejected",
+    principal: ctx.auth.userId ?? ctx.auth.keyId,
+  });
+}
+
+/**
+ * Bounded cutoff for best-effort accounting. Unref'd so the timer itself
+ * never holds the process open after the response is served.
+ */
+function accountingTimeout(): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ACCOUNTING_TIMEOUT_MS);
+    const unrefable = timer as unknown as { unref?: () => void };
+    if (typeof unrefable.unref === "function") {
+      unrefable.unref();
+    }
+  });
 }
 
 /** Observability is best-effort: hook failures are swallowed, never thrown. */
-function safe(fn: () => void): void {
+function safe(fn: () => unknown): void {
   try {
-    fn();
+    const result = fn();
+    if (result instanceof Promise) {
+      result.catch(() => {
+        // Intentionally ignored — telemetry must never break a response.
+      });
+    }
   } catch {
     // Intentionally ignored — telemetry must never break a response.
   }
