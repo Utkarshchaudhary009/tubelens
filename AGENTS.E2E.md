@@ -16,6 +16,8 @@ The workflow has checked out the PR and installed OpenCode. You have a full Linu
 
 Do not use a fixed route checklist. Test what the changes make relevant.
 
+## If testing requirs browser
+ you can install, configure and se vercel agent browser. for task ike if redirection is happening properly, if any route is vunarable or other purposes.Use it at its full potential for robust e2e testing.
 ## Supporting services and Docker
 
 The E2E environment is allowed to use Docker as a real integration environment, not only as a last-resort workaround. When a PR depends on stateful or external infrastructure, start temporary isolated services as needed.

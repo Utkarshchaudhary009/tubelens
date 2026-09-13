@@ -18,18 +18,30 @@ TubeLens uses separate systems for separate responsibilities:
 
 All newly created TubeLens users are **Free by default**.
 
+### Canonical metadata keys
+
+Authoritative state lives in Clerk user `publicMetadata` with exactly two keys:
+
+```json
+{ "tier": "free|plus|pro|enterprise", "role": "admin|support|user" }
+```
+
+Tiers are ranked `free < plus < pro < enterprise`. `team` is an org concept, never a tier. Backend-written, UI-readable. Never use `unsafeMetadata` for roles/tier (client-writable). `privateMetadata` is reserved for future internal flags. Orgs are not used — `publicMetadata.role` is the admin signal.
+
+Bootstrap the first `admin` out-of-band via the Clerk Dashboard (Users → target user → Public metadata) or via `clerkClient.users.updateUserMetadata()`. Never ship a self-grant endpoint.
+
 ### Active tier
 
 | Tier | Status | Purpose |
 |---|---|---|
 | `free` | Active | Default for every user; enough allowance for experimentation and evaluation. |
 
-### Reserved future tiers
+### Reserved future tiers (ranked `free < plus < pro < enterprise`)
 
 | Tier | Status | Purpose |
 |---|---|---|
-| `pro` | Defined, not active by default | Higher credit allowance, higher rate limits, developer-focused usage. |
-| `team` | Defined, not active by default | Shared organization/project limits and higher pooled allowance. |
+| `plus` | Defined, not active by default | Higher credit allowance and rate limits for power users. |
+| `pro` | Defined, not active by default | Higher pooled allowance, developer-focused usage. |
 | `enterprise` | Reserved | Custom contracts, controls, support, and limits. |
 
 Do not implement paid billing merely because a tier exists in the enum. A tier can be defined before billing is enabled.
@@ -38,23 +50,29 @@ The initial implementation must make `free` the safe fallback if a user has no t
 
 ## 3. Clerk session-token claim
 
-Configure the Clerk session token with a small custom claim:
+Configure the Clerk session token via Dashboard → Sessions → Customize session token with a small custom claim projecting the authoritative tier:
 
 ```json
 {
+  "metadata": "{{user.public_metadata}}",
   "tubelens": {
     "tier": "{{user.public_metadata.tier}}"
   }
 }
 ```
 
-Prefer a single small field rather than copying the complete metadata object into the token. Clerk recommends keeping custom claims small because browser cookies have practical size limits, and recommends using individual claims when possible. citeturn102115search2
+Prefer single small fields rather than copying large objects into the token. Keep total custom claims under 1.2KB (browser cookie size limits).
+
+Read server-side with `auth()` from `@clerk/nextjs/server` (`const { userId, sessionClaims } = await auth()`), tier via `sessionClaims.tubelens.tier`, role via `sessionClaims.metadata.role`, typed through `types/globals.d.ts CustomJwtSessionClaims`. Prefer `auth()` + claims on hot paths; `currentUser()`/`getUser()` costs a Backend API call. Missing/invalid tier falls back to `free` — it can never self-escalate.
+
+Later MCP auth (future `@xmcp-dev/clerk` spike, not now): `clerkProvider` in `src/middleware.ts` with JWKS Bearer verification; inside each tool call `getSession()` for fast claims and skip `getUser()` on the hot path; enable DCR in the Clerk Dashboard; same `tubelens.tier` claim and `free` fallback apply.
 
 On user creation, initialize:
 
 ```json
 {
-  "tier": "free"
+  "tier": "free",
+  "role": "user"
 }
 ```
 
@@ -62,48 +80,61 @@ The claim is used by the request context for fast policy selection.
 
 ### Freshness rule
 
-- Normal requests may use the session claim.
+- Normal requests may use the session claim; fall back to `free` (and `user` role) on missing/invalid values — an invalid tier can never become an elevated plan.
+- Claims lag ~60s after a metadata change. Fast paths may read claims; write paths must re-fetch authoritative state via `clerkClient.users.getUser()`.
 - After a tier mutation, the UI should force a session refresh where appropriate.
 - Server-side authorization that must take effect immediately must consult the authoritative Clerk metadata or an explicit server-side entitlement cache/invalidation mechanism.
-- Never allow the client to directly modify `publicMetadata.tier`; Clerk public metadata is backend-writable and frontend-readable, making it appropriate for backend-controlled product state that the UI may display. citeturn102115search2
+- Never allow the client to directly modify `publicMetadata.tier`/`role`; Clerk public metadata is backend-writable and frontend-readable, making it appropriate for backend-controlled product state that the UI may display.
 
-## 4. Tier-management endpoint
+## 4. Tier and role administration endpoints
 
-Tier changes are an administrative product operation, not a self-service user operation.
+Tier and role changes are administrative product operations, not self-service user operations.
 
-### Endpoint
+### Endpoints
 
 ```http
 PATCH /api/v1/admin/users/:userId/tier
+PATCH /api/v1/admin/users/:userId/role
 ```
 
-Request:
+Tier request (`tier: free|plus|pro|enterprise`):
 
 ```json
 {
-  "tier": "free"
+  "tier": "pro",
+  "reason": "optional, max 280 chars"
 }
 ```
 
-or, once enabled:
+Role request (`role: admin|support|user`):
 
 ```json
 {
-  "tier": "pro"
+  "role": "support",
+  "reason": "optional, max 280 chars"
 }
 ```
 
 ### Authorization
 
-- Caller must be authenticated.
-- Caller must have an explicit TubeLens admin capability/role.
-- The target user ID must be validated as a Clerk user ID.
-- The endpoint must never accept a caller-supplied role/tier override that changes the caller's own privileges.
-- Tier changes must be audited.
+- Caller must be authenticated (401 `unauthenticated` when signed out).
+- Caller must have `publicMetadata.role === "admin"` (403 `forbidden` otherwise).
+- The target `:userId` must match `/^user_[A-Za-z0-9]+$/` (400 `invalid_user_id`).
+- Reject self-escalation: no caller-supplied field may change the caller's own privileges.
+- Forbid self-demotion: `actor === target && role !== "admin"` → 403.
+- Unknown tier → 400 `invalid_tier`; unknown role → 400 `invalid_role`.
+- Never enforce admin checks only in `proxy.ts` (`proxy.ts` is not a complete authZ boundary, cf CVE-2025-29927); enforce inside the handler/service via `requireAdmin()`. Do not use `auth.protect()` in Route Handlers (throws 404) — return 401/403 manually.
+- Tier and role changes must be audited.
 
 ### Implementation
 
-Use Clerk's dedicated metadata update API/SDK (`updateUserMetadata`) rather than the deprecated general user-update metadata path. Clerk's current API exposes dedicated metadata endpoints for these operations. citeturn887591search1turn887591search3
+Use Clerk's dedicated metadata update SDK, which wraps `PATCH /v1/users/{userId}/metadata` (deep-merge, `null` removes a key):
+
+```ts
+clerkClient.users.updateUserMetadata(userId, { publicMetadata: { tier } })
+```
+
+Since API version 2026-05-12, metadata is rejected on the general `updateUser()` path — the dedicated method is required.
 
 Write only the minimal product metadata:
 
@@ -132,6 +163,14 @@ Return the effective tier plus an explicit freshness note when relevant:
 ```
 
 The exact response should follow the existing TubeLens envelope conventions.
+
+### References (Clerk docs the autonomous bot can read directly)
+
+- Basic RBAC (roles via publicMetadata): https://clerk.com/docs/guides/secure/basic-rbac
+- Update user metadata (dedicated method, `PATCH /v1/users/{userId}/metadata`): https://clerk.com/docs/reference/backend/user/update-user-metadata
+- Customize session tokens (projection template): https://clerk.com/docs/guides/sessions/customize-session-tokens
+- `auth()` in App Router Route Handlers: https://clerk.com/docs/nextjs/reference/app-router/auth
+- Next.js authentication guide 2026: https://clerk.com/articles/nextjs-authentication-guide-2026 — note the 2026-05-12 API change: metadata is rejected on general `updateUser()` and must use the dedicated metadata method.
 
 ## 5. Self-service plan information
 
@@ -389,7 +428,9 @@ A usage record keeps its policy version so support/admin tools can explain why a
 
 ## 15. Part B / Part C integration rule
 
-Part C MCP must consume the same tier, entitlement, quota, and rate-limit services as REST.
+Part C MCP is a **thin wrapper**: each tool authenticates the caller via Clerk, then calls the **same shared service functions** as the REST Route Handlers and returns the same data. No HTTP loopback to `localhost/api`, no separate business logic.
+
+Part C MCP must consume the same tier, entitlement, quota, and rate-limit services as REST. Auth runs **before** tool execution; the shared `src/lib/auth.ts` (`AuthContext`, `getEffectiveTier`, `requireAuth`/`requireAdmin`) and `src/lib/quota.ts` (operation → cost map) serve REST first and MCP later. Envelope, cursor, and cache helpers are reused, not reimplemented.
 
 There must be no separate:
 
@@ -401,3 +442,13 @@ MCP user database
 ```
 
 unless a future product requirement explicitly creates an MCP-specific policy. Even then, it should reference the same underlying identity and account model.
+
+## 16. Auth/quota foundation (built for REST first, reused by MCP later)
+
+Build these files during Part B so later MCP is a one-PR spike:
+
+- `src/lib/auth.ts` — `AuthContext`, `getEffectiveTier()` (claim → ranked tier, fallback `free`), `requireAuth()`/`requireAdmin()` returning typed 401/403; consumed by REST handlers first, called by MCP tools later.
+- `src/lib/quota.ts` — operation → cost map wrapping the weighted-credit stub; single source for REST + MCP charging.
+- Reuse `src/lib/envelope`, `src/lib/cache`, cursor helpers in both surfaces.
+
+Later MCP spike (one PR, after Part B): `bun add xmcp @xmcp-dev/clerk`, `clerkProvider` in `src/middleware.ts` (JWKS Bearer verify, DCR enabled in Clerk Dashboard), `/mcp` route whose tools call `getSession()` → `getEffectiveTier()` → shared service fns → same data as REST.
