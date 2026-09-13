@@ -1,5 +1,6 @@
 import type { NextRequest } from "next/server";
-import { CACHE_CONTROL, getRequestId, successResponse } from "@/lib/envelope";
+import { CACHE_CONTROL, successResponse } from "@/lib/envelope";
+import { withRequestContext } from "@/lib/pipeline";
 
 export const runtime = "nodejs";
 
@@ -20,9 +21,16 @@ const defaultDeps: HealthDeps = {
 // Liveness + youtubei.ts session status. Liveness must stay green, so an
 // upstream session failure returns 200 with session "degraded" plus a
 // warnings entry — never a 500.
+//
+// Phase 01 (Part B): GET runs through the shared request pipeline
+// (withRequestContext) so every call gets a typed RequestContext; the
+// envelope output is unchanged (Part A wire contract preserved).
 export async function GET(req: NextRequest) {
-  const requestId = getRequestId(req);
-  return handleHealth(requestId, defaultDeps);
+  return withRequestContext(
+    async (_r, ctx) => handleHealth(ctx.requestId, defaultDeps),
+    {},
+    "health",
+  )(req);
 }
 
 export async function handleHealth(
