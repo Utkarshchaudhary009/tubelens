@@ -553,6 +553,26 @@ export interface ClassifiedVideoError {
   retryAfter?: number;
 }
 
+/** Upstream HTTP status carried on thrown provider errors (if any). */
+function errorStatusOf(err: unknown): number | undefined {
+  if (typeof err === "object" && err !== null) {
+    const status = (err as Record<string, unknown>).status;
+    return typeof status === "number" ? status : undefined;
+  }
+  return undefined;
+}
+
+/** Retry-After seconds carried on thrown provider errors (if any). */
+function errorRetryAfterOf(err: unknown): number | undefined {
+  if (typeof err === "object" && err !== null) {
+    const v = (err as Record<string, unknown>).retryAfter;
+    return typeof v === "number" && Number.isFinite(v) && v >= 0
+      ? Math.round(v)
+      : undefined;
+  }
+  return undefined;
+}
+
 /**
  * Shared timeout/abort signal: the 8s fail-fast surfaces as
  * TimeoutError/AbortError. Single copy used by /search and
@@ -685,8 +705,20 @@ export function classifyCaptionsError(err: unknown): ClassifiedVideoError {
  * get_transcript 5xx/network failures fall through (no 4xx status), so
  * outages still report 502/504 via classifyVideoError, as do private/deleted
  * videos (video_not_found) — never a misleading transcript_unavailable.
+ * Provider HTTP errors carry their status: 429 -> 429 rate_limited
+ * (Retry-After preserved, defaulting to 60s), checked first so a transient
+ * never misclassifies as a missing transcript.
  */
 export function classifyTranscriptError(err: unknown): ClassifiedVideoError {
+  if (errorStatusOf(err) === 429) {
+    return {
+      code: "rate_limited",
+      message: "Transcript providers rate-limited upstream.",
+      hint: "Back off and retry after the Retry-After seconds.",
+      status: 429,
+      retryAfter: errorRetryAfterOf(err) ?? 60,
+    };
+  }
   const raw =
     err instanceof Error ? `${err.name}: ${err.message}` : String(err);
   if (

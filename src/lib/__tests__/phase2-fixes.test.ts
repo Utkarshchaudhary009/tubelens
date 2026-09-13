@@ -148,13 +148,13 @@ describe("finding 2: empty transcript -> 404 transcript_unavailable", () => {
     const res = await handleTranscript(
       req(`http://x/api/v1/videos/${id}/transcript`),
       id,
-      { fetchTranscript: async () => [] },
+      { fetchNative: async () => [] },
     );
     expect(res.status).toBe(404);
     const body = await res.json();
     expect(body.error.code).toBe("transcript_unavailable");
     expect(body.error.hint).toMatch(/hide the transcript panel/i);
-    expect(cacheGet(`transcript:v1:${id}`)).toBeUndefined();
+    expect(cacheGet(`transcript:v1:${id}:en`)).toBeUndefined();
   });
 
   test("fresh-empty with stale copy -> stale wins (200 + warning)", async () => {
@@ -163,13 +163,13 @@ describe("finding 2: empty transcript -> 404 transcript_unavailable", () => {
     const segments = [{ startSeconds: 0, text: "hi" }];
     const primed = await (
       await handleTranscript(req(url), id, {
-        fetchTranscript: async () => segments,
+        fetchNative: async () => segments,
       })
     ).json();
     expect(primed.data).toEqual(segments);
-    cacheSet(`transcript:v1:${id}`, primed.data, -1, 60 * 60 * 1000);
+    cacheSet(`transcript:v1:${id}:en`, primed.data, -1, 60 * 60 * 1000);
     const res = await handleTranscript(req(url), id, {
-      fetchTranscript: async () => [],
+      fetchNative: async () => [],
     });
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -180,9 +180,9 @@ describe("finding 2: empty transcript -> 404 transcript_unavailable", () => {
   test("stale-empty copy -> 404, never 200", async () => {
     const id = "GGGGGGGGGGG";
     const url = `http://x/api/v1/videos/${id}/transcript`;
-    cacheSet(`transcript:v1:${id}`, [], -1, 60 * 60 * 1000);
+    cacheSet(`transcript:v1:${id}:en`, [], -1, 60 * 60 * 1000);
     const res = await handleTranscript(req(url), id, {
-      fetchTranscript: async () => {
+      fetchNative: async () => {
         throw new Error("429 Too Many Requests");
       },
     });
@@ -204,13 +204,13 @@ describe("finding 2: empty transcript -> 404 transcript_unavailable", () => {
     const segments = [{ startSeconds: 0, text: "hi" }];
     const primed = await (
       await handleTranscript(req(url), id, {
-        fetchTranscript: async () => segments,
+        fetchNative: async () => segments,
       })
     ).json();
     expect(primed.data).toEqual(segments);
-    cacheSet(`transcript:v1:${id}`, primed.data, -1, 60 * 60 * 1000);
+    cacheSet(`transcript:v1:${id}:en`, primed.data, -1, 60 * 60 * 1000);
     const res = await handleTranscript(req(url), id, {
-      fetchTranscript: async () => {
+      fetchNative: async () => {
         throw new Error("429 Too Many Requests");
       },
     });
@@ -510,7 +510,7 @@ describe("review: narrow captions/transcript classifiers", () => {
       req(`http://x/api/v1/videos/${id}/transcript`),
       id,
       {
-        fetchTranscript: async () => {
+        fetchNative: async () => {
           throw transcriptFailure;
         },
       },
@@ -818,13 +818,13 @@ describe("review: stale never served on video_not_found", () => {
     const segments = [{ startSeconds: 0, text: "hi" }];
     const primed = await (
       await handleTranscript(req(url), id, {
-        fetchTranscript: async () => segments,
+        fetchNative: async () => segments,
       })
     ).json();
     expect(primed.data).toEqual(segments);
-    cacheSet(`transcript:v1:${id}`, primed.data, -1, 60 * 60 * 1000);
+    cacheSet(`transcript:v1:${id}:en`, primed.data, -1, 60 * 60 * 1000);
     const res = await handleTranscript(req(url), id, {
-      fetchTranscript: async () => {
+      fetchNative: async () => {
         throw new Error("Video deleted or removed");
       },
     });

@@ -433,7 +433,7 @@ describe("transcript handler (mocked upstream)", () => {
       req("http://x/api/v1/videos/!!/transcript"),
       "!!",
       {
-        fetchTranscript: async () => {
+        fetchNative: async () => {
           throw new Error("must not run");
         },
       },
@@ -446,7 +446,7 @@ describe("transcript handler (mocked upstream)", () => {
     const res = await handleTranscript(
       req("http://x/api/v1/videos/dQw4w9WgXcQ/transcript"),
       "dQw4w9WgXcQ",
-      { fetchTranscript: async () => segments },
+      { fetchNative: async () => segments },
     );
     expect(res.status).toBe(200);
     expect(res.headers.get("Cache-Control")).toContain("s-maxage=86400");
@@ -460,7 +460,7 @@ describe("transcript handler (mocked upstream)", () => {
       req("http://x/api/v1/videos/dQw4w9WgXcQ/transcript"),
       "dQw4w9WgXcQ",
       {
-        fetchTranscript: async () => {
+        fetchNative: async () => {
           throw new Error(
             "Engagement panels not found. Video likely has no transcript.",
           );
@@ -478,12 +478,12 @@ describe("transcript handler (mocked upstream)", () => {
     const url = `http://x/api/v1/videos/${id}/transcript`;
     const primed = await (
       await handleTranscript(req(url), id, {
-        fetchTranscript: async () => segments,
+        fetchNative: async () => segments,
       })
     ).json();
-    cacheSet(`transcript:v1:${id}`, primed.data, -1, 60 * 60 * 1000);
+    cacheSet(`transcript:v1:${id}:en`, primed.data, -1, 60 * 60 * 1000);
     const res = await handleTranscript(req(url), id, {
-      fetchTranscript: async () => {
+      fetchNative: async () => {
         throw new Error("429 Too Many Requests");
       },
     });
@@ -499,7 +499,7 @@ describe("transcript handler (mocked upstream)", () => {
       req("http://x/api/v1/videos/CCCCCCCCCCC/transcript"),
       "CCCCCCCCCCC",
       {
-        fetchTranscript: async () => {
+        fetchNative: async () => {
           throw new Error("Transcript continuation not found.");
         },
       },
