@@ -16,6 +16,23 @@ The workflow has checked out the PR and installed OpenCode. You have a full Linu
 
 Do not use a fixed route checklist. Test what the changes make relevant.
 
+## Supporting services and Docker
+
+The E2E environment is allowed to use Docker as a real integration environment, not only as a last-resort workaround. When a PR depends on stateful or external infrastructure, start temporary isolated services as needed.
+
+Examples include, but are not limited to:
+
+- **Redis** for distributed rate limiting, counters, locks, cache coordination, or quota-window tests;
+- **Postgres** for durable product state, API-key metadata, plans/entitlements, usage records, audit data, or other persistence tests;
+- **PostHog** using a self-hosted Docker setup when validating analytics delivery, event capture, identity behavior, or analytics-outage handling;
+- other databases, queues, mock upstreams, object stores, or infrastructure required to reproduce the changed behavior faithfully.
+
+Prefer Docker Compose or equivalent isolated containers/networks when multiple services are required together. Seed disposable test data as needed. Use temporary volumes and clean up containers, networks, and volumes after verification unless the workflow intentionally preserves an artifact for diagnostics.
+
+Do not avoid an integration test merely because the dependency is stateful. The purpose of E2E is to verify the real request path through the application and its required infrastructure.
+
+For third-party SaaS such as Clerk, use dedicated test configuration/credentials when available or a deterministic test seam approved by the repository. Never print or commit production secrets. Do not attempt to replace a real Clerk verification path with a fake implementation when the PR's purpose is to validate Clerk integration; use a controlled test account/token or the repository's documented test mechanism.
+
 Do not make product/code changes as part of the review. You may create temporary files or services needed for testing, preferably outside the repository.
 
 Do not modify `AGENTS.md`, `AGENTS.E2E.md`, workflows, or other repository configuration.
@@ -30,7 +47,7 @@ Rules:
 - Use GitHub Markdown UI elements when they materially improve clarity: `<details>/<summary>` for test evidence or diagnostics; `[!IMPORTANT]`, `[!WARNING]`, or `[!NOTE]` for findings that deserve emphasis; tables when they improve comparison.
 - Never hide an important failure inside a collapsed section.
 - Keep routes, files, status codes, and technical identifiers in code formatting.
-- No greetings, filler, conversational language, internal reasoning, emojis, or unnecessary logs.
+- No greetings, filler, conversational language, emojis, internal reasoning, or unnecessary logs.
 - Do not create separate top-level comments for separate failures; group them into one E2E result.
 
 ### PASS
