@@ -12,6 +12,7 @@
 // pure `./factory` / `./health` modules the client binds.
 
 import { afterEach, describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
@@ -44,16 +45,38 @@ afterEach(() => {
   }
 });
 
+interface MockSqlQuery {
+  text: string;
+  signal: AbortSignal | undefined;
+}
+
 function mockSql(
-  impl: (
-    strings: TemplateStringsArray,
-    ...params: unknown[]
-  ) => Promise<unknown> = async () => [{ "?column?": 1 }],
+  impl: (text: string) => Promise<unknown> = async () => [{ "?column?": 1 }],
+  queries?: MockSqlQuery[],
 ): SqlClient {
-  const fn = async (
-    strings: TemplateStringsArray,
-    ...params: unknown[]
-  ): Promise<unknown> => impl(strings, ...params);
+  const record = (text: string, signal: AbortSignal | undefined) => {
+    queries?.push({ text, signal });
+  };
+  const fn = Object.assign(
+    async (
+      _strings: TemplateStringsArray,
+      ..._params: unknown[]
+    ): Promise<unknown> => {
+      record("<template>", undefined);
+      return impl("<template>");
+    },
+    {
+      query: async (
+        text: string,
+        _params?: unknown[],
+        queryOpts?: { fetchOptions?: { signal?: AbortSignal } },
+      ): Promise<unknown> => {
+        const signal = queryOpts?.fetchOptions?.signal;
+        record(text, signal);
+        return impl(text);
+      },
+    },
+  );
   return fn as unknown as SqlClient;
 }
 
@@ -152,6 +175,21 @@ describe("checkDbHealth", () => {
     expect(deps.calls.createSql).toBe(0);
   });
 
+  test("probe threads the abort signal into the driver query", async () => {
+    const queries: MockSqlQuery[] = [];
+    const deps = mockDeps({
+      createSql: (_url: string) =>
+        mockSql(async () => [{ "?column?": 1 }], queries),
+    });
+    const store = createDbStore(deps);
+    const health = await checkDbHealth(() => store.getSql());
+    expect(health.ok).toBe(true);
+    expect(queries.length).toBe(1);
+    expect(queries[0]?.text).toBe("SELECT 1");
+    expect(queries[0]?.signal).toBeInstanceOf(AbortSignal);
+    expect(queries[0]?.signal?.aborted).toBe(false);
+  });
+
   test("forced timeout fails bounded well under the 8s budget", async () => {
     const hanging = () => new Promise<never>(() => {});
     const deps = mockDeps({
@@ -163,6 +201,49 @@ describe("checkDbHealth", () => {
     const elapsed = Date.now() - started;
     expect(health).toMatchObject({ ok: false, code: "db_timeout" });
     expect(elapsed).toBeLessThan(2000);
+  });
+
+  test("driver-side abort maps to typed db_timeout (never a bare 500)", async () => {
+    // Mirror a driver that cancels the underlying fetch when the probe's
+    // timeout signal aborts: reject with AbortError on abort.
+    const captured: { signal?: AbortSignal } = {};
+    const deps = mockDeps({
+      createSql: (_url: string) => {
+        const fn = Object.assign(
+          async (): Promise<unknown> => [{ "?column?": 1 }],
+          {
+            query: async (
+              _text: string,
+              _params?: unknown[],
+              queryOpts?: { fetchOptions?: { signal?: AbortSignal } },
+            ): Promise<unknown> => {
+              const signal = queryOpts?.fetchOptions?.signal;
+              captured.signal = signal;
+              return new Promise<unknown>((_resolve, reject) => {
+                signal?.addEventListener(
+                  "abort",
+                  () => {
+                    const err = new Error("The operation was aborted.");
+                    err.name = "AbortError";
+                    reject(err);
+                  },
+                  { once: true },
+                );
+              });
+            },
+          },
+        );
+        return fn as unknown as SqlClient;
+      },
+    });
+    const store = createDbStore(deps);
+    const health = await checkDbHealth(() => store.getSql(), 25);
+    expect(health).toMatchObject({
+      ok: false,
+      code: "db_timeout",
+      status: 504,
+    });
+    expect(captured.signal).toBeInstanceOf(AbortSignal);
   });
 
   test("default fail-fast budget is 8s", () => {
@@ -192,6 +273,35 @@ describe("server-only boundary (static note)", () => {
 });
 
 function repoTextFiles(): string[] {
+  // Scan Git-tracked files only: a developer following the documented
+  // workflow keeps a real DATABASE_URL in gitignored `.env.local`, which
+  // must never fail the suite — only committed code is scanned. When git
+  // is unavailable, fall back to the directory walk (same skips).
+  try {
+    const out = execFileSync("git", ["ls-files", "-z"], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return out
+      .split("\0")
+      .filter((f) => f.length > 0)
+      .map((f) => join(REPO_ROOT, f))
+      .filter((f) => underSizeLimit(f));
+  } catch {
+    return walkRepoFiles();
+  }
+}
+
+function underSizeLimit(full: string): boolean {
+  try {
+    return statSync(full).size <= 1024 * 1024;
+  } catch {
+    return false;
+  }
+}
+
+function walkRepoFiles(): string[] {
   const skipDirs = new Set([
     ".git",
     "node_modules",
@@ -213,14 +323,9 @@ function repoTextFiles(): string[] {
         continue;
       }
       const full = join(dir, entry.name);
-      try {
-        if (statSync(full).size > 1024 * 1024) {
-          continue;
-        }
-      } catch {
-        continue;
+      if (underSizeLimit(full)) {
+        out.push(full);
       }
-      out.push(full);
     }
   };
   walk(REPO_ROOT);

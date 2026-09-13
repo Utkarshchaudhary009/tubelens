@@ -31,9 +31,12 @@ export async function checkDbHealth(
 ): Promise<DbHealth> {
   const started = Date.now();
   try {
-    await withDbTimeout(async () => {
+    // The signal is threaded into the driver (fetchOptions.signal) so the
+    // underlying Neon fetch is cancelled on timeout — not just the race.
+    // A driver-side abort surfaces as AbortError and maps to db_timeout.
+    await withDbTimeout(async (signal) => {
       const sql = await getSql();
-      await sql`SELECT 1`;
+      await sql.query("SELECT 1", [], { fetchOptions: { signal } });
     }, timeoutMs);
     return { ok: true, latencyMs: Date.now() - started };
   } catch (err) {
@@ -46,7 +49,13 @@ export async function checkDbHealth(
         status: 503,
       };
     }
-    if (err instanceof Error && err.name === "TimeoutError") {
+    if (
+      err instanceof Error &&
+      // AbortError can only come from this probe's own timeout signal, so
+      // it is the same budget-exceeded outcome as the race gate's
+      // TimeoutError — never a bare 500.
+      (err.name === "TimeoutError" || err.name === "AbortError")
+    ) {
       return {
         ok: false,
         code: "db_timeout",
