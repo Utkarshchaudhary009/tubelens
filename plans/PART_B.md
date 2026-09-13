@@ -1,19 +1,21 @@
-# TubeLens — Part B: Identity, Access, Usage & Product Intelligence
+# TubeLens — Part B: Identity, Access, Usage & Observability
 
 Part B is the product/account platform layer that sits between the completed REST API (Part A) and the MCP layer (Part C).
 
-**Goal:** turn the API from a public collection of routes into a controlled developer product with identity, machine authentication, quota/rate limiting, usage visibility, product analytics, and a foundation for future posting/mutations.
+**Goal:** turn the API from a public collection of routes into a controlled developer product with identity, machine authentication, quota/rate limiting, operational observability, usage visibility, and a foundation for future posting/mutations.
 
 **Primary systems:**
-- **Clerk** — user identity, sessions, organizations/roles where needed, and machine-token verification.
+- **Clerk** — user identity, sessions, API keys, organizations/roles where needed, and machine authentication.
 - **Upstash Redis** — distributed rate limiting, short-lived counters, abuse controls, and optional ephemeral usage state.
-- **PostHog** — product analytics, funnels, feature adoption, activation, experiments, and backend/API usage analytics.
-- **Postgres** — durable product data that must survive process restarts: API keys/metadata if not stored by Clerk, plans, entitlements, usage summaries, audit records, and future posting-related state. Use the selected hosted/free-tier Postgres in production only where durable state is actually required.
+- **Postgres** — durable product data: plans, entitlements, API-key/product metadata, usage summaries, audit records, and future posting-related state. Clerk remains authoritative for Clerk-managed credentials.
+- **Datadog** — backend observability: traces/APM, structured logs, metrics, error monitoring, service health, latency, and infrastructure correlation. Datadog's current Next.js integration supports the App Router and can correlate frontend RUM with backend traces/logs; server-side Node instrumentation uses `dd-trace`. citeturn164837search0turn164837search1
 - **Vercel** — application/runtime deployment.
 
-> **Architecture rule:** authentication, authorization, rate limiting, quota, analytics, and durable product state are separate concerns. Do not use PostHog as the source of truth for security/billing/usage, and do not use Redis as the durable product database.
+> **Deferred:** PostHog is intentionally not part of Part B. Add PostHog after the UI/marketing/product surface exists, when funnels, feature adoption, experiments, and user-journey analytics become more valuable.
 
-> **Testing rule:** local/CI E2E may run Redis, Postgres, PostHog, and other required dependencies in isolated Docker containers/networks. Production architecture must not inherit test-only dependencies or state.
+> **Architecture rule:** authentication, authorization, rate limiting, quota, observability, and durable product state are separate concerns. Datadog is observability, not the source of truth for security/billing/usage. Redis is not the durable product database.
+
+> **Testing rule:** local/CI E2E may run Redis, Postgres, Datadog-compatible telemetry stubs/collectors, and other required dependencies in isolated Docker containers/networks. Production architecture must not inherit test-only dependencies or state.
 
 ## B1 — Platform foundation and boundaries
 
@@ -22,17 +24,17 @@ Part B is the product/account platform layer that sits between the completed RES
 **Goal:** establish the shared request context and clean boundaries before adding providers.
 
 **Implementation:**
-- Define canonical request context containing request ID, auth principal, plan/entitlements, rate-limit identity, and analytics identity.
-- Establish explicit layers: `auth` → `authorization` → `rate-limit/quota` → `service` → `analytics` → response.
-- Keep provider-specific code isolated under `src/lib/auth`, `src/lib/rate-limit`, `src/lib/analytics`, and `src/lib/product`.
+- Define canonical request context containing request ID, auth principal, plan/entitlements, rate-limit identity, and observability context.
+- Establish explicit layers: `auth` → `authorization` → `rate-limit/quota` → `service` → `observability` → response.
+- Keep provider-specific code isolated under `src/lib/auth`, `src/lib/rate-limit`, `src/lib/observability`, and `src/lib/product`.
 - Do not put provider calls directly in individual endpoint business logic.
-- Define environment/config validation for Clerk, Redis, PostHog, and Postgres.
+- Define environment/config validation for Clerk, Redis, Datadog, and Postgres.
 - Define fail-open/fail-closed rules per dependency before implementation.
 
 **Exit criteria:**
 - A representative REST request can flow through the new context without changing successful API output.
 - Existing Part A tests remain green.
-- Missing optional analytics configuration does not break public API functionality; missing security-critical configuration fails safely.
+- Missing optional observability configuration does not break public API functionality; missing security-critical configuration fails safely.
 
 ## B2 — Clerk user authentication
 
@@ -61,17 +63,18 @@ Part B is the product/account platform layer that sits between the completed RES
 **Goal:** make TubeLens usable by scripts, backend services, and future MCP clients without tying machine access to a browser session.
 
 **Implementation:**
-- Use Clerk-supported machine authentication where appropriate and define the canonical accepted credential types.
-- Add a TubeLens developer API-key model with opaque, revocable credentials if the product needs dedicated API keys separate from Clerk session tokens.
-- Store only non-secret key metadata and a secure verifier/hash where durable key storage is required; show plaintext secrets only once at creation time.
-- Give each key a stable ID, owner, creation time, last-used time, status, plan/entitlement binding, and optional environment label.
-- Support immediate revocation and rotation.
+- Prefer **Clerk API Keys** for developer credentials where they fit the product model. Clerk currently provides API-key creation for users/organizations and client/backend management components/hooks; use those primitives instead of inventing a parallel credential authority. citeturn226502search6turn226502search9turn226502search10
+- Define TubeLens-specific metadata around each Clerk API key: internal key reference, owner, environment/label, plan/entitlement binding, created time, last-used time, status, and optional project/application association.
+- If a future requirement cannot be satisfied by Clerk API Keys, introduce a dedicated opaque TubeLens key model only after documenting the reason; do not maintain two independent key authorities by default.
+- Never store plaintext secrets in Postgres. The application should only receive/display a newly created secret according to Clerk's supported API-key lifecycle and never persist a copy itself.
+- Support immediate revocation/rotation through the authoritative credential provider.
 - Ensure API credentials work consistently with REST and remain compatible with the future Part C MCP endpoint.
 
 **Exit criteria:**
 - A machine request authenticates without a browser session.
 - Revoked keys stop working immediately or within the documented propagation window.
-- Credentials never appear in logs, PostHog events, error payloads, or telemetry.
+- Credentials never appear in logs, Datadog events, error payloads, or telemetry.
+- TubeLens-specific key metadata remains queryable independently of credential secrecy.
 
 ## B4 — Distributed rate-limit engine
 
@@ -80,7 +83,7 @@ Part B is the product/account platform layer that sits between the completed RES
 **Goal:** build a genuinely strong serverless-safe rate-limit layer rather than a per-process counter.
 
 **Implementation:**
-- Use Upstash Redis through its HTTP-based rate-limit tooling so limits work across Vercel/serverless instances.
+- Use Upstash Redis through its HTTP-based rate-limit tooling so limits work across Vercel/serverless instances. Upstash's TypeScript limiter supports identifiers, sliding windows, token buckets, request costs, analytics, and dynamic limits. citeturn226502search2turn226502search4turn226502search7turn226502search8
 - Centralize all policy in `src/lib/rate-limit/policies.ts`; routes declare cost/class, not raw algorithms.
 - Apply multiple dimensions where appropriate: anonymous IP, authenticated user, API key, organization/project, and protected endpoint class.
 - Use endpoint/request costs instead of treating every request as equal.
@@ -112,7 +115,7 @@ Part B is the product/account platform layer that sits between the completed RES
 **Implementation:**
 - Define plans/entitlements independently from Clerk user records.
 - Represent usage as weighted credits/units rather than raw request count.
-- Redis handles hot-window enforcement; durable storage records data that must survive restarts or support account-level reporting.
+- Redis handles hot-window enforcement; Postgres records data that must survive restarts or support account-level reporting.
 - Define monthly/daily windows, rollover/reset behavior, and the authoritative source for each metric.
 - Record enough durable metadata to explain why a request was accepted or denied.
 - Expose the existing `/api/v1/quota` semantics consistently for authenticated developers.
@@ -120,67 +123,63 @@ Part B is the product/account platform layer that sits between the completed RES
 
 **Exit criteria:**
 - A user can understand remaining allowance and reset time.
-- Rate limit and quota decisions are reproducible from server state.
+- Rate-limit and quota decisions are reproducible from server state.
 - Usage cannot be inflated by switching credentials or deployment instances.
 - The system can later add paid plans without changing every route.
 
-## B6 — PostHog product analytics foundation
+## B6 — Datadog observability foundation
 
 **Status:** `[ ]` not started.
 
-**Goal:** instrument the product around activation and retention, not collect random event spam.
+**Goal:** make backend behavior visible enough to operate the API reliably before a full UI/product analytics stack exists.
 
 **Implementation:**
-- Integrate PostHog on the browser using the Next.js-recommended client entry point.
-- Add a small typed event registry under `src/lib/analytics/events.ts`.
-- Add a server-side PostHog client for API/backend events.
-- Identify authenticated users using stable Clerk user IDs, never email addresses as the primary identity.
-- Reset analytics identity on logout.
-- Define the first product funnel:
-  `landing_viewed → signup_completed → api_key_created → first_api_request → successful_api_request`.
-- Define activation/retention events around actual product value, not vanity clicks.
-- Keep event capture non-blocking and prevent analytics outages from breaking API responses.
+- Integrate Datadog's current Node/Next.js tracing path using `dd-trace` for Node runtime code; keep tracing initialization isolated from application business logic. Datadog's current Next.js guidance supports Next.js 13.4+ and recommends Node-only initialization for server instrumentation. citeturn164837search1turn164837search2
+- Add structured application logging with request ID, route, status, latency, auth type, rate-limit result, cache result, and upstream dependency context.
+- Capture traces for REST Route Handlers and important service/upstream operations.
+- Define service/environment/version tags so deploys and incidents can be correlated.
+- Add error monitoring and exception context without recording credentials or raw sensitive input.
+- Add custom metrics for request volume, latency, 4xx/5xx rates, upstream failures, cache hit rate, rate-limit rejections, and quota exhaustion.
+- Configure sampling intentionally; do not collect every noisy event forever by default.
+- Keep observability asynchronous/non-critical where possible so Datadog degradation cannot take down the API.
 
 **Exit criteria:**
-- One authenticated developer has a coherent identity across web and server events.
-- The signup → first successful API request funnel is measurable.
-- Analytics can be disabled in local/test environments without affecting application correctness.
+- A request can be followed from incoming API route through important service/upstream spans.
+- Errors show enough context to diagnose the responsible route/dependency.
+- p50/p95/p99 latency can be inspected for the major API groups.
+- No API key, token, authorization header, or sensitive request content is emitted.
 
-## B7 — API usage analytics and operational intelligence
+## B7 — API reliability and operational intelligence
 
 **Status:** `[ ]` not started.
 
-**Goal:** make PostHog useful for product decisions and make the backend measurable without turning PostHog into an operational database.
+**Goal:** turn Datadog from "logs are somewhere" into an operational feedback system.
 
-**Server events should include:**
-- `api_request`
-- `api_error`
-- `api_rate_limited`
-- `quota_exhausted`
-- `api_key_created`
-- `api_key_revoked`
-- feature-adoption events for high-value capabilities such as transcript, combined, batch, and future MCP
+**Dashboards:**
+- API overview: traffic, p50/p95/p99 latency, error rate, saturation.
+- Endpoint health: latency/error distribution by logical endpoint.
+- Upstream health: YouTube/third-party provider latency, status codes, timeouts.
+- Rate limiting: rejected requests, hottest identities, policy hits, Redis latency/errors.
+- Quota: consumption, exhaustion events, high-cost endpoints.
+- Deployment health: version-to-version error/latency comparisons.
 
-**Useful properties:**
-- logical endpoint/tool name
-- HTTP method or operation type
-- status class
-- latency bucket or bounded latency value
-- auth type
-- plan
-- request cost
-- cache hit/miss classification where useful
-- safe country/region classification only when legitimately needed
+**Monitors / alerts:**
+- sustained 5xx spike;
+- p95 latency regression;
+- abnormal upstream failure rate;
+- Redis/rate-limit dependency failure;
+- quota/rate-limit anomalies;
+- elevated authentication failures;
+- production deployment regression.
 
 **Rules:**
-- Never send secrets, authorization headers, API keys, raw tokens, full request URLs with sensitive query material, or raw user content unless separately justified.
-- Do not use PostHog data as authoritative quota/billing/security state.
-- Sample noisy low-value events if volume becomes excessive.
+- Prefer server-side operational telemetry over product-behavior analytics at this stage.
+- Use bounded/sanitized attributes instead of raw request content.
+- Correlate logs and traces using request/trace identifiers. Datadog's Node integration can automatically inject trace and service context into logs when configured through its APM instrumentation. citeturn164837search4
 
 **Exit criteria:**
-- Product can answer which endpoints drive activation and continued usage.
-- Product can identify top error/rate-limit pain points.
-- Analytics failure never causes an API request to fail.
+- An engineer can answer "what is broken?", "where?", and "since which deploy?" from Datadog without reproducing the incident locally.
+- Important operational regressions generate actionable alerts rather than dashboard-only signals.
 
 ## B8 — Developer dashboard, usage visibility and controls
 
@@ -190,13 +189,13 @@ Part B is the product/account platform layer that sits between the completed RES
 
 **Implementation:**
 - Developer account area backed by Clerk identity.
-- API-key creation, listing, rotation, and revocation.
+- API-key creation, listing, rotation, and revocation using Clerk-backed credentials.
 - Current plan and entitlement display.
 - Quota/usage summary and reset information.
 - Recent request/usage summary where durable data is available.
 - Clear rate-limit and quota error explanations.
 - Security-sensitive actions require fresh authentication where appropriate.
-- PostHog feature flags may control gradual rollout of dashboard capabilities.
+- Keep the UI independent of Datadog; Datadog remains an operator-facing system.
 
 **Exit criteria:**
 A developer can sign in, create a credential, make an API request, see usage, understand a rate-limit response, and revoke the credential without touching the database or deployment manually.
@@ -213,7 +212,7 @@ A developer can sign in, create a credential, make an API request, see usage, un
 - Add an audit-event model for security-sensitive mutations such as credential creation/revocation and future posting actions.
 - Add idempotency requirements for future POST operations where retries could duplicate effects.
 - Define CSRF/origin requirements for browser-authenticated mutation endpoints.
-- Separate user-generated content from analytics telemetry.
+- Separate user-generated content from observability telemetry.
 - Add abuse limits stricter than read limits for future mutation endpoints.
 - Keep any YouTube write/auth flows behind explicit product, abuse, and legal gates.
 
@@ -227,11 +226,11 @@ A developer can sign in, create a credential, make an API request, see usage, un
 
 **Status:** `[ ]` not started.
 
-**Goal:** prove that identity, rate limiting, quota, analytics, durable state, and the existing REST API work together in a real multi-service environment.
+**Goal:** prove that identity, rate limiting, quota, observability, durable state, and the existing REST API work together in a real multi-service environment.
 
 **E2E environment:**
 - GitHub E2E runs may use Docker Compose or standalone Docker containers.
-- The E2E agent is explicitly allowed to start temporary **Redis, Postgres, PostHog, and other required supporting services** for the test.
+- The E2E agent is explicitly allowed to start temporary **Redis, Postgres, Datadog-compatible telemetry collectors/stubs, and other required supporting services** for the test.
 - Containers must use isolated names/networks/volumes and be cleaned up after the run.
 - Test credentials and seeded data must be disposable.
 - Clerk cloud integration may use dedicated test credentials or a deterministic test seam; do not fabricate production Clerk secrets.
@@ -245,24 +244,24 @@ A developer can sign in, create a credential, make an API request, see usage, un
 - weighted endpoint costs;
 - burst + sustained limit behavior;
 - quota reset/remaining calculation;
-- PostHog server event capture;
-- PostHog outage does not break API responses;
+- Datadog server trace/log/metric emission;
+- Datadog outage does not break API responses;
 - Redis outage follows the documented safety policy;
 - Postgres restart/reconnect preserves durable product state;
 - API key creation/revocation reflected in authorization;
-- no credential leakage into logs or analytics payloads;
+- no credential leakage into logs or telemetry;
 - existing Part A REST regression suite remains green.
 
 **Production gate:**
 - Clerk authentication and authorization are enforced at the resource boundary.
 - Distributed rate limits work across Vercel instances.
 - Quota semantics are documented and deterministic.
-- PostHog identity/event funnels are verified in a non-production or controlled production project.
+- Datadog traces/logs/metrics are verified for the main API paths.
 - Durable data has backup/retention expectations appropriate to its purpose.
 - All security-sensitive events have request IDs/audit context.
 - 401/403/429 behavior is consistent and machine-readable.
-- Docs explain authentication, API keys, quotas, rate limits, and usage.
+- Docs explain authentication, API keys, quotas, rate limits, and operational expectations.
 - Rollback and key-revocation procedures are tested.
 
 **Definition of done:**
-TubeLens has a production-ready identity and platform layer: users can authenticate with Clerk, machines can authenticate safely, distributed rate limits protect the API, durable quota/usage rules support future plans, PostHog gives actionable product intelligence, and future posting/mutation capabilities have a secure foundation — without coupling security or billing truth to analytics.
+TubeLens has a production-ready identity and platform layer: users can authenticate with Clerk, machines can authenticate safely, distributed rate limits protect the API, durable quota/usage rules support future plans, Datadog provides actionable backend observability, and future posting/mutation capabilities have a secure foundation — without coupling security or billing truth to observability telemetry.
