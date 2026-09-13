@@ -241,19 +241,21 @@ export function withRequestContext(
     stampRateLimitHeaders(res, ctx, decision);
 
     // Accounting stage (Phase 01: no-op recorder). Best-effort and bounded:
-    // recorder invocation is deferred off the request path, then raced
-    // against ACCOUNTING_TIMEOUT_MS; a hung recorder observes an abort via
-    // its optional signal, and timeouts/failures vanish through safe().
+    // recorder invocation is dispatched in a later macrotask so it runs
+    // after the route response is delivered, then raced against
+    // ACCOUNTING_TIMEOUT_MS; a hung recorder observes an abort via its
+    // optional signal, and timeouts/failures vanish through safe().
+    // (Nodejs runtime, so setTimeout is always available.)
     const usage = pick(providers.usage, getUsageRecorder());
-    safe(() =>
-      Promise.resolve().then(() => {
+    setTimeout(() => {
+      safe(() => {
         const controller = new AbortController();
         return Promise.race([
           usageRecord(usage, ctx, route, res.ok, controller.signal),
           accountingTimeout(controller),
         ]);
-      }),
-    );
+      });
+    }, 0);
 
     safe(() =>
       observability.log("info", "request served", {
