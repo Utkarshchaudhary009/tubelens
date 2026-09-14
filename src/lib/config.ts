@@ -44,7 +44,11 @@ type Env = Record<string, string | undefined>;
  *   ConfigError rather than silently serving unprotected.
  */
 export function getConfig(env: Env = process.env): PlatformConfig {
-  const datadogApiKey = env.DATADOG_API_KEY ?? env.DD_API_KEY;
+  // Aliases: first non-blank value wins. A blank/whitespace-only primary
+  // must not shadow a valid alias, and whitespace alone is not a key.
+  const datadogApiKey = [env.DATADOG_API_KEY, env.DD_API_KEY].find(
+    (v) => v !== undefined && v.trim() !== "",
+  );
   const observability: ObservabilityConfig = datadogApiKey
     ? { enabled: true }
     : { enabled: false, reason: "missing_datadog_api_key" };

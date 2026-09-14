@@ -18,6 +18,7 @@ import {
 } from "../observability";
 import { createRequestContext, withRequestContext } from "../pipeline";
 import {
+  FREE_ENTITLEMENTS,
   getProductPolicyProvider,
   KNOWN_TIERS,
   normalizeTier,
@@ -108,6 +109,17 @@ describe("config validation + failure policy (Phase 01)", () => {
     const res = await run(req("http://x/api/v1/health"));
     expect(res.status).toBe(200);
     expect((await res.json()).data).toEqual({ ok: true });
+  });
+
+  test("blank datadog primary falls through to alias; whitespace-only disables", () => {
+    expect(
+      getConfig({ DATADOG_API_KEY: "", DD_API_KEY: "dd_valid" }).observability
+        .enabled,
+    ).toBe(true);
+    expect(getConfig({ DATADOG_API_KEY: "   " }).observability.enabled).toBe(
+      false,
+    );
+    expect(getConfig({ DD_API_KEY: "  " }).observability.enabled).toBe(false);
   });
 
   test("required security secret missing fails safely (typed throw)", () => {
@@ -427,6 +439,35 @@ describe("review hardening (Phase 01)", () => {
     expect(res.headers.get("X-Request-Id")).toBe("cfg-1");
   });
 
+  test("config-fault 503 records the error and ends the request span", async () => {
+    let ended = 0;
+    let recorded = 0;
+    const run = withRequestContext(
+      async (_r, ctx) =>
+        successResponse({ ok: true }, { requestId: ctx.requestId }),
+      {
+        env: { TUBELENS_AUTH_ENFORCEMENT: "required" },
+        observability: {
+          ...noopObservabilityProvider,
+          startSpan: () => ({
+            recordError: () => {
+              recorded += 1;
+            },
+            end: () => {
+              ended += 1;
+            },
+          }),
+        },
+      },
+      "health",
+    );
+    const res = await run(req("http://x/api/v1/health", "cfg-span-1"));
+    expect(res.status).toBe(503);
+    expect((await res.json()).error.code).toBe("missing_security_config");
+    expect(recorded).toBe(1);
+    expect(ended).toBe(1);
+  });
+
   test("pipeline serves when the required secret is present", async () => {
     const run = withRequestContext(
       async (_r, ctx) =>
@@ -498,6 +539,19 @@ describe("cubic review findings", () => {
     ]) {
       expect(normalizeTier(other)).toBe("free");
     }
+  });
+
+  test("canonical FREE_ENTITLEMENTS is frozen; per-request copies stay independent", () => {
+    expect(Object.isFrozen(FREE_ENTITLEMENTS)).toBe(true);
+    expect(() => {
+      (FREE_ENTITLEMENTS as { monthlyCredits: number }).monthlyCredits = 1;
+    }).toThrow();
+    const first = getProductPolicyProvider().entitlementsFor("free");
+    first.monthlyCredits = 1;
+    expect(
+      getProductPolicyProvider().entitlementsFor("free").monthlyCredits,
+    ).toBe(10_000);
+    expect(FREE_ENTITLEMENTS.monthlyCredits).toBe(10_000);
   });
 
   test("unknown TUBELENS_AUTH_ENFORCEMENT fails closed, not fail-open", () => {

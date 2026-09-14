@@ -159,6 +159,9 @@ export function withRequestContext(
       getConfig(providers.env ?? process.env);
     } catch (err) {
       if (err instanceof ConfigError) {
+        safe(() => observability.captureError(err, { requestId }));
+        span.recordError(err);
+        span.end();
         return errorResponse(requestId, {
           code: err.code,
           message: "Service configuration is incomplete.",

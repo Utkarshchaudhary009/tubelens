@@ -27,13 +27,16 @@ export interface EntitlementSnapshot {
   policyVersion: string;
 }
 
-export const FREE_ENTITLEMENTS: EntitlementSnapshot = {
+// Frozen: the canonical snapshot must never be mutated in place —
+// entitlementsFor hands out a fresh copy per request, so a poisoned
+// canonical would otherwise propagate to every subsequent caller.
+export const FREE_ENTITLEMENTS: Readonly<EntitlementSnapshot> = Object.freeze({
   tier: "free",
   monthlyCredits: 10_000,
   burstRequests: 60,
   burstWindowSeconds: 10,
   policyVersion: FREE_POLICY_VERSION,
-};
+});
 
 /**
  * Normalize an untrusted tier value. Any canonical known tier
