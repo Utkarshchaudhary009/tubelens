@@ -5,6 +5,9 @@
 // lands here in Phase 02). Routes must depend on this interface, never on
 // provider-specific imports.
 
+import type { NextResponse } from "next/server";
+import { errorResponse } from "./errors";
+
 export type AuthPrincipalType = "anonymous" | "user" | "api_key";
 
 export interface AuthContext {
@@ -51,4 +54,36 @@ export function getAuthProvider(): AuthProvider {
 /** Reset to the Phase 01 anonymous default (primarily for tests). */
 export function resetAuthProvider(): void {
   current = anonymousAuthProvider;
+}
+
+/**
+ * Typed 401 JSON for unauthenticated callers. Machine-readable by design:
+ * protected API routes must return this, never a browser redirect or 404.
+ */
+export function unauthenticatedResponse(requestId: string): NextResponse {
+  return errorResponse(requestId, {
+    code: "unauthenticated",
+    message: "Authentication is required.",
+    hint: "Sign in and retry with a valid session; anonymous callers cannot access this endpoint.",
+    status: 401,
+  });
+}
+
+/**
+ * Gate for protected routes (Phase 02). Returns undefined when the context
+ * carries an authenticated principal, otherwise the typed 401 response.
+ *
+ * Returns (never throws): the pipeline maps handler throws to 500, so a
+ * throwing gate would mask 401s as 500s. Usage:
+ *   const denied = requireAuth(ctx);
+ *   if (denied) return denied;
+ */
+export function requireAuth(ctx: {
+  auth: AuthContext;
+  requestId: string;
+}): NextResponse | undefined {
+  if (ctx.auth.authenticated) {
+    return undefined;
+  }
+  return unauthenticatedResponse(ctx.requestId);
 }
