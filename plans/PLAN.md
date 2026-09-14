@@ -394,7 +394,7 @@ Define configuration validation and dependency failure policy before implementat
 
 ## Phase 02 — Clerk user authentication
 
-**Status:** `[ ]` not started.
+**Status:** `[x]` done — shipped via PR #21 (merged 2026-09-14): Clerk user sessions behind the Phase 01 auth seam + protected `GET /api/v1/me` (typed 200/401 envelope, fail-safe, no secrets client-side) with 643 unit tests + e2e PASS on live upstream. Note: live authenticated-200 path covered by stub-provider unit tests (no Clerk test credentials in CI); sign-in/up/out UI is Clerk-hosted (API-only repo).
 
 **Build:** Integrate the current Clerk Next.js SDK using the repository's Next.js 16 App Router conventions and `proxy.ts` where appropriate. Add sign-in, sign-up, sign-out, and account flows required by the developer product. Normalize Clerk users into an internal `AuthContext`. Decide which REST routes are anonymous, authenticated, or machine-authenticated.
 
