@@ -25,6 +25,9 @@ jobs:
 
       - name: Start test server (port 8000)
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y espeak-ng
+          espeak-ng --version
           pip install -r tts-test/requirements.txt
           nohup python3 tts-test/server.py > /tmp/tts-server.log 2>&1 &
           sleep 3

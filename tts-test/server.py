@@ -1,11 +1,14 @@
-"""Minimal test-only TTS placeholder server (stdlib only, no ML, no heavy deps).
+"""Minimal test-only TTS server (stdlib only, no ML, no heavy deps).
 
 Endpoints:
   GET /health      -> {"ok": true}
-  GET /speak/<text> -> WAV sine-wave beep, Content-Type: audio/wav
+  GET /speak/<text>[?voice=en&speed=175] -> WAV spoken via espeak-ng, Content-Type: audio/wav
 
-The WAV is generated on-the-fly in memory (no model, no espeak).
-Different texts produce slightly different tones so curl tests are audible.
+Synthesis: `espeak-ng --stdout -v <voice> -s <speed> "<text>"` if the
+espeak-ng binary is present (offline, tiny apt package). Falls back to the
+legacy sine-wave beep only when espeak-ng is missing or fails, so the tunnel
+flow test still passes on machines without espeak.
+Different beep texts produce slightly different tones so curl tests are audible.
 Used only to validate GitHub Runner + Cloudflare Tunnel flow.
 """
 from __future__ import annotations
@@ -15,12 +18,40 @@ import io
 import json
 import math
 import os
+import re
+import shutil
 import struct
+import subprocess
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse, parse_qs
 
 SAMPLE_RATE = 22050
+ESPEAK_BIN = shutil.which("espeak-ng")
+
+# Keep voice values conservative: letters, digits, +/_/- only (e.g. "en", "en-us").
+_VOICE_RE = re.compile(r"^[A-Za-z0-9_+\-]+$")
+
+
+def espeak_wav_bytes(text: str, voice: str = "en", speed: int = 175) -> bytes | None:
+    """Synthesize real speech via espeak-ng. Returns None if unavailable/failed."""
+    if not ESPEAK_BIN:
+        return None
+    try:
+        proc = subprocess.run(
+            [ESPEAK_BIN, "--stdout", "-v", voice, "-s", str(speed), text],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    wav = proc.stdout or b""
+    # Basic sanity: must look like a WAV (RIFF....WAVE) and be non-trivial.
+    if proc.returncode != 0 or len(wav) < 500 or not wav.startswith(b"RIFF"):
+        return None
+    return wav
 
 
 def tone_wav_bytes(text: str, freq: float | None = None, secs: float | None = None) -> bytes:
@@ -77,20 +108,32 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 freq = float(qs["freq"][0]) if "freq" in qs else None
                 secs = float(qs["secs"][0]) if "secs" in qs else None
+                voice = qs["voice"][0] if "voice" in qs else "en"
+                speed = int(qs["speed"][0]) if "speed" in qs else 175
                 if freq is not None and not 50 <= freq <= 4000:
                     raise ValueError("freq must be 50-4000")
                 if secs is not None and not 0.1 <= secs <= 10:
                     raise ValueError("secs must be 0.1-10")
+                if not _VOICE_RE.match(voice) or len(voice) > 32:
+                    raise ValueError("voice must match [A-Za-z0-9_+-]{1,32} (e.g. en, en-us)")
+                if not 80 <= speed <= 450:
+                    raise ValueError("speed must be 80-450 wpm")
             except ValueError as e:
                 self._send_json(400, {"error": str(e)})
                 return
-            wav = tone_wav_bytes(text, freq=freq, secs=secs)
+            wav = espeak_wav_bytes(text, voice=voice, speed=speed)
+            engine = "espeak-ng"
+            if wav is None:
+                # Fallback: legacy sine beep (espeak-ng missing or failed).
+                wav = tone_wav_bytes(text, freq=freq, secs=secs)
+                engine = "beep-fallback"
             # Streamed in chunks so tunnel/proxy behavior matches real audio serving.
             self.send_response(200)
             self.send_header("Content-Type", "audio/wav")
             self.send_header("Content-Length", str(len(wav)))
             self.send_header("Content-Disposition", 'inline; filename="speak.wav"')
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-TTS-Engine", engine)
             self.end_headers()
             for i in range(0, len(wav), 8192):
                 self.wfile.write(wav[i : i + 8192])
