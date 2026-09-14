@@ -378,7 +378,7 @@ Part B is the platform/security layer between the completed REST API (Part A) an
 
 ## Phase 01 — Platform boundaries and request context
 
-**Status:** `[~]` in progress.
+**Status:** `[x]` done — shipped via PR #20 (merged 2026-09-14): request context + provider boundaries (auth/rate-limit/usage/observability/product) wired into health with Part A wire-contract byte-identical, 626 unit tests + e2e PASS on live upstream. Note: restores PR #17, whose commits were lost from main by a later history rewrite.
 
 **Build:** Define a canonical request context containing request ID, authentication principal, project/key identity, effective tier, entitlement snapshot, rate-limit identity, and trace/observability context. Establish the common request pipeline:
 
