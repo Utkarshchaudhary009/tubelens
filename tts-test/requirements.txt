@@ -1,0 +1,2 @@
+# No dependencies — server.py is stdlib-only (http.server + wave + math).
+# This file exists so `pip install -r tts-test/requirements.txt` is a no-op on the runner.

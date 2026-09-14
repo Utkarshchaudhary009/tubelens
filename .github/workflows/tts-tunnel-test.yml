@@ -1,0 +1,67 @@
+# Test-only: expose the throwaway tts-test/server.py via a free Cloudflare quick tunnel.
+# Trigger: Actions tab -> tts-tunnel-test -> Run workflow. Job stays alive ~30 min.
+name: tts-tunnel-test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  tunnel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
+          chmod +x /tmp/cloudflared
+          sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Start test server (port 8000)
+        run: |
+          pip install -r tts-test/requirements.txt
+          nohup python3 tts-test/server.py > /tmp/tts-server.log 2>&1 &
+          sleep 3
+          curl -s http://localhost:8000/health
+          echo ""
+          echo "--- server log head ---"
+          head -n 20 /tmp/tts-server.log
+
+      - name: Start Cloudflare quick tunnel + keep alive ~30min
+        run: |
+          nohup cloudflared tunnel --url http://localhost:8000 --no-autoupdate > /tmp/cloudflared.log 2>&1 &
+          echo "Waiting for tunnel URL..."
+          TUNNEL_URL=""
+          for i in $(seq 1 45); do
+            TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -n 1 || true)
+            if [ -n "$TUNNEL_URL" ]; then break; fi
+            sleep 2
+          done
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "FAILED to get tunnel URL. cloudflared log:"
+            cat /tmp/cloudflared.log
+            exit 1
+          fi
+          echo "=================================================="
+          echo "TUNNEL_URL=$TUNNEL_URL"
+          echo ""
+          echo "Test from your machine:"
+          echo "  curl $TUNNEL_URL/health"
+          echo "  curl $TUNNEL_URL/speak/hello --output hello.wav"
+          echo "=================================================="
+          # Sanity check through the public URL (retry while DNS propagates)
+          for i in $(seq 1 20); do
+            if curl -sf "$TUNNEL_URL/health"; then echo ""; break; fi
+            echo "tunnel not ready yet (try $i/20)..."
+            sleep 5
+          done
+          curl -sf "$TUNNEL_URL/speak/hello" --output /tmp/tunnel-test.wav && ls -la /tmp/tunnel-test.wav && file /tmp/tunnel-test.wav
+          echo ""
+          echo "Keeping job alive 30 min for manual curl tests (cancel workflow to stop early)..."
+          sleep 1800
