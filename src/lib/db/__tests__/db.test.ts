@@ -307,6 +307,8 @@ function walkRepoFiles(): string[] {
     "build",
     "coverage",
   ]);
+  const skipFiles = (name: string) =>
+    name === ".env" || name.startsWith(".env.");
   const out: string[] = [];
   const walk = (dir: string) => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -317,6 +319,9 @@ function walkRepoFiles(): string[] {
         continue;
       }
       if (!entry.isFile()) {
+        continue;
+      }
+      if (skipFiles(entry.name)) {
         continue;
       }
       const full = join(dir, entry.name);

@@ -2,12 +2,14 @@
 // and timeout semantics are unit-testable under bun:test. The server-only
 // boundary lives in `./client`, which binds the default store.
 //
-// Fail-fast pattern mirrors `../youtube.ts` `withTimeout`
-// (AbortSignal.timeout race, tasks still bounded if they ignore the signal).
+// Fail-fast pattern shares the single AbortSignal.timeout race in
+// `../with-timeout` with `../youtube.ts` `withTimeout`
+// (tasks that ignore the signal are still bounded by the race).
 
 import { type NeonQueryFunction, neon } from "@neondatabase/serverless";
 import { drizzle, type NeonHttpDatabase } from "drizzle-orm/neon-http";
 import { createLazySingleton } from "../singleton";
+import { raceWithTimeout } from "../with-timeout";
 
 /** Fail-fast budget for DB work (AGENTS.md route checklist: 8s). */
 export const DB_FAIL_FAST_MS = 8000;
@@ -87,30 +89,10 @@ export function createDbStore(
   };
 }
 
-/** Same AbortSignal.timeout race as `../youtube.ts` `withTimeout`. */
+/** Same AbortSignal.timeout race as `../youtube.ts` `withTimeout` (shared helper). */
 export async function withDbTimeout<T>(
   task: (signal: AbortSignal) => Promise<T>,
   ms: number = DB_FAIL_FAST_MS,
 ): Promise<T> {
-  const signal = AbortSignal.timeout(ms);
-  let onAbort: (() => void) | undefined;
-  const gate = new Promise<never>((_resolve, reject) => {
-    onAbort = () => {
-      const err = new Error(`Database timed out after ${ms}ms`);
-      err.name = "TimeoutError";
-      reject(err);
-    };
-    if (signal.aborted) {
-      onAbort();
-    } else {
-      signal.addEventListener("abort", onAbort, { once: true });
-    }
-  });
-  try {
-    return await Promise.race([task(signal), gate]);
-  } finally {
-    if (onAbort) {
-      signal.removeEventListener("abort", onAbort);
-    }
-  }
+  return raceWithTimeout(task, ms, `Database timed out after ${ms}ms`);
 }
