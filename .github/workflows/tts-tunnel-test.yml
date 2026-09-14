@@ -57,6 +57,8 @@ jobs:
           echo "Test from your machine:"
           echo "  curl $TUNNEL_URL/health"
           echo "  curl $TUNNEL_URL/speak/hello --output hello.wav"
+          echo "  curl $TUNNEL_URL/transcript/dQw4w9WgXcQ"
+          echo "  curl \"$TUNNEL_URL/speak/hello\" --output hello.wav"
           echo "=================================================="
           # Sanity check through the public URL (retry while DNS propagates)
           for i in $(seq 1 20); do
@@ -65,6 +67,8 @@ jobs:
             sleep 5
           done
           curl -sf "$TUNNEL_URL/speak/hello" --output /tmp/tunnel-test.wav && ls -la /tmp/tunnel-test.wav && file /tmp/tunnel-test.wav
+          # Best-effort transcript check (captions depend on the video, never fail the job)
+          curl -sf "$TUNNEL_URL/transcript/dQw4w9WgXcQ" --output /tmp/tunnel-transcript.json && head -c 500 /tmp/tunnel-transcript.json; echo "" || echo "transcript check skipped/failed (non-fatal)"
           echo -n "$TUNNEL_URL" > "$GITHUB_WORKSPACE/tunnel-url.txt"
           echo "Wrote tunnel URL to tunnel-url.txt artifact source"
 

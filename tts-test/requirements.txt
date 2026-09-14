@@ -1,2 +1,3 @@
-# No dependencies — server.py is stdlib-only (http.server + wave + math).
-# This file exists so `pip install -r tts-test/requirements.txt` is a no-op on the runner.
+# Test-only tunnel server deps (ubuntu-latest runner, no GPU needed).
+# server.py itself is stdlib http.server; this adds YouTube caption fetching.
+youtube-transcript-api
