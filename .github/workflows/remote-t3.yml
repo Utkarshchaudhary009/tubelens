@@ -1,0 +1,248 @@
+# remote-t3 — persistent T3 remote-dev behind a free Cloudflare quick tunnel.
+#
+# Trigger: Actions tab -> remote-t3 -> Run workflow. The job runs
+# `npx t3 serve`, exposes :3773 via cloudflared, publishes the pairing URL,
+# then idles ~290 min so the session stays usable (job budget 300 min).
+#
+# CRITICAL OTP catch (live probe): `npx t3 serve` prints
+#   Connection string: http://127.0.0.1:3773
+#   Token: <16 chars from 23456789ABCDEFGHJKLMNPQRSTUVWXYZ, ~5min TTL>
+#   Pairing URL: http://127.0.0.1:3773/pair#token=<code>
+# The #token= fragment NEVER reaches any server — the browser consumes it
+# locally and auto-pairs. There is NO --auth-token flag (removed upstream)
+# and NO short numeric OTP, so this workflow captures the FULL pairing URL,
+# host-swaps 127.0.0.1 -> <tunnel-host>, and POSTs the whole thing
+# (fragment included) to the `t3` tunnel slot. /dev/t3 redirects to that
+# stored URL verbatim; redirecting to the bare tunnel root would land on
+# manual token entry instead.
+#
+# Secrets:
+#   TUNNEL_UPDATE_TOKEN — bearer for POST /api/v1/tunnel-url (best-effort;
+#     the t3-url.txt artifact is the fallback). Always $TUNNEL_UPDATE_TOKEN.
+#   PAT — repo PAT (see unit-test.yml convention) for the duplicate-guard
+#     self-cancel and the end-of-run self-chain (`gh workflow run`).
+#
+# Resume: the final step always saves `git diff` -> work.patch + run metadata
+# -> state.json into cache key t3-work-<run_number> AND the t3-state
+# artifact (7d). To resume: download t3-state (or restore that cache key)
+# and `git apply work.patch`.
+#
+# MULTI-USER LIMITATION (documented, by design): the `t3` slot is a single
+# global pointer — concurrent publishers are last-writer-wins, runId names
+# the winner. Two operators running remote-t3 at once will steal each
+# other's /dev/t3 redirect. The concurrency group + duplicate guard below
+# keep accidental double-runs to one survivor; intentional sharing still
+# needs out-of-band coordination.
+#
+# STOPPING the loop: the final step self-chains even on cancel, so cancel
+# alone restarts it — first Disable the workflow (Actions -> ... -> Disable
+# workflow), THEN cancel the run.
+name: remote-t3
+
+on:
+  workflow_dispatch:
+
+# One live dev server at a time. Re-dispatches queue instead of killing the
+# running session; a queued duplicate self-cancels in the guard step once it
+# starts (it sees the newer waiter / live holder and yields).
+concurrency:
+  group: remote-dev-main
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  remote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Duplicate guard (yield when another remote-t3 run is live/queued)
+        env:
+          PAT_TOKEN: ${{ secrets.PAT }}
+          FALLBACK_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "$PAT_TOKEN" ]; then
+            GH_TOKEN="$PAT_TOKEN"
+          else
+            GH_TOKEN="$FALLBACK_TOKEN"
+          fi
+          export GH_TOKEN
+          ME="${{ github.run_id }}"
+          LIST="$(gh run list --workflow remote-t3.yml --limit 20 --json databaseId,status --jq '.[] | select(.status == "in_progress" or .status == "queued") | .databaseId' || true)"
+          OTHERS="$(printf '%s\n' "$LIST" | grep -v -x "$ME" | grep -v '^$' || true)"
+          if [ -z "$GH_TOKEN" ]; then
+            echo "No token available; skipping duplicate guard (fail-open)."
+            exit 0
+          fi
+          if [ -n "$OTHERS" ]; then
+            echo "Another remote-t3 run is active/queued; self-cancelling this duplicate (red here is intentional)."
+            gh run cancel "$ME" || echo "self-cancel API call failed; stopping the job anyway."
+            sleep 5
+            exit 1
+          fi
+          echo "No duplicate remote-t3 run detected; proceeding."
+
+      - name: Start t3 serve (port 3773)
+        run: |
+          nohup npx -y t3@latest serve --host 0.0.0.0 --port 3773 > /tmp/t3.log 2>&1 &
+          echo "$!" > /tmp/t3.pid
+          echo "Waiting for t3 serve on :3773..."
+          for i in $(seq 1 60); do
+            if curl -s -o /dev/null --max-time 2 http://127.0.0.1:3773/ 2>/dev/null; then break; fi
+            if ! kill -0 "$(cat /tmp/t3.pid)" 2>/dev/null; then
+              echo "t3 serve exited early. Log:"
+              cat /tmp/t3.log
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "--- t3 log head ---"
+          head -n 20 /tmp/t3.log
+          # Capture the Connection string + FULL Pairing URL lines (fragment
+          # included — that is the auto-pair credential; see header note).
+          grep -E "Connection string:|Pairing URL:" /tmp/t3.log | tee "$GITHUB_WORKSPACE/t3-url.txt"
+          test -s "$GITHUB_WORKSPACE/t3-url.txt" || { echo "No pairing lines in t3 log:"; cat /tmp/t3.log; exit 1; }
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
+          chmod +x /tmp/cloudflared
+          sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Start Cloudflare quick tunnel + publish pairing URL
+        id: tunnel
+        env:
+          TUNNEL_UPDATE_TOKEN: ${{ secrets.TUNNEL_UPDATE_TOKEN }}
+        continue-on-error: true
+        run: |
+          nohup cloudflared tunnel --url http://localhost:3773 --no-autoupdate > /tmp/cloudflared.log 2>&1 &
+          echo "Waiting for tunnel URL..."
+          TUNNEL_HOST=""
+          for i in $(seq 1 45); do
+            TUNNEL_HOST=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -n 1 || true)
+            if [ -n "$TUNNEL_HOST" ]; then break; fi
+            sleep 2
+          done
+          if [ -z "$TUNNEL_HOST" ]; then
+            echo "FAILED to get tunnel URL. cloudflared log:"
+            cat /tmp/cloudflared.log
+            exit 1
+          fi
+          # Host-swap the LOCAL pairing URL onto the tunnel host, preserving
+          # the #token= fragment exactly (that fragment is the credential).
+          LOCAL_PAIRING=$(grep -oE 'http://(127\.0\.0\.1|0\.0\.0\.0|localhost):3773/pair#token=[A-Za-z0-9]+' /tmp/t3.log | head -n 1 || true)
+          if [ -z "$LOCAL_PAIRING" ]; then
+            echo "FAILED to find the Pairing URL line in t3 log:"
+            cat /tmp/t3.log
+            exit 1
+          fi
+          PAIRING_PUBLIC="$(printf '%s' "$LOCAL_PAIRING" | sed -E "s|http://(127\.0\.0\.1\|0\.0\.0\.0\|localhost):3773|${TUNNEL_HOST}|")"
+          case "$PAIRING_PUBLIC" in
+            https://*.trycloudflare.com/pair\#token=?*)
+              ;;
+            *)
+              echo "Host-swapped pairing URL looks wrong: $PAIRING_PUBLIC"
+              exit 1
+              ;;
+          esac
+          {
+            echo "PUBLIC_TUNNEL=$TUNNEL_HOST"
+            echo "PUBLIC_PAIRING=$PAIRING_PUBLIC"
+          } | tee -a "$GITHUB_WORKSPACE/t3-url.txt"
+          echo "host=$TUNNEL_HOST" >> "$GITHUB_OUTPUT"
+          echo "pairing=$PAIRING_PUBLIC" >> "$GITHUB_OUTPUT"
+          echo "=================================================="
+          echo "Pair this session from any browser:"
+          echo "  https://tubelens.vercel.app/dev/t3"
+          echo "Direct pairing URL (carries the token in #fragment):"
+          echo "  $PAIRING_PUBLIC"
+          echo "Bare tunnel root (manual token entry — avoid):"
+          echo "  $TUNNEL_HOST"
+          echo "=================================================="
+          # Best-effort reachability probe through the public URL (log only,
+          # never fail the job — t3 answers pairing flows, not health APIs).
+          curl -s -o /dev/null -w "tunnel probe http_code=%{http_code}\n" --max-time 10 "$TUNNEL_HOST/" || true
+          if [ -z "$TUNNEL_UPDATE_TOKEN" ]; then
+            echo "TUNNEL_UPDATE_TOKEN secret not set; skipping API publish (t3-url.txt artifact remains the fallback)."
+            exit 0
+          fi
+          curl -sf -X POST "https://tubelens.vercel.app/api/v1/tunnel-url" \
+            -H "Authorization: Bearer $TUNNEL_UPDATE_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\": \"t3\", \"url\": \"$PAIRING_PUBLIC\", \"runId\": \"${{ github.run_id }}\"}"
+          echo ""
+          echo "Published pairing URL to the t3 slot of the production API"
+
+      - name: Upload t3 URL (artifact fallback)
+        uses: actions/upload-artifact@v4
+        with:
+          name: t3-url
+          path: t3-url.txt
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Keep alive ~290 min (cancel workflow to stop early)
+        run: |
+          echo "T3 session live; sleeping 290 min. /dev/t3 redirects into the pairing URL."
+          sleep 17400
+
+      - name: Save work.patch + state.json
+        if: always()
+        run: |
+          git diff > "$GITHUB_WORKSPACE/work.patch" || true
+          wc -c "$GITHUB_WORKSPACE/work.patch"
+          TUNNEL_HOST="${{ steps.tunnel.outputs.host }}"
+          PAIRING_PUBLIC="${{ steps.tunnel.outputs.pairing }}"
+          GITHUB_RUN_NUMBER="${{ github.run_number }}" TUNNEL_HOST="$TUNNEL_HOST" PAIRING_PUBLIC="$PAIRING_PUBLIC" python3 - <<'EOF'
+          import json, os
+          state = {
+            "run_number": int(os.environ.get("GITHUB_RUN_NUMBER", "0")),
+            "tunnel_url": os.environ.get("TUNNEL_HOST", ""),
+            "pairing_url": os.environ.get("PAIRING_PUBLIC", ""),
+          }
+          with open("state.json", "w") as f:
+            json.dump(state, f, indent=2)
+          print(open("state.json").read())
+          EOF
+
+      - name: Save state to cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            work.patch
+            state.json
+          key: t3-work-${{ github.run_number }}
+
+      - name: Upload t3-state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: t3-state
+          path: |
+            work.patch
+            state.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Self-chain next run
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "PAT secret not set; skipping self-chain (state is still saved in cache t3-work-${{ github.run_number }} + t3-state artifact)."
+            exit 0
+          fi
+          gh workflow run remote-t3.yml --ref main
+          echo "Chained the next remote-t3 run."

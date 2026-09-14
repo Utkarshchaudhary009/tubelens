@@ -92,12 +92,15 @@ jobs:
             exit 0
           fi
           TUNNEL_URL=$(cat "$GITHUB_WORKSPACE/tunnel-url.txt")
+          # `name` is REQUIRED (no default slot). This server is the
+          # transcript/speak helper -> `transcript` slot (`t3` belongs to the
+          # remote-t3 pairing URL; sharing it would last-writer-wins clash).
           curl -sf -X POST "https://tubelens.vercel.app/api/v1/tunnel-url" \
             -H "Authorization: Bearer $TUNNEL_UPDATE_TOKEN" \
             -H "Content-Type: application/json" \
-            -d "{\"url\": \"$TUNNEL_URL\", \"runId\": \"${{ github.run_id }}\"}"
+            -d "{\"name\": \"transcript\", \"url\": \"$TUNNEL_URL\", \"runId\": \"${{ github.run_id }}\"}"
           echo ""
-          echo "Published $TUNNEL_URL to production API"
+          echo "Published $TUNNEL_URL to the transcript slot of the production API"
 
       - name: Keep alive 30 min (cancel workflow to stop early)
         run: sleep 1800
