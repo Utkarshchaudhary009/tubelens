@@ -1,6 +1,7 @@
 import "server-only";
 import { Innertube, UniversalCache } from "youtubei.js";
 import { createLazySingleton } from "./singleton";
+import { raceWithTimeout } from "./with-timeout";
 
 // Singleton Innertube session shared across all route handlers in one
 // instance. Never instantiate per request — session creation is expensive
@@ -43,25 +44,5 @@ export async function withTimeout<T>(
   task: (signal: AbortSignal) => Promise<T>,
   ms = 8000,
 ): Promise<T> {
-  const signal = AbortSignal.timeout(ms);
-  let onAbort: (() => void) | undefined;
-  const gate = new Promise<never>((_resolve, reject) => {
-    onAbort = () => {
-      const err = new Error(`Upstream timed out after ${ms}ms`);
-      err.name = "TimeoutError";
-      reject(err);
-    };
-    if (signal.aborted) {
-      onAbort();
-    } else {
-      signal.addEventListener("abort", onAbort, { once: true });
-    }
-  });
-  try {
-    return await Promise.race([task(signal), gate]);
-  } finally {
-    if (onAbort) {
-      signal.removeEventListener("abort", onAbort);
-    }
-  }
+  return raceWithTimeout(task, ms, `Upstream timed out after ${ms}ms`);
 }
