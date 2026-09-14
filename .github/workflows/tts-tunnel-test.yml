@@ -29,8 +29,10 @@ jobs:
           sudo apt-get install -y espeak-ng
           espeak-ng --version
           pip install -r tts-test/requirements.txt
-          nohup python3 tts-test/server.py > /tmp/tts-server.log 2>&1 &
-          sleep 3
+          WORKERS="$(nproc)"
+          echo "Starting uvicorn with $WORKERS workers"
+          nohup python3 -m uvicorn server:app --app-dir tts-test --host 0.0.0.0 --port 8000 --workers "$WORKERS" --loop uvloop --http httptools --timeout-keep-alive 30 > /tmp/tts-server.log 2>&1 &
+          sleep 5
           curl -s http://localhost:8000/health
           echo ""
           echo "--- server log head ---"
@@ -79,6 +81,23 @@ jobs:
           path: tunnel-url.txt
           if-no-files-found: error
           retention-days: 1
+
+      - name: Publish tunnel URL to production API (best-effort)
+        env:
+          TUNNEL_UPDATE_TOKEN: ${{ secrets.TUNNEL_UPDATE_TOKEN }}
+        continue-on-error: true
+        run: |
+          if [ -z "$TUNNEL_UPDATE_TOKEN" ]; then
+            echo "TUNNEL_UPDATE_TOKEN secret not set; skipping API publish (artifact remains the fallback)."
+            exit 0
+          fi
+          TUNNEL_URL=$(cat "$GITHUB_WORKSPACE/tunnel-url.txt")
+          curl -sf -X POST "https://tubelens.vercel.app/api/v1/tunnel-url" \
+            -H "Authorization: Bearer $TUNNEL_UPDATE_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"url\": \"$TUNNEL_URL\", \"runId\": \"${{ github.run_id }}\"}"
+          echo ""
+          echo "Published $TUNNEL_URL to production API"
 
       - name: Keep alive 30 min (cancel workflow to stop early)
         run: sleep 1800

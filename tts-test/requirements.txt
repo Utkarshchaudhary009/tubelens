@@ -1,3 +1,6 @@
 # Test-only tunnel server deps (ubuntu-latest runner, no GPU needed).
-# server.py itself is stdlib http.server; this adds YouTube caption fetching.
+# FastAPI + uvicorn[standard] (uvloop/httptools) for high-concurrency async serving.
+fastapi>=0.115
+uvicorn[standard]>=0.30
+httpx>=0.27
 youtube-transcript-api
