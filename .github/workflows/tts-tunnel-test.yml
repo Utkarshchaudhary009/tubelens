@@ -33,7 +33,7 @@ jobs:
           echo "--- server log head ---"
           head -n 20 /tmp/tts-server.log
 
-      - name: Start Cloudflare quick tunnel + keep alive ~30min
+      - name: Start Cloudflare quick tunnel + verify
         run: |
           nohup cloudflared tunnel --url http://localhost:8000 --no-autoupdate > /tmp/cloudflared.log 2>&1 &
           echo "Waiting for tunnel URL..."
@@ -62,6 +62,16 @@ jobs:
             sleep 5
           done
           curl -sf "$TUNNEL_URL/speak/hello" --output /tmp/tunnel-test.wav && ls -la /tmp/tunnel-test.wav && file /tmp/tunnel-test.wav
-          echo ""
-          echo "Keeping job alive 30 min for manual curl tests (cancel workflow to stop early)..."
-          sleep 1800
+          echo -n "$TUNNEL_URL" > "$GITHUB_WORKSPACE/tunnel-url.txt"
+          echo "Wrote tunnel URL to tunnel-url.txt artifact source"
+
+      - name: Upload tunnel URL
+        uses: actions/upload-artifact@v4
+        with:
+          name: tunnel-url
+          path: tunnel-url.txt
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Keep alive 30 min (cancel workflow to stop early)
+        run: sleep 1800
