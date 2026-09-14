@@ -34,7 +34,20 @@ export function routeAuthKind(pathname: string): RouteAuthKind {
     : "public";
 }
 
-function hasClerkSecret(env: Record<string, string | undefined>): boolean {
+/**
+ * Shared session-attach gate: both `src/proxy.ts` and this provider key on
+ * the server secret alone. Deliberately NOT on
+ * NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: that key is public client config, not a
+ * server secret, and `getConfig` (pinned by Phase 01 tests) treats
+ * required+secret-only as valid — requiring the publishable key server-side
+ * would contradict that contract. A half-configured deploy (secret without
+ * publishable key) therefore attempts attach and degrades to anonymous when
+ * the Clerk SDK throws its missing-key error, so protected routes 401 via
+ * `requireAuth()` while public routes keep serving (never a framework 500).
+ */
+export function hasClerkSecret(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
   return (env.CLERK_SECRET_KEY ?? "").trim() !== "";
 }
 
@@ -55,7 +68,7 @@ function hasClerkSecret(env: Record<string, string | undefined>): boolean {
 export const clerkAuthProvider: AuthProvider = {
   async resolve(_req: Request): Promise<AuthContext> {
     getConfig(process.env);
-    if (!hasClerkSecret(process.env)) {
+    if (!hasClerkSecret()) {
       return { ...anonymousAuthContext };
     }
     try {

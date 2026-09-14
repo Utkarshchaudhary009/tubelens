@@ -3,6 +3,7 @@ import { NextRequest } from "next/server";
 import { handleHealth } from "../../app/api/v1/health/route";
 import { handleMe, GET as meGET } from "../../app/api/v1/me/route";
 import {
+  type AuthProvider,
   anonymousAuthProvider,
   getAuthProvider,
   requireAuth,
@@ -12,6 +13,7 @@ import {
 import {
   AUTHENTICATED_ROUTES,
   clerkAuthProvider,
+  hasClerkSecret,
   routeAuthKind,
 } from "../clerk-auth";
 import { ConfigError } from "../config";
@@ -30,6 +32,7 @@ function req(url: string, requestId?: string): NextRequest {
 // coverage — always restore so later files see a clean keyless env.
 const savedEnforcement = process.env.TUBELENS_AUTH_ENFORCEMENT;
 const savedSecret = process.env.CLERK_SECRET_KEY;
+const savedPublishable = process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
 
 afterEach(() => {
   resetAuthProvider();
@@ -43,11 +46,17 @@ afterEach(() => {
   } else {
     process.env.CLERK_SECRET_KEY = savedSecret;
   }
+  if (savedPublishable === undefined) {
+    delete process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
+  } else {
+    process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY = savedPublishable;
+  }
 });
 
 function keylessEnv(): void {
   delete process.env.TUBELENS_AUTH_ENFORCEMENT;
   delete process.env.CLERK_SECRET_KEY;
+  delete process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
 }
 
 describe("requireAuth gate (Phase 02)", () => {
@@ -125,6 +134,48 @@ describe("GET /api/v1/me (protected proof endpoint)", () => {
     );
     expect(res.status).toBe(401);
     expect((await res.json()).error.code).toBe("unauthenticated");
+  });
+
+  test("non-user principal carrying a subject userId still gets 401", async () => {
+    const res = handleMe(
+      "me-key-subject",
+      {
+        type: "api_key",
+        authenticated: true,
+        keyId: "key_1",
+        userId: "user_abc",
+      },
+      "free",
+    );
+    expect(res.status).toBe(401);
+    expect((await res.json()).error.code).toBe("unauthenticated");
+  });
+
+  test("route wiring: pipeline with injected user provider yields 200", async () => {
+    // Mirrors GET's wiring (`withRequestContext(..., { auth }, "me")`) with
+    // a stub user provider: a dropped provider or wrong-ctx miswire in GET
+    // fails here instead of hiding behind the pure-handleMe tests above.
+    keylessEnv();
+    const stubUserProvider: AuthProvider = {
+      resolve: () => ({
+        type: "user",
+        authenticated: true,
+        userId: "user_wire",
+      }),
+    };
+    const run = withRequestContext(
+      async (_r, ctx) => handleMe(ctx.requestId, ctx.auth, ctx.tier),
+      { auth: stubUserProvider },
+      "me",
+    );
+    const res = await run(req("http://x/api/v1/me", "me-wire"));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-Request-Id")).toBe("me-wire");
+    expect(res.headers.get("Cache-Control")).toBe("private, no-store");
+    const body = await res.json();
+    expect(body.data).toEqual({ userId: "user_wire", tier: "free" });
+    expect(body.page).toEqual({ next: null });
+    expect(body.meta.requestId).toBe("me-wire");
   });
 
   test("public pipeline still serves anonymously; global default untouched", async () => {
@@ -240,5 +291,35 @@ describe("secret safety + fail-safe (Phase 02)", () => {
     );
     expect(ctx).toMatchObject({ type: "anonymous", authenticated: false });
     expect(ctx.userId).toBeUndefined();
+  });
+
+  test("attach gate keys on the secret alone, not the publishable key", () => {
+    // Secret-without-publishable is a half-configured deploy, not a keyless
+    // one: proxy and provider must both attempt attach (and degrade to
+    // anonymous downstream) rather than disagree about whether Clerk runs.
+    expect(hasClerkSecret({ CLERK_SECRET_KEY: "sk_test_x" })).toBe(true);
+    expect(hasClerkSecret({})).toBe(false);
+    expect(hasClerkSecret({ CLERK_SECRET_KEY: "   " })).toBe(false);
+  });
+
+  test("proxy passes through keyless and degrades half-configured, never throws", async () => {
+    const { default: proxy } = await import("../../proxy");
+    const event = { waitUntil: () => {} } as never;
+    keylessEnv();
+    const keyless = await proxy(new NextRequest("http://x/api/v1/me"), event);
+    expect(keyless?.headers.get("x-middleware-next")).toBe("1");
+    // Secret without publishable key: Clerk throws its missing-key error at
+    // request time; the proxy degrades to pass-through (anonymous) so the
+    // route layer answers typed 401/200 instead of a framework 500.
+    process.env.CLERK_SECRET_KEY = "sk_test_half_configured";
+    try {
+      const degraded = await proxy(
+        new NextRequest("http://x/api/v1/me"),
+        event,
+      );
+      expect(degraded?.headers.get("x-middleware-next")).toBe("1");
+    } finally {
+      delete process.env.CLERK_SECRET_KEY;
+    }
   });
 });
