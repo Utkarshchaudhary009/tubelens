@@ -378,7 +378,7 @@ Part B is the platform/security layer between the completed REST API (Part A) an
 
 ## Phase 01 — Platform boundaries and request context
 
-**Status:** `[ ]` not started.
+**Status:** `[~]` in progress.
 
 **Build:** Define a canonical request context containing request ID, authentication principal, project/key identity, effective tier, entitlement snapshot, rate-limit identity, and trace/observability context. Establish the common request pipeline:
 
