@@ -322,9 +322,9 @@ describe("review hardening (Phase 01)", () => {
     expect(pipelined.headers.get("X-RateLimit-Remaining")).toBe("99");
   });
 
-  test("throwing auth/product providers fail safe with typed 503 JSON", async () => {
-    const unreachable = async () => NextResponse.json({ unreachable: true });
-    const failing = [
+  test("throwing auth provider fails safe with auth-classified 503 JSON", async () => {
+    const run = withRequestContext(
+      async () => NextResponse.json({ unreachable: true }),
       {
         auth: {
           resolve: () => {
@@ -332,6 +332,22 @@ describe("review hardening (Phase 01)", () => {
           },
         },
       },
+      "health",
+    );
+    const res = await run(req("http://x/api/v1/health", "auth-1"));
+    expect(res.status).toBe(503);
+    expect(res.headers.get("Content-Type")).toContain("application/json");
+    expect(res.headers.get("X-Request-Id")).toBe("auth-1");
+    const body = await res.json();
+    expect(body.error.code).toBe("dependency_unavailable");
+    expect(typeof body.error.hint).toBe("string");
+    expect(JSON.stringify(body)).not.toContain("clerk down");
+    expect(body.meta.requestId).toBe("auth-1");
+  });
+
+  test("throwing policy provider fails safe with policy-classified 503, not auth", async () => {
+    const run = withRequestContext(
+      async () => NextResponse.json({ unreachable: true }),
       {
         product: {
           resolveTier: () => {
@@ -342,20 +358,20 @@ describe("review hardening (Phase 01)", () => {
           },
         },
       },
-    ];
-    for (const providers of failing) {
-      const run = withRequestContext(unreachable, providers, "health");
-      const res = await run(req("http://x/api/v1/health", "auth-1"));
-      expect(res.status).toBe(503);
-      expect(res.headers.get("Content-Type")).toContain("application/json");
-      expect(res.headers.get("X-Request-Id")).toBe("auth-1");
-      const body = await res.json();
-      expect(body.error.code).toBe("dependency_unavailable");
-      expect(typeof body.error.hint).toBe("string");
-      expect(JSON.stringify(body)).not.toContain("clerk down");
-      expect(JSON.stringify(body)).not.toContain("policy store down");
-      expect(body.meta.requestId).toBe("auth-1");
-    }
+      "health",
+    );
+    const res = await run(req("http://x/api/v1/health", "pol-1"));
+    expect(res.status).toBe(503);
+    expect(res.headers.get("Content-Type")).toContain("application/json");
+    expect(res.headers.get("X-Request-Id")).toBe("pol-1");
+    const body = await res.json();
+    expect(body.error.code).toBe("service_unavailable");
+    expect(body.error.code).not.toBe("dependency_unavailable");
+    expect(typeof body.error.hint).toBe("string");
+    expect(JSON.stringify(body)).not.toContain("policy store down");
+    // A policy-store fault must not read as an authentication outage.
+    expect(JSON.stringify(body)).not.toContain("Authentication");
+    expect(body.meta.requestId).toBe("pol-1");
   });
 
   test("throwing handler returns typed 500 JSON, never a stack leak", async () => {
@@ -662,7 +678,9 @@ describe("cubic review findings", () => {
     expect(res.headers.get("Content-Type")).toContain("application/json");
     expect(res.headers.get("X-Request-Id")).toBe("bad-1");
     const body = await res.json();
-    expect(body.error.code).toBe("missing_security_config");
+    // A route miswire is a programmer fault, not a missing secret — it
+    // must not borrow the security-config code clients/alerts watch for.
+    expect(body.error.code).toBe("internal");
     expect(typeof body.error.hint).toBe("string");
     expect(body.meta.requestId).toBe("bad-1");
   });

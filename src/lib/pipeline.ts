@@ -15,8 +15,8 @@
 // Observability hooks are best-effort and can never break a response.
 
 import type { NextRequest, NextResponse } from "next/server";
-import { type AuthProvider, getAuthProvider } from "./auth";
-import { CONFIG_ERROR_CODE, ConfigError, getConfig } from "./config";
+import { type AuthContext, type AuthProvider, getAuthProvider } from "./auth";
+import { ConfigError, getConfig } from "./config";
 import { errorResponse } from "./errors";
 import {
   getObservabilityProvider,
@@ -102,7 +102,8 @@ export async function createRequestContext(
 /**
  * Wrap a route handler with the Phase 01 pipeline. The wrapper:
  *  1. validates config (missing security config → typed 503),
- *  2. builds the typed RequestContext (throwing provider → typed 503),
+ *  2. resolves identity (auth throw → typed 503) and policy tier +
+ *     entitlements (policy throw → typed 503 with its own classification),
  *  3. runs the rate-limit check (deny → 429 with decision headers;
  *     liveness bypass honored only on /api/v1/health, else a typed 500),
  *  4. invokes the handler (throw → typed 500, never a stack leak),
@@ -146,7 +147,7 @@ export function withRequestContext(
       span.recordError(err);
       span.end();
       return errorResponse(requestId, {
-        code: CONFIG_ERROR_CODE,
+        code: "internal",
         message: "Service route misconfigured.",
         hint: "Report the X-Request-Id; operators must remove bypassRateLimit from this route.",
         status: 500,
@@ -172,11 +173,13 @@ export function withRequestContext(
       throw err;
     }
 
-    // Authentication stage: a throwing provider fails safe with a typed
-    // 503, never an unhandled 500 without request-id headers.
-    let ctx: RequestContext;
+    // Authentication stage: a throwing auth provider fails safe with a
+    // typed 503, never an unhandled 500 without request-id headers.
+    const authProvider = pick(providers.auth, getAuthProvider());
+    const product = pick(providers.product, getProductPolicyProvider());
+    let auth: AuthContext;
     try {
-      ctx = await createRequestContext(req, providers, route);
+      auth = await authProvider.resolve(req);
     } catch (err) {
       safe(() => observability.captureError(err, { requestId }));
       span.recordError(err);
@@ -185,6 +188,26 @@ export function withRequestContext(
         code: "dependency_unavailable",
         message: "Authentication service unavailable.",
         hint: "Retry shortly; the request was rejected rather than served without identity.",
+        status: 503,
+      });
+    }
+
+    // Policy stage: tier + entitlements. A throwing policy provider is a
+    // different outage than auth — classify it as the dependency it is so
+    // operators don't chase the identity stack for a policy-store fault.
+    let ctx: RequestContext;
+    try {
+      const tier = product.resolveTier(auth);
+      const entitlements = product.entitlementsFor(tier);
+      ctx = buildRequestContext(req, { auth, tier, entitlements, route });
+    } catch (err) {
+      safe(() => observability.captureError(err, { requestId }));
+      span.recordError(err);
+      span.end();
+      return errorResponse(requestId, {
+        code: "service_unavailable",
+        message: "Product policy unavailable.",
+        hint: "Retry shortly; the request was rejected rather than served without an entitlement decision.",
         status: 503,
       });
     }
