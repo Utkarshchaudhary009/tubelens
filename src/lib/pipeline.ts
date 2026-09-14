@@ -16,7 +16,7 @@
 
 import type { NextRequest, NextResponse } from "next/server";
 import { type AuthProvider, getAuthProvider } from "./auth";
-import { ConfigError, getConfig } from "./config";
+import { CONFIG_ERROR_CODE, ConfigError, getConfig } from "./config";
 import { errorResponse } from "./errors";
 import {
   getObservabilityProvider,
@@ -60,7 +60,7 @@ export interface PipelineOptions {
    * Skip the rate-limit check. Liveness probes ONLY — a probe must never
    * 429/503 because of request providers. Enforced by pathname: honored
    * exclusively on /api/v1/health, and any other route requesting it
-   * throws a programmer-error ConfigError. Never use for data routes.
+   * fails closed with a typed 500. Never use for data routes.
    */
   bypassRateLimit?: boolean;
 }
@@ -104,7 +104,7 @@ export async function createRequestContext(
  *  1. validates config (missing security config → typed 503),
  *  2. builds the typed RequestContext (throwing provider → typed 503),
  *  3. runs the rate-limit check (deny → 429 with decision headers;
- *     liveness bypass honored only on /api/v1/health, else throws),
+ *     liveness bypass honored only on /api/v1/health, else a typed 500),
  *  4. invokes the handler (throw → typed 500, never a stack leak),
  *  5. stamps X-Request-Id / X-RateLimit-* from the limiter decision,
  *     preserving the Part A wire contract (defaults match the old stubs),
@@ -132,15 +132,25 @@ export function withRequestContext(
 
     // Liveness-only invariant: bypassRateLimit is honored exclusively on
     // the approved liveness path. Any other route requesting it is a
-    // programmer error and fails closed here (typed, never silent).
+    // programmer error and fails closed here with a typed 500 (never an
+    // unhandled throw, which would escape as framework HTML).
     if (
       options.bypassRateLimit &&
       req.nextUrl.pathname !== LIVENESS_BYPASS_PATH
     ) {
-      throw new ConfigError(
+      const err = new ConfigError(
         "bypassRateLimit is reserved for the liveness probe.",
         "Remove bypassRateLimit from this route; only /api/v1/health may bypass the limiter.",
       );
+      safe(() => observability.captureError(err, { requestId }));
+      span.recordError(err);
+      span.end();
+      return errorResponse(requestId, {
+        code: CONFIG_ERROR_CODE,
+        message: "Service route misconfigured.",
+        hint: "Report the X-Request-Id; operators must remove bypassRateLimit from this route.",
+        status: 500,
+      });
     }
 
     // Config stage: security-critical validation fails safely with a typed
@@ -246,6 +256,10 @@ export function withRequestContext(
     // ACCOUNTING_TIMEOUT_MS; a hung recorder observes an abort via its
     // optional signal, and timeouts/failures vanish through safe().
     // (Nodejs runtime, so setTimeout is always available.)
+    // NOTE: a bare setTimeout macrotask may be dropped on serverless when
+    // the function is frozen after the response. Migrate this dispatch to
+    // waitUntil (Ph.13–14 durable usage) once the runtime handle is
+    // threaded through the pipeline — no behavior change until then.
     const usage = pick(providers.usage, getUsageRecorder());
     setTimeout(() => {
       safe(() => {

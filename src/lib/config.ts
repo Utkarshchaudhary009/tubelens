@@ -8,7 +8,9 @@ export const CONFIG_ERROR_CODE = "missing_security_config";
 
 export class ConfigError extends Error {
   readonly code = CONFIG_ERROR_CODE;
-  readonly status = 500;
+  // Security config unavailable at request time is a 503 (retryable,
+  // operator-fixable), matching the pipeline's config-fault mapping.
+  readonly status = 503;
 
   constructor(message: string, hint: string) {
     super(`${message} Hint: ${hint}`);

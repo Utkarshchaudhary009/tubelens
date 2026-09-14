@@ -19,6 +19,7 @@ import {
 import { createRequestContext, withRequestContext } from "../pipeline";
 import {
   getProductPolicyProvider,
+  KNOWN_TIERS,
   normalizeTier,
   resetProductPolicyProvider,
 } from "../product";
@@ -126,6 +127,8 @@ describe("config validation + failure policy (Phase 01)", () => {
     } catch (err) {
       expect(err).toBeInstanceOf(ConfigError);
       expect((err as ConfigError).code).toBe("missing_security_config");
+      // Security-config-unavailable is a retryable 503, not a 500.
+      expect((err as ConfigError).status).toBe(503);
     }
   });
 
@@ -477,19 +480,23 @@ describe("cubic review findings", () => {
     expect(anonymousAuthContext.type).toBe("anonymous");
   });
 
-  test("normalizeTier only honors active tiers; reserved fall back to free", () => {
-    expect(normalizeTier("free")).toBe("free");
-    for (const reserved of [
-      "pro",
+  test("normalizeTier accepts canonical tiers; team/unknown fall back to free", () => {
+    expect(KNOWN_TIERS).toEqual(["free", "plus", "pro", "enterprise"]);
+    for (const known of ["free", "plus", "pro", "enterprise"] as const) {
+      expect(normalizeTier(known)).toBe(known);
+    }
+    // `team` is an org concept, never a tier — never effective.
+    for (const other of [
       "team",
-      "enterprise",
       "admin",
+      "FREE",
       "",
       null,
       undefined,
       42,
+      {},
     ]) {
-      expect(normalizeTier(reserved)).toBe("free");
+      expect(normalizeTier(other)).toBe("free");
     }
   });
 
@@ -588,7 +595,7 @@ describe("cubic review findings", () => {
     }
   });
 
-  test("bypassRateLimit outside liveness throws a programmer-error ConfigError", async () => {
+  test("bypassRateLimit outside liveness returns typed 500 JSON, never throws", async () => {
     const run = withRequestContext(
       async (_r, ctx) =>
         successResponse({ ok: true }, { requestId: ctx.requestId }),
@@ -596,9 +603,14 @@ describe("cubic review findings", () => {
       "search",
       { bypassRateLimit: true },
     );
-    await expect(
-      run(req("http://x/api/v1/search?q=x", "bad-1")),
-    ).rejects.toThrow(ConfigError);
+    const res = await run(req("http://x/api/v1/search?q=x", "bad-1"));
+    expect(res.status).toBe(500);
+    expect(res.headers.get("Content-Type")).toContain("application/json");
+    expect(res.headers.get("X-Request-Id")).toBe("bad-1");
+    const body = await res.json();
+    expect(body.error.code).toBe("missing_security_config");
+    expect(typeof body.error.hint).toBe("string");
+    expect(body.meta.requestId).toBe("bad-1");
   });
 
   test("500 responses carry the limiter decision's header values", async () => {

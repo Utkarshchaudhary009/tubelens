@@ -2,14 +2,14 @@
 // Source of truth: plans/PLANS_AND_USAGE.md — do NOT invent competing tier
 // rules here. This module only projects that document into typed policy.
 
-/** Active tier plus reserved future tiers (defined, not active by default). */
-export type Tier = "free" | "pro" | "team" | "enterprise";
+/** Canonical tiers, ranked `free < plus < pro < enterprise` (`team` is an org concept, never a tier). */
+export type Tier = "free" | "plus" | "pro" | "enterprise";
 
 export const ACTIVE_TIERS: readonly Tier[] = ["free"];
 export const KNOWN_TIERS: readonly Tier[] = [
   "free",
+  "plus",
   "pro",
-  "team",
   "enterprise",
 ];
 
@@ -36,13 +36,14 @@ export const FREE_ENTITLEMENTS: EntitlementSnapshot = {
 };
 
 /**
- * Normalize an untrusted tier value. Only ACTIVE_TIERS are effective —
- * reserved tiers (pro/team/enterprise) are defined but not active, so they
- * fall back to `free` like any unknown value. A tier can never be
- * self-escalated via a forged claim.
+ * Normalize an untrusted tier value. Any canonical known tier
+ * (free/plus/pro/enterprise) is accepted as-is; unknown values — including
+ * `team`, which is an org concept and never a tier — fall back to `free`.
+ * Non-free labels grant no extra allowance in Phase 01 (entitlementsFor
+ * projects the free snapshot), so a forged claim can never self-escalate.
  */
 export function normalizeTier(raw: unknown): Tier {
-  return ACTIVE_TIERS.includes(raw as Tier) ? (raw as Tier) : "free";
+  return KNOWN_TIERS.includes(raw as Tier) ? (raw as Tier) : "free";
 }
 
 export interface ProductPolicyProvider {
