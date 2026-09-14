@@ -7,6 +7,14 @@
 
 import type { NextResponse } from "next/server";
 import { errorResponse } from "./errors";
+import type { Tier } from "./product";
+
+// Canonical re-export (PLANS_AND_USAGE.md §16): REST handlers and future
+// MCP tools import `getEffectiveTier` from this module. The implementation
+// stays in `./product`; this is a type-plus-value re-export with no logic.
+// No cycle risk: `./product` imports nothing from this module, and the
+// `Tier` import above is type-only (erased at runtime).
+export { getEffectiveTier } from "./product";
 
 export type AuthPrincipalType = "anonymous" | "user" | "api_key";
 
@@ -16,6 +24,14 @@ export interface AuthContext {
   authenticated: boolean;
   /** Clerk user id once Phase 02 lands; absent for anonymous. */
   userId?: string;
+  /**
+   * Claim-projected tier (Phase 03): `clerkAuthProvider` normalizes the
+   * `tubelens.tier` session claim here via `getEffectiveTier`. Absent for
+   * anonymous/legacy contexts — the pipeline's policy provider falls back
+   * to `free`. Fast but ~60s-stale; write paths must re-fetch authoritative
+   * Clerk metadata (Phase 04), never trust this alone.
+   */
+  tier?: Tier;
   /** Clerk key reference once Phase 05 lands; never a plaintext secret. */
   keyId?: string;
   /** Owning project/environment label once projects exist (Phase 07+). */
