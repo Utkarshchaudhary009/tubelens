@@ -223,6 +223,39 @@ export interface ApiKeysClient {
   verifyKey(secret: string, opts?: ClerkCallOptions): Promise<ApiKeyRecord>;
 }
 
+/** Per-page size for the authority key listing. */
+export const KEY_LIST_PAGE_SIZE = 50;
+/** Defensive cap on walked list pages — bounds work on a misbehaving authority. */
+export const MAX_KEY_LIST_PAGES = 20;
+
+export interface KeyPage<T> {
+  data: T[];
+  totalCount: number;
+}
+
+/**
+ * Walk the authority's offset pagination until a short page (or the
+ * `totalCount`) ends the walk, combining results. Capped at
+ * `MAX_KEY_LIST_PAGES` pages. Exported so tests cover the walk without the
+ * Clerk SDK; the live `listKeys` adapter above is its only production caller.
+ */
+export async function collectKeyPages<T>(
+  fetchPage: (offset: number, limit: number) => Promise<KeyPage<T>>,
+): Promise<T[]> {
+  const all: T[] = [];
+  for (let page = 0; page < MAX_KEY_LIST_PAGES; page++) {
+    const res = await fetchPage(page * KEY_LIST_PAGE_SIZE, KEY_LIST_PAGE_SIZE);
+    all.push(...res.data);
+    if (res.data.length < KEY_LIST_PAGE_SIZE) {
+      break;
+    }
+    if (all.length >= res.totalCount) {
+      break;
+    }
+  }
+  return all;
+}
+
 function toRecord(raw: {
   id: string;
   name: string;
@@ -311,12 +344,15 @@ export const liveApiKeysClient: ApiKeysClient = {
     return withBudget(async () => {
       const { clerkClient } = await import("@clerk/nextjs/server");
       const client = await clerkClient();
-      const page = await client.apiKeys.list({
-        subject: params.subject,
-        includeInvalid: params.includeInvalid ?? true,
-        limit: 50,
-      });
-      return page.data.map((key) =>
+      const keys = await collectKeyPages((offset, limit) =>
+        client.apiKeys.list({
+          subject: params.subject,
+          includeInvalid: params.includeInvalid ?? true,
+          limit,
+          offset,
+        }),
+      );
+      return keys.map((key) =>
         toRecord({
           id: key.id,
           name: key.name,

@@ -6,6 +6,7 @@ import {
   getKeyMetadata,
   hasPrivilegeClaims,
   mapApiKeyBodyError,
+  markKeyRevoked,
   recordKeyMetadata,
   requireAuthoritativeCaller,
   tierRank,
@@ -164,14 +165,29 @@ export async function handleAdminKeysCreate(
     return clerkErrorResponse(requestId, err);
   }
   if (!created.secret) {
-    // The authority must return the secret once: without it the key is
-    // unusable and the issuance must not be presented as success. A
-    // dedicated code (not the generic dependency mapping) so operators can
-    // distinguish an authority contract break from an outage.
+    // Orphan cleanup: the authority minted a key but withheld its secret,
+    // leaving an unusable credential behind. Best-effort revoke it so a
+    // retry cannot pile up orphan keys. (No request-backed idempotency is
+    // possible: Clerk `apiKeys.create` takes no idempotency key, so cleanup
+    // — not dedup — is the guard.) A dedicated code (not the generic
+    // dependency mapping) so operators can distinguish an authority contract
+    // break from an outage.
+    let cleanupFailed = false;
+    try {
+      await apiKeys.revokeKey(
+        { apiKeyId: created.id, revocationReason: "missing-secret cleanup" },
+        { signal: AbortSignal.timeout(8000) },
+      );
+      markKeyRevoked(created.id, "missing-secret cleanup");
+    } catch {
+      cleanupFailed = true;
+    }
     return errorResponse(requestId, {
       code: "key_authority_error",
       message: "Key authority did not return a secret.",
-      hint: "The key was not issued — retry the request; report the X-Request-Id if the failure persists.",
+      hint: cleanupFailed
+        ? "Issuance outcome is unknown — the orphan key may still exist. List the subject's keys to reconcile before retrying; report the X-Request-Id if the failure persists."
+        : "The unusable key was revoked — list the subject's keys to confirm, then retry; report the X-Request-Id if the failure persists.",
       status: 503,
     });
   }

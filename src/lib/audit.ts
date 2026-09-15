@@ -171,7 +171,21 @@ export function recordAuditEvent(input: AuditInput): AuditEvent {
     events.shift();
   }
   console.info(JSON.stringify({ level: "audit", ...event }));
-  return event;
+  // Defensive clone: the stored row must not alias the return value, or a
+  // caller mutating it would rewrite history (same shape as the
+  // getAuditEvents snapshot below).
+  return snapshotAuditEvent(event);
+}
+
+/**
+ * Snapshot one stored row. Each row is shallow-cloned (`api_key.issued`
+ * rows additionally clone their `scopes` array) so callers can neither
+ * mutate the store array nor the stored row objects.
+ */
+function snapshotAuditEvent(event: AuditEvent): AuditEvent {
+  return event.action === "api_key.issued"
+    ? { ...event, scopes: [...event.scopes] }
+    : { ...event };
 }
 
 /**
@@ -180,11 +194,7 @@ export function recordAuditEvent(input: AuditInput): AuditEvent {
  * rows additionally clone their `scopes` array).
  */
 export function getAuditEvents(): AuditEvent[] {
-  return events.map((event) =>
-    event.action === "api_key.issued"
-      ? { ...event, scopes: [...event.scopes] }
-      : { ...event },
-  );
+  return events.map(snapshotAuditEvent);
 }
 
 /** Clear the store (primarily for tests). */

@@ -15,16 +15,19 @@ import {
   type ApiKeyRecord,
   type ApiKeysClient,
   clearApiKeyMetadata,
+  collectKeyPages,
   createKeyBodySchema,
   getKeyMetadata,
   hasPrivilegeClaims,
+  KEY_LIST_PAGE_SIZE,
+  MAX_KEY_LIST_PAGES,
   mapApiKeyBodyError,
   resetApiKeysClient,
   revokeKeyBodySchema,
   setApiKeysClient,
   tierRank,
 } from "../api-keys";
-import { clearAuditEvents, getAuditEvents } from "../audit";
+import { clearAuditEvents, getAuditEvents, recordAuditEvent } from "../audit";
 import { type AuthContext, requireAdmin, requireAuth } from "../auth";
 import {
   clerkAuthProvider,
@@ -674,12 +677,12 @@ describe("POST /admin/keys guards (Phase 05)", () => {
     expect(getAuditEvents()).toHaveLength(0);
   });
 
-  test("503 key_authority_error when the authority returns no secret", async () => {
+  test("503 key_authority_error revokes the orphan; failed cleanup warns", async () => {
     const users: Record<string, MockMeta> = {
       user_admin1: { tier: "pro", role: "admin" },
       user_pro1: { tier: "pro", role: "user" },
     };
-    const { client } = mockApiKeys(users);
+    const { client, seen, keys } = mockApiKeys(users);
     // Authority created the key but broke the once-secret contract: the
     // issuance must not be presented as success, audited, or overlaid.
     const secretless: ApiKeysClient = {
@@ -700,8 +703,42 @@ describe("POST /admin/keys guards (Phase 05)", () => {
     const body = await res.json();
     expect(body.error.code).toBe("key_authority_error");
     expect(body.error.hint).toBeString();
+    // Orphan cleanup ran: the unusable key was revoked, not left behind.
+    const revokeSeen = seen.find((s) => s.op === "revokeKey")?.params as
+      | { apiKeyId?: string }
+      | undefined;
+    expect(revokeSeen?.apiKeyId).toBe("key_1");
+    expect(keys.get("key_1")?.revoked).toBe(true);
+    expect(body.error.hint).toMatch(/revoked/);
     expect(getAuditEvents()).toHaveLength(0);
     expect(getKeyMetadata("key_1")).toBeUndefined();
+
+    // Cleanup itself failed: same code, but the hint admits the unknown
+    // outcome and advises listing to reconcile rather than blind retry.
+    clearAuditEvents();
+    const failing = mockApiKeys(users, {
+      failRevoke: new Error("revoke down"),
+    });
+    const secretlessFailing: ApiKeysClient = {
+      ...failing.client,
+      async createKey(params, o) {
+        const created = await failing.client.createKey(params, o);
+        const { secret: _dropped, ...rest } = created;
+        return rest;
+      },
+    };
+    const res2 = await handleAdminKeysCreate(
+      "keys-nosecret-2",
+      adminAuth,
+      { subject: "user_pro1", name: "k" },
+      { apiKeys: secretlessFailing },
+    );
+    expect(res2.status).toBe(503);
+    const body2 = await res2.json();
+    expect(body2.error.code).toBe("key_authority_error");
+    expect(body2.error.hint).toMatch(/unknown/i);
+    expect(body2.error.hint).toMatch(/reconcile/i);
+    expect(getAuditEvents()).toHaveLength(0);
   });
 
   test("404 unknown subject maps to user_not_found with no audit row", async () => {
@@ -1336,5 +1373,94 @@ describe("audit isolation for key rows (Phase 05)", () => {
     } else {
       throw new Error("expected an api_key.issued row");
     }
+  });
+
+  test("recordAuditEvent return value does not alias the stored row", () => {
+    const row = recordAuditEvent({
+      action: "user.tier.changed",
+      actor: "user_admin1",
+      target: "user_x1",
+      targetUserId: "user_x1",
+      oldTier: "free",
+      newTier: "pro",
+      requestId: "alias-1",
+    });
+    row.actor = "user_tampered";
+    expect(getAuditEvents()[0]).toMatchObject({ actor: "user_admin1" });
+
+    const issued = recordAuditEvent({
+      action: "api_key.issued",
+      actor: "user_admin1",
+      target: "user_x1",
+      targetUserId: "user_x1",
+      keyId: "key_alias1",
+      name: "k",
+      scopes: ["search:read"],
+      tierAtIssuance: "pro",
+      requestId: "alias-2",
+    });
+    if (issued.action !== "api_key.issued") {
+      throw new Error("expected an api_key.issued row");
+    }
+    issued.scopes.push("tampered:write");
+    const reread = getAuditEvents();
+    expect(reread).toHaveLength(2);
+    if (reread[1].action !== "api_key.issued") {
+      throw new Error("expected an api_key.issued row");
+    }
+    expect(reread[1].scopes).toEqual(["search:read"]);
+  });
+});
+
+describe("collectKeyPages (Phase 05)", () => {
+  test("combines pages until a short page ends the walk", async () => {
+    const seen: { offset: number; limit: number }[] = [];
+    const total = KEY_LIST_PAGE_SIZE * 2 + 7;
+    const combined = await collectKeyPages(async (offset, limit) => {
+      seen.push({ offset, limit });
+      const remaining = total - offset;
+      const count = Math.min(limit, remaining);
+      return {
+        data: Array.from({ length: count }, (_, i) => `key_${offset + i}`),
+        totalCount: total,
+      };
+    });
+    expect(combined).toHaveLength(total);
+    expect(combined[0]).toBe("key_0");
+    expect(combined[total - 1]).toBe(`key_${total - 1}`);
+    expect(seen).toEqual([
+      { offset: 0, limit: KEY_LIST_PAGE_SIZE },
+      { offset: KEY_LIST_PAGE_SIZE, limit: KEY_LIST_PAGE_SIZE },
+      { offset: KEY_LIST_PAGE_SIZE * 2, limit: KEY_LIST_PAGE_SIZE },
+    ]);
+  });
+
+  test("stops on totalCount even when the page is full", async () => {
+    let calls = 0;
+    const combined = await collectKeyPages(async () => {
+      calls += 1;
+      return {
+        data: Array.from({ length: KEY_LIST_PAGE_SIZE }, (_, i) => `key_${i}`),
+        totalCount: KEY_LIST_PAGE_SIZE,
+      };
+    });
+    expect(combined).toHaveLength(KEY_LIST_PAGE_SIZE);
+    expect(calls).toBe(1);
+  });
+
+  test("caps the walk defensively on a misbehaving authority", async () => {
+    let calls = 0;
+    const combined = await collectKeyPages(async (offset) => {
+      calls += 1;
+      return {
+        data: Array.from(
+          { length: KEY_LIST_PAGE_SIZE },
+          (_, i) => `key_${offset + i}`,
+        ),
+        totalCount: Number.MAX_SAFE_INTEGER,
+      };
+    });
+    expect(calls).toBe(MAX_KEY_LIST_PAGES);
+    expect(combined).toHaveLength(MAX_KEY_LIST_PAGES * KEY_LIST_PAGE_SIZE);
   });
 });
