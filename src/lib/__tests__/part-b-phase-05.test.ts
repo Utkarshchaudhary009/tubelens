@@ -206,10 +206,13 @@ function mockApiKeys(
       if (opts.failList !== undefined) {
         throw opts.failList;
       }
-      return [...keys.values()]
-        .filter((key) => key.subject === params.subject)
-        .filter((key) => (params.includeInvalid ? true : !key.revoked))
-        .map((key) => toRecord(key, false));
+      return {
+        keys: [...keys.values()]
+          .filter((key) => key.subject === params.subject)
+          .filter((key) => (params.includeInvalid ? true : !key.revoked))
+          .map((key) => toRecord(key, false)),
+        truncated: false,
+      };
     },
     async revokeKey(params, o) {
       seen.push({
@@ -1416,18 +1419,21 @@ describe("collectKeyPages (Phase 05)", () => {
   test("combines pages until a short page ends the walk", async () => {
     const seen: { offset: number; limit: number }[] = [];
     const total = KEY_LIST_PAGE_SIZE * 2 + 7;
-    const combined = await collectKeyPages(async (offset, limit) => {
-      seen.push({ offset, limit });
-      const remaining = total - offset;
-      const count = Math.min(limit, remaining);
-      return {
-        data: Array.from({ length: count }, (_, i) => `key_${offset + i}`),
-        totalCount: total,
-      };
-    });
+    const { keys: combined, truncated } = await collectKeyPages(
+      async (offset, limit) => {
+        seen.push({ offset, limit });
+        const remaining = total - offset;
+        const count = Math.min(limit, remaining);
+        return {
+          data: Array.from({ length: count }, (_, i) => `key_${offset + i}`),
+          totalCount: total,
+        };
+      },
+    );
     expect(combined).toHaveLength(total);
     expect(combined[0]).toBe("key_0");
     expect(combined[total - 1]).toBe(`key_${total - 1}`);
+    expect(truncated).toBe(false);
     expect(seen).toEqual([
       { offset: 0, limit: KEY_LIST_PAGE_SIZE },
       { offset: KEY_LIST_PAGE_SIZE, limit: KEY_LIST_PAGE_SIZE },
@@ -1437,7 +1443,7 @@ describe("collectKeyPages (Phase 05)", () => {
 
   test("stops on totalCount even when the page is full", async () => {
     let calls = 0;
-    const combined = await collectKeyPages(async () => {
+    const { keys: combined, truncated } = await collectKeyPages(async () => {
       calls += 1;
       return {
         data: Array.from({ length: KEY_LIST_PAGE_SIZE }, (_, i) => `key_${i}`),
@@ -1445,22 +1451,80 @@ describe("collectKeyPages (Phase 05)", () => {
       };
     });
     expect(combined).toHaveLength(KEY_LIST_PAGE_SIZE);
+    expect(truncated).toBe(false);
     expect(calls).toBe(1);
   });
 
   test("caps the walk defensively on a misbehaving authority", async () => {
     let calls = 0;
-    const combined = await collectKeyPages(async (offset) => {
-      calls += 1;
-      return {
-        data: Array.from(
-          { length: KEY_LIST_PAGE_SIZE },
-          (_, i) => `key_${offset + i}`,
-        ),
-        totalCount: Number.MAX_SAFE_INTEGER,
-      };
-    });
+    const { keys: combined, truncated } = await collectKeyPages(
+      async (offset) => {
+        calls += 1;
+        return {
+          data: Array.from(
+            { length: KEY_LIST_PAGE_SIZE },
+            (_, i) => `key_${offset + i}`,
+          ),
+          totalCount: Number.MAX_SAFE_INTEGER,
+        };
+      },
+    );
     expect(calls).toBe(MAX_KEY_LIST_PAGES);
     expect(combined).toHaveLength(MAX_KEY_LIST_PAGES * KEY_LIST_PAGE_SIZE);
+    // The cap is reported, never silent: the listing route turns this into
+    // a `truncated` warning instead of a fake-complete page.
+    expect(truncated).toBe(true);
+  });
+
+  test("stops promptly when the signal is already aborted", async () => {
+    let calls = 0;
+    await expect(
+      collectKeyPages(
+        async () => {
+          calls += 1;
+          return { data: ["key_0"], totalCount: 1 };
+        },
+        { signal: AbortSignal.abort(new Error("budget fired")) },
+      ),
+    ).rejects.toThrow("budget fired");
+    expect(calls).toBe(0);
+  });
+
+  test("GET /admin/keys warns on truncation, stays quiet otherwise", async () => {
+    const users: Record<string, MockMeta> = {
+      user_admin1: { tier: "pro", role: "admin" },
+      user_pro1: { tier: "pro", role: "user" },
+    };
+    const { client } = mockApiKeys(users);
+    // Untruncated listing: no warnings.
+    const clean = await handleAdminKeysList(
+      "keys-trunc-clean",
+      adminAuth,
+      "user_pro1",
+      { apiKeys: client },
+    );
+    expect(clean.status).toBe(200);
+    expect((await clean.json()).warnings).toEqual([]);
+
+    // Truncated walk: the route surfaces it honestly.
+    const truncatedClient: ApiKeysClient = {
+      ...client,
+      async listKeys(params, o) {
+        const res = await client.listKeys(params, o);
+        return { ...res, truncated: true };
+      },
+    };
+    const cut = await handleAdminKeysList(
+      "keys-trunc-cut",
+      adminAuth,
+      "user_pro1",
+      { apiKeys: truncatedClient },
+    );
+    expect(cut.status).toBe(200);
+    const body = await cut.json();
+    expect(body.page).toEqual({ next: null });
+    expect(body.warnings).toHaveLength(1);
+    expect(body.warnings[0].code).toBe("truncated");
+    expect(body.warnings[0].message).toBeString();
   });
 });

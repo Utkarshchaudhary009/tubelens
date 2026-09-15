@@ -210,7 +210,7 @@ export interface ApiKeysClient {
   listKeys(
     params: { subject: string; includeInvalid?: boolean },
     opts?: ClerkCallOptions,
-  ): Promise<ApiKeyRecord[]>;
+  ): Promise<ListKeysResult>;
   revokeKey(
     params: RevokeKeyParams,
     opts?: ClerkCallOptions,
@@ -233,27 +233,41 @@ export interface KeyPage<T> {
   totalCount: number;
 }
 
+/** Result of `listKeys`: the walked keys plus whether the defensive page cap cut the walk short. */
+export interface ListKeysResult {
+  keys: ApiKeyRecord[];
+  /** True when the walk hit `MAX_KEY_LIST_PAGES` with a full final page — more keys may exist. */
+  truncated: boolean;
+}
+
 /**
  * Walk the authority's offset pagination until a short page (or the
  * `totalCount`) ends the walk, combining results. Capped at
- * `MAX_KEY_LIST_PAGES` pages. Exported so tests cover the walk without the
- * Clerk SDK; the live `listKeys` adapter above is its only production caller.
+ * `MAX_KEY_LIST_PAGES` pages (`truncated: true` when the cap cuts a
+ * still-full walk short, so callers can surface it honestly instead of
+ * presenting a partial array as complete). Checks `opts.signal` before
+ * each page fetch and throws its reason when aborted, so a fired 8s
+ * `withBudget` stops the walk instead of leaking page requests in the
+ * background. Exported so tests cover the walk without the Clerk SDK;
+ * the live `listKeys` adapter is its only production caller.
  */
 export async function collectKeyPages<T>(
   fetchPage: (offset: number, limit: number) => Promise<KeyPage<T>>,
-): Promise<T[]> {
+  opts?: { signal?: AbortSignal },
+): Promise<{ keys: T[]; truncated: boolean }> {
   const all: T[] = [];
   for (let page = 0; page < MAX_KEY_LIST_PAGES; page++) {
+    opts?.signal?.throwIfAborted();
     const res = await fetchPage(page * KEY_LIST_PAGE_SIZE, KEY_LIST_PAGE_SIZE);
     all.push(...res.data);
     if (res.data.length < KEY_LIST_PAGE_SIZE) {
-      break;
+      return { keys: all, truncated: false };
     }
     if (all.length >= res.totalCount) {
-      break;
+      return { keys: all, truncated: false };
     }
   }
-  return all;
+  return { keys: all, truncated: true };
 }
 
 function toRecord(raw: {
@@ -344,30 +358,35 @@ export const liveApiKeysClient: ApiKeysClient = {
     return withBudget(async () => {
       const { clerkClient } = await import("@clerk/nextjs/server");
       const client = await clerkClient();
-      const keys = await collectKeyPages((offset, limit) =>
-        client.apiKeys.list({
-          subject: params.subject,
-          includeInvalid: params.includeInvalid ?? true,
-          limit,
-          offset,
-        }),
+      const { keys, truncated } = await collectKeyPages(
+        (offset, limit) =>
+          client.apiKeys.list({
+            subject: params.subject,
+            includeInvalid: params.includeInvalid ?? true,
+            limit,
+            offset,
+          }),
+        { signal: opts?.signal },
       );
-      return keys.map((key) =>
-        toRecord({
-          id: key.id,
-          name: key.name,
-          subject: key.subject,
-          scopes: key.scopes,
-          claims: key.claims as Record<string, unknown> | null,
-          revoked: key.revoked,
-          revocationReason: key.revocationReason,
-          expired: key.expired,
-          expiration: key.expiration,
-          createdBy: key.createdBy,
-          createdAt: key.createdAt,
-          lastUsedAt: key.lastUsedAt,
-        }),
-      );
+      return {
+        keys: keys.map((key) =>
+          toRecord({
+            id: key.id,
+            name: key.name,
+            subject: key.subject,
+            scopes: key.scopes,
+            claims: key.claims as Record<string, unknown> | null,
+            revoked: key.revoked,
+            revocationReason: key.revocationReason,
+            expired: key.expired,
+            expiration: key.expiration,
+            createdBy: key.createdBy,
+            createdAt: key.createdAt,
+            lastUsedAt: key.lastUsedAt,
+          }),
+        ),
+        truncated,
+      };
     }, opts?.signal);
   },
   async revokeKey(params, opts) {

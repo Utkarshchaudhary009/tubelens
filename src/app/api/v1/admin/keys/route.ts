@@ -272,9 +272,9 @@ export async function handleAdminKeysList(
   if (!callerCheck.ok) {
     return callerCheck.response;
   }
-  let keys: Awaited<ReturnType<ApiKeysClient["listKeys"]>>;
+  let listed: Awaited<ReturnType<ApiKeysClient["listKeys"]>>;
   try {
-    keys = await apiKeys.listKeys(
+    listed = await apiKeys.listKeys(
       { subject: subjectParam, includeInvalid: true },
       { signal: AbortSignal.timeout(8000) },
     );
@@ -285,8 +285,10 @@ export async function handleAdminKeysList(
   // leak through, even if the authority ever returns one on list. The local
   // overlay contributes `tierAtIssuance` (null for keys issued outside this
   // API or before a process restart — Clerk stays the source of truth).
+  // A truncated walk is surfaced honestly via `warnings`, never presented
+  // as a complete listing.
   return successResponse(
-    keys.map((key) => ({
+    listed.keys.map((key) => ({
       keyId: key.id,
       name: key.name,
       subject: key.subject,
@@ -307,6 +309,20 @@ export async function handleAdminKeysList(
           : null,
       tierAtIssuance: getKeyMetadata(key.id)?.tierAtIssuance ?? null,
     })),
-    { requestId, cacheControl: CACHE_CONTROL.noStore },
+    {
+      requestId,
+      cacheControl: CACHE_CONTROL.noStore,
+      ...(listed.truncated
+        ? {
+            warnings: [
+              {
+                code: "truncated",
+                message:
+                  "Key listing hit the 1000-key page cap; more keys may exist. Revoke stale keys or narrow the listing before relying on it being complete.",
+              },
+            ],
+          }
+        : {}),
+    },
   );
 }
