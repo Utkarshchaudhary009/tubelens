@@ -21,6 +21,7 @@
 import type { AuthContext, AuthProvider } from "./auth";
 import { anonymousAuthContext } from "./auth";
 import { getConfig } from "./config";
+import { getEffectiveTier } from "./product";
 
 /** Protected pathnames (exact match); everything else is public. */
 export const AUTHENTICATED_ROUTES = ["/api/v1/me"] as const;
@@ -52,7 +53,46 @@ export function hasClerkSecret(
 }
 
 /**
+ * Pure session-to-context projection (no SDK import): maps a Clerk session
+ * shape to an AuthContext, normalizing the fast `tubelens.tier` claim via
+ * `getEffectiveTier` (missing/invalid → `free`, never self-escalating).
+ * Signed-out/malformed sessions resolve anonymous. Exported pure so unit
+ * tests cover the claim mapping without initializing the Clerk SDK; the
+ * live provider below only handles import/config plumbing.
+ */
+export function contextFromClerkSession(
+  session:
+    | {
+        userId?: unknown;
+        sessionClaims?: unknown;
+      }
+    | null
+    | undefined,
+): AuthContext {
+  const userId = session?.userId;
+  if (typeof userId === "string" && userId !== "") {
+    return {
+      type: "user",
+      authenticated: true,
+      userId,
+      tier: getEffectiveTier(session?.sessionClaims),
+    };
+  }
+  return { ...anonymousAuthContext };
+}
+
+/**
  * Resolve the caller principal via the Clerk session.
+ *
+ * Tier projection (Phase 03): `sessionClaims.tubelens.tier` carries the
+ * fast claim minted by the Dashboard session-token template
+ * (`{"metadata":"{{user.public_metadata}}","tubelens":{"tier":"{{user.public_metadata.tier}}"}}`,
+ * custom claims <1.2KB). It is normalized via `getEffectiveTier` onto the
+ * returned context so the pipeline's `ctx.tier` reflects the claim without
+ * a Backend API call. Signed-out/malformed → anonymous (no tier);
+ * authenticated + missing/invalid → `free`;
+ * the projection lags metadata changes by ~60s, so security-sensitive
+ * write paths must re-fetch authoritative Clerk metadata (Phase 04).
  *
  * - Fail-safe first: when TUBELENS_AUTH_ENFORCEMENT=required without
  *   CLERK_SECRET_KEY, `getConfig` throws a typed ConfigError — protection
@@ -74,13 +114,11 @@ export const clerkAuthProvider: AuthProvider = {
     try {
       // Lazy import: keyless envs and unit tests never initialize the Clerk
       // SDK. `auth()` is async in the v7 SDK — `await` covers both shapes.
+      // Claim mapping itself lives in the pure `contextFromClerkSession`
+      // above (unit-tested without the SDK); this block is import/config
+      // plumbing only.
       const { auth } = await import("@clerk/nextjs/server");
-      const session = await auth();
-      const userId = session?.userId;
-      if (typeof userId === "string" && userId !== "") {
-        return { type: "user", authenticated: true, userId };
-      }
-      return { ...anonymousAuthContext };
+      return contextFromClerkSession(await auth());
     } catch {
       return { ...anonymousAuthContext };
     }
