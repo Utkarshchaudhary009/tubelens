@@ -517,6 +517,35 @@ describe("POST /admin/keys happy path (Phase 05)", () => {
     expect(res.status).toBe(200);
     expect((await res.json()).data.tierAtIssuance).toBe("free");
   });
+
+  test("create reason is audited; over-long reason is 400 invalid_reason", async () => {
+    const users: Record<string, MockMeta> = {
+      user_admin1: { tier: "pro", role: "admin" },
+      user_pro1: { tier: "pro", role: "user" },
+    };
+    const { client } = mockApiKeys(users);
+    const res = await handleAdminKeysCreate(
+      "keys-reason-1",
+      adminAuth,
+      { subject: "user_pro1", name: "etl", reason: "rotation prep" },
+      { apiKeys: client },
+    );
+    expect(res.status).toBe(200);
+    expect(getAuditEvents()[0]).toMatchObject({
+      action: "api_key.issued",
+      reason: "rotation prep",
+    });
+
+    const longRes = await handleAdminKeysCreate(
+      "keys-reason-2",
+      adminAuth,
+      { subject: "user_pro1", name: "etl", reason: "x".repeat(281) },
+      { apiKeys: client },
+    );
+    expect(longRes.status).toBe(400);
+    expect((await longRes.json()).error.code).toBe("invalid_reason");
+    expect(getAuditEvents()).toHaveLength(1);
+  });
 });
 
 describe("POST /admin/keys guards (Phase 05)", () => {
@@ -643,6 +672,36 @@ describe("POST /admin/keys guards (Phase 05)", () => {
       expect(parsed.error.hint).toBeString();
     }
     expect(getAuditEvents()).toHaveLength(0);
+  });
+
+  test("503 key_authority_error when the authority returns no secret", async () => {
+    const users: Record<string, MockMeta> = {
+      user_admin1: { tier: "pro", role: "admin" },
+      user_pro1: { tier: "pro", role: "user" },
+    };
+    const { client } = mockApiKeys(users);
+    // Authority created the key but broke the once-secret contract: the
+    // issuance must not be presented as success, audited, or overlaid.
+    const secretless: ApiKeysClient = {
+      ...client,
+      async createKey(params, o) {
+        const created = await client.createKey(params, o);
+        const { secret: _dropped, ...rest } = created;
+        return rest;
+      },
+    };
+    const res = await handleAdminKeysCreate(
+      "keys-nosecret-1",
+      adminAuth,
+      { subject: "user_pro1", name: "k" },
+      { apiKeys: secretless },
+    );
+    expect(res.status).toBe(503);
+    const body = await res.json();
+    expect(body.error.code).toBe("key_authority_error");
+    expect(body.error.hint).toBeString();
+    expect(getAuditEvents()).toHaveLength(0);
+    expect(getKeyMetadata("key_1")).toBeUndefined();
   });
 
   test("404 unknown subject maps to user_not_found with no audit row", async () => {
@@ -1011,7 +1070,60 @@ describe("machine verification (Phase 05)", () => {
     expect(seen.length).toBe(before);
   });
 
-  test("subject-tier read failure falls back to free, never escalates", async () => {
+  test("verified-but-flagged keys deny even when verify resolves", async () => {
+    // Fail-closed guard: a verify result already carrying revoked/expired
+    // must resolve anonymous — never trust the payload, even though the
+    // authority resolved instead of threw.
+    const flagged: MockKeyState = {
+      id: "key_11",
+      secret: "ak_test_flagged_11",
+      name: "stale",
+      subject: "user_pro1",
+      scopes: [],
+      claims: null,
+      revoked: true,
+      revocationReason: "rotated",
+      expired: false,
+      expiration: null,
+      createdBy: "user_admin1",
+      createdAt: Date.now(),
+      lastUsedAt: null,
+    };
+    const { client, seen } = mockApiKeys(
+      { user_pro1: { tier: "pro", role: "user" } },
+      { seedKeys: [flagged] },
+    );
+    // Bypass the mock's throwing verify: resolve the revoked record itself.
+    const passthrough: ApiKeysClient = {
+      ...client,
+      async verifyKey(secret, o) {
+        seen.push({ op: "verifyKey", signal: o?.signal });
+        const state = [...[flagged]].find((key) => key.secret === secret);
+        if (!state) {
+          throw Object.assign(new Error("invalid api key"), { status: 401 });
+        }
+        return {
+          id: state.id,
+          name: state.name,
+          subject: state.subject,
+          scopes: [...state.scopes],
+          claims: null,
+          revoked: state.revoked,
+          revocationReason: state.revocationReason,
+          expired: state.expired,
+          expiration: state.expiration,
+          createdBy: state.createdBy,
+          createdAt: state.createdAt,
+          lastUsedAt: state.lastUsedAt,
+        };
+      },
+    };
+    const ctx = await resolveApiKeyContext("ak_test_flagged_11", passthrough);
+    expect(ctx).toEqual({ type: "anonymous", authenticated: false });
+    expect(requireAuth({ auth: ctx, requestId: "r" })?.status).toBe(401);
+  });
+
+  test("deleted subject (getUser 404) denies; transient errors fall back to free", async () => {
     const seed: MockKeyState = {
       id: "key_10",
       secret: "ak_test_valid_10",
@@ -1027,13 +1139,34 @@ describe("machine verification (Phase 05)", () => {
       createdAt: Date.now(),
       lastUsedAt: null,
     };
-    // Seed users WITHOUT the subject: verify succeeds, getUser 404s.
+    // Seed users WITHOUT the subject: verify succeeds, getUser 404s →
+    // the key no longer binds a live user, so deny (never free-tier).
     const { client } = mockApiKeys({}, { seedKeys: [seed] });
-    const ctx = await resolveApiKeyContext("ak_test_valid_10", client);
+    const deleted = await resolveApiKeyContext("ak_test_valid_10", client);
+    expect(deleted).toEqual({ type: "anonymous", authenticated: false });
+    expect(requireAuth({ auth: deleted, requestId: "r" })?.status).toBe(401);
+
+    // Transient (non-404) subject-read failure: the key itself verified, so
+    // an unreadable tier must not lock it out — least-privilege free.
+    const outage = mockApiKeys(
+      { user_pro1: { tier: "pro", role: "user" } },
+      {
+        seedKeys: [
+          {
+            ...seed,
+            id: "key_12",
+            secret: "ak_test_valid_12",
+            subject: "user_pro1",
+          },
+        ],
+        failGet: new Error("clerk down"),
+      },
+    );
+    const ctx = await resolveApiKeyContext("ak_test_valid_12", outage.client);
     expect(ctx).toMatchObject({
       type: "api_key",
       authenticated: true,
-      userId: "user_gone1",
+      userId: "user_pro1",
       tier: "free",
     });
   });
@@ -1072,11 +1205,12 @@ describe("machine verification (Phase 05)", () => {
     });
     expect(requireAuth({ auth: ctxA, requestId: "loop-1" })).toBeUndefined();
 
-    // Rotation: create-new (B) + revoke-old (A, same operator reason).
+    // Rotation: create-new (B, sharing the operator reason) + revoke-old
+    // (A, same operator reason).
     const issuedB = await handleAdminKeysCreate(
       "loop-issue-b",
       adminAuth,
-      { subject: "user_pro1", name: "b" },
+      { subject: "user_pro1", name: "b", reason: "rotation" },
       { apiKeys: client },
     );
     const bodyB = await issuedB.json();
@@ -1112,6 +1246,7 @@ describe("machine verification (Phase 05)", () => {
       "api_key.issued",
       "api_key.revoked",
     ]);
+    expect(getAuditEvents()[1]).toMatchObject({ reason: "rotation" });
     expect(getAuditEvents()[2]).toMatchObject({
       revocationReason: "rotation",
       reason: "rotation",

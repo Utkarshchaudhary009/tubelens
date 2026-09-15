@@ -69,6 +69,11 @@ export const createKeyBodySchema = z
       .max(MAX_EXPIRY_SECONDS)
       .optional(),
     claims: z.record(z.string(), z.unknown()).optional(),
+    // Optional operator reason (e.g. rotation correlation: the create-new
+    // half shares its reason with the revoke-old half). Trimmed so
+    // ""/whitespace-only reasons become droppable audit noise; max applies
+    // post-trim. Same convention as the Phase 04 tier/role routes.
+    reason: z.string().trim().max(280).optional(),
   })
   .strict();
 
@@ -142,11 +147,11 @@ export function mapApiKeyBodyError(issues: readonly KeyBodyIssue[]): {
         hint: "Send a non-empty name up to 64 characters.",
       };
     }
-    if (head === "revocationReason") {
+    if (head === "revocationReason" || head === "reason") {
       return {
         code: "invalid_reason",
-        message: "Invalid revocation reason.",
-        hint: "Keep revocationReason to 280 characters or fewer, or omit it.",
+        message: "Invalid reason.",
+        hint: "Keep the reason to 280 characters or fewer, or omit it.",
       };
     }
   }

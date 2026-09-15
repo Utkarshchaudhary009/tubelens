@@ -26,6 +26,7 @@ import {
 } from "./api-keys";
 import type { AuthContext, AuthProvider } from "./auth";
 import { anonymousAuthContext } from "./auth";
+import { clerkErrorStatus } from "./clerk-admin";
 import { getConfig } from "./config";
 import { getEffectiveTier, normalizeTier, type Tier } from "./product";
 
@@ -200,15 +201,26 @@ export async function resolveApiKeyContext(
     // (protected routes 401), never bypass.
     return { ...anonymousAuthContext };
   }
+  // Fail-closed guard: never trust a verified payload that already carries
+  // revoked/expired — deny even if the authority resolved instead of threw.
+  if (verified.revoked || verified.expired) {
+    return { ...anonymousAuthContext };
+  }
   let tier: Tier = "free";
   try {
     const subject = await client.getUser(verified.subject, {
       signal: AbortSignal.timeout(8000),
     });
     tier = normalizeTier(subject.publicMetadata?.tier);
-  } catch {
-    // The key itself verified; an unreadable subject tier must not lock out
-    // a valid key — least-privilege `free`, never an escalation.
+  } catch (err) {
+    // A 404 names a deleted subject — the key no longer binds a live user,
+    // so deny rather than serve a dangling principal. Only transient /
+    // non-404 failures fall back to least-privilege `free` (the key itself
+    // verified, so an unreadable tier must not lock it out — and never an
+    // escalation).
+    if (clerkErrorStatus(err) === 404) {
+      return { ...anonymousAuthContext };
+    }
     tier = "free";
   }
   touchKeyLastUsed(verified.id);

@@ -97,6 +97,7 @@ export async function handleAdminKeysCreate(
     scopes = [],
     secondsUntilExpiration,
     claims,
+    reason,
   } = parsed.data;
   // Privilege smuggling inside `claims`: keys bind the subject's
   // authoritative tier at issuance — a client-supplied tier/role is a
@@ -164,11 +165,15 @@ export async function handleAdminKeysCreate(
   }
   if (!created.secret) {
     // The authority must return the secret once: without it the key is
-    // unusable and the issuance must not be presented as success.
-    return clerkErrorResponse(
-      requestId,
-      new Error("Key authority did not return a secret."),
-    );
+    // unusable and the issuance must not be presented as success. A
+    // dedicated code (not the generic dependency mapping) so operators can
+    // distinguish an authority contract break from an outage.
+    return errorResponse(requestId, {
+      code: "key_authority_error",
+      message: "Key authority did not return a secret.",
+      hint: "The key was not issued — retry the request; report the X-Request-Id if the failure persists.",
+      status: 503,
+    });
   }
   const issuedAt = new Date().toISOString();
   recordKeyMetadata({
@@ -196,6 +201,10 @@ export async function handleAdminKeysCreate(
     scopes: [...scopes],
     tierAtIssuance,
     requestId,
+    // Rotation correlation: the create-new half shares its reason with the
+    // revoke-old half (whitespace-only reasons were trimmed to "" by the
+    // schema and are dropped here, same as the tier/role routes).
+    ...(reason ? { reason } : {}),
   });
   return successResponse(
     {
