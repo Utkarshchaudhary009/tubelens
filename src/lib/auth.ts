@@ -42,6 +42,14 @@ export interface AuthContext {
   role?: string;
   /** Clerk key reference once Phase 05 lands; never a plaintext secret. */
   keyId?: string;
+  /**
+   * Key scopes projected from the verified Clerk API key (Phase 07):
+   * `resolveApiKeyContext` copies `verified.scopes` here for
+   * `requireScope()`. Absent for sessions/anonymous — session scopes are a
+   * future extension, so non-key principals never satisfy a scope gate
+   * except via the admin bypass.
+   */
+  scopes?: string[];
   /** Owning project/environment label once projects exist (Phase 07+). */
   projectId?: string;
 }

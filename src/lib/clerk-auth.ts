@@ -230,5 +230,10 @@ export async function resolveApiKeyContext(
     userId: verified.subject,
     tier,
     keyId: verified.id,
+    // Phase 07: project the key's scopes so `requireScope()` can gate
+    // future write scopes. Copied (never aliased) from the verified record;
+    // `?? []` guards an authority that omits scopes so a missing field can
+    // never throw into a bare 500.
+    scopes: [...(verified.scopes ?? [])],
   };
 }

@@ -191,7 +191,44 @@ export async function handleAdminKeysCreate(
       status: 503,
     });
   }
+  // Phase 07 subject verification: the authority must bind the created key
+  // to the REQUESTED subject. On divergence the secret would authenticate
+  // as another subject while metadata/audit/response name this one, so the
+  // minted key is revoked best-effort (same orphan-cleanup pattern as
+  // above) and the request fails closed with 409 `key_owner_mismatch` (the
+  // revoke route's established code for authority/overlay ownership
+  // divergence). The secret is never exposed on any failure path below.
+  if (created.subject !== subject) {
+    let cleanupFailed = false;
+    try {
+      await apiKeys.revokeKey(
+        { apiKeyId: created.id, revocationReason: "subject-mismatch cleanup" },
+        { signal: AbortSignal.timeout(8000) },
+      );
+      markKeyRevoked(created.id, "subject-mismatch cleanup");
+    } catch {
+      cleanupFailed = true;
+    }
+    if (cleanupFailed) {
+      return errorResponse(requestId, {
+        code: "key_authority_error",
+        message: "Key authority bound the key to another subject.",
+        hint: "Issuance outcome is unknown — the divergent key may still exist. List the subject's keys to reconcile before retrying; report the X-Request-Id if the failure persists.",
+        status: 503,
+      });
+    }
+    return errorResponse(requestId, {
+      code: "key_owner_mismatch",
+      message: "Key authority bound the key to another subject.",
+      hint: "The divergent key was revoked — list the subject's keys to confirm, then retry; report the X-Request-Id if the failure persists.",
+      status: 409,
+    });
+  }
   const issuedAt = new Date().toISOString();
+  // Phase 07 owner binding: the issuance record is bound to the CALLER
+  // (`createdBy === caller.userId`, never client-supplied) alongside the
+  // subject's authoritative `tierAtIssuance` — the tier-rank self-grant
+  // check above stays the mint-time guard.
   recordKeyMetadata({
     keyId: created.id,
     subject,
@@ -285,10 +322,16 @@ export async function handleAdminKeysList(
   // leak through, even if the authority ever returns one on list. The local
   // overlay contributes `tierAtIssuance` (null for keys issued outside this
   // API or before a process restart — Clerk stays the source of truth).
-  // A truncated walk is surfaced honestly via `warnings`, never presented
-  // as a complete listing.
+  // Phase 07 subject cross-check: the authority is asked by subject, but
+  // rows are re-verified locally so a misbehaving authority can never leak
+  // another subject's key metadata through this listing. Dropped rows are
+  // reported honestly via `warnings`, never presented as complete and never
+  // silently kept. A truncated walk is surfaced honestly via `warnings`,
+  // never presented as a complete listing.
+  const scoped = listed.keys.filter((key) => key.subject === subjectParam);
+  const dropped = listed.keys.length - scoped.length;
   return successResponse(
-    listed.keys.map((key) => ({
+    scoped.map((key) => ({
       keyId: key.id,
       name: key.name,
       subject: key.subject,
@@ -312,14 +355,27 @@ export async function handleAdminKeysList(
     {
       requestId,
       cacheControl: CACHE_CONTROL.noStore,
-      ...(listed.truncated
+      ...(listed.truncated || dropped > 0
         ? {
             warnings: [
-              {
-                code: "truncated",
-                message:
-                  "Key listing hit the 1000-key page cap; more keys may exist. Revoke stale keys or narrow the listing before relying on it being complete.",
-              },
+              ...(listed.truncated
+                ? [
+                    {
+                      code: "truncated",
+                      message:
+                        "Key listing hit the 1000-key page cap; more keys may exist. Revoke stale keys or narrow the listing before relying on it being complete.",
+                    },
+                  ]
+                : []),
+              ...(dropped > 0
+                ? [
+                    {
+                      code: "subject_mismatch",
+                      message:
+                        "The key authority returned keys for another subject; they were withheld from this listing. List that subject directly to inspect them.",
+                    },
+                  ]
+                : []),
             ],
           }
         : {}),

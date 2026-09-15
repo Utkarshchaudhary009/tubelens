@@ -370,7 +370,9 @@ describe("parseStoredTunnel", () => {
 describe("isT3PairingUrl", () => {
   test("accepts only full quick-tunnel /pair#token= URLs", () => {
     expect(
-      isT3PairingUrl("https://bright-fox-123.trycloudflare.com/pair#token=ABC234"),
+      isT3PairingUrl(
+        "https://bright-fox-123.trycloudflare.com/pair#token=ABC234",
+      ),
     ).toBe(true);
     for (const bad of [
       "https://bright-fox-123.trycloudflare.com", // bare tunnel root: manual token entry, not auto-pair
