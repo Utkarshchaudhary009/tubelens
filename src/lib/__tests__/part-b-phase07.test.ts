@@ -361,6 +361,14 @@ describe("requireScope (Phase 07)", () => {
     }
     // Non-privileged scopes still use membership alone.
     expect(requireScope(privilegedKey, "search:read")).toEqual({ ok: true });
+    // Inherited property names are not privileged actions: a granted scope
+    // colliding with one (e.g. "toString") passes by membership.
+    expect(
+      requireScope(
+        { ...apiKeyAuth, scopes: ["toString", "constructor"] },
+        "toString",
+      ),
+    ).toEqual({ ok: true });
   });
 
   test("non-admin session user denied", () => {

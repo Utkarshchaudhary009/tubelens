@@ -299,7 +299,11 @@ export function requireScope(
     return { ok: true };
   }
   if (ctx.authenticated && ctx.type === "api_key") {
-    const mapped = PRIVILEGED_SCOPE_ACTIONS[scope];
+    // Own-key check: inherited properties (e.g. "constructor") must not be
+    // treated as privileged actions.
+    const mapped = Object.hasOwn(PRIVILEGED_SCOPE_ACTIONS, scope)
+      ? PRIVILEGED_SCOPE_ACTIONS[scope]
+      : undefined;
     if (mapped !== undefined) {
       const decision = can({ action: mapped, ctx, resource });
       if (!decision.ok) {
