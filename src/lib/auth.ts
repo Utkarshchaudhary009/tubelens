@@ -32,6 +32,14 @@ export interface AuthContext {
    * Clerk metadata (Phase 04), never trust this alone.
    */
   tier?: Tier;
+  /**
+   * Claim-projected role (Phase 04): `clerkAuthProvider` normalizes the
+   * `metadata.role` session claim here via `getEffectiveRole`.
+   * Missing/invalid → `user` (least privilege, never self-escalating).
+   * Fast but ~60s-stale; admin write paths must re-fetch authoritative
+   * Clerk metadata (Phase 04), never trust this alone.
+   */
+  role?: string;
   /** Clerk key reference once Phase 05 lands; never a plaintext secret. */
   keyId?: string;
   /** Owning project/environment label once projects exist (Phase 07+). */
@@ -103,3 +111,23 @@ export function requireAuth(ctx: {
   }
   return unauthenticatedResponse(ctx.requestId);
 }
+
+export type {
+  RequireAdminDenial,
+  RequireAdminResult,
+  RequireAdminSuccess,
+  UserRole,
+} from "./admin-guard";
+// Phase 04 admin helpers live in `./admin-guard` (REST handlers first,
+// future MCP tools later per PLANS_AND_USAGE.md §16); re-exported here so
+// both surfaces share one module. `./admin-guard` imports this file
+// type-only, so the re-export below is not a runtime cycle.
+export {
+  forbiddenResponse,
+  getEffectiveRole,
+  mapAdminBodyError,
+  normalizeRole,
+  requireAdmin,
+  USER_ID_PATTERN,
+  USER_ROLES,
+} from "./admin-guard";
