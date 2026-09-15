@@ -262,20 +262,50 @@ export function requireOwnerOrAdmin(
 }
 
 /**
+ * Scope strings that name a privileged matrix action. A key carrying one of
+ * these strings is NOT thereby authorized for the action — `requireScope`
+ * consults `can()` for the mapped action first, and `can()` denies every
+ * `api_key` administration regardless of scope strings (keys can never
+ * admin). Without this map, an authority-minted scope like
+ * `users:mutate-role` would pass a pure membership check and contradict the
+ * matrix. Non-privileged scopes (e.g. `search:read`, `write:comments`) use
+ * membership alone.
+ */
+const PRIVILEGED_SCOPE_ACTIONS: Record<string, AuthorizeAction> = {
+  "keys:list": "keys:list",
+  "keys:issue": "keys:issue",
+  "keys:revoke": "keys:revoke",
+  "users:mutate-tier": "users:mutate-tier",
+  "users:mutate-role": "users:mutate-role",
+  "read:self": "read:self",
+};
+
+/**
  * Scope gate for `api_key` principals (future write scopes). Admin user
- * sessions are not scope-bound and always pass; an `api_key` principal
- * passes only when its projected `scopes` (see `auth.ts`) include the
- * required scope. Session users without admin rights and anonymous callers
- * are denied. Returns (never throws).
+ * sessions are not scope-bound and always pass. An `api_key` principal
+ * passes only when the matrix allows the mapped action (for scope strings
+ * naming a privileged action — `can()` denies all key administration, so a
+ * privileged scope string alone never authorizes) AND its projected
+ * `scopes` (see `auth.ts`) include the required scope. Session users
+ * without admin rights and anonymous callers are denied.
+ * Returns (never throws).
  */
 export function requireScope(
   ctx: AuthContext,
   scope: string,
+  resource?: AuthorizeResource,
 ): AuthorizeDecision {
   if (isAdminPrincipal(ctx)) {
     return { ok: true };
   }
   if (ctx.authenticated && ctx.type === "api_key") {
+    const mapped = PRIVILEGED_SCOPE_ACTIONS[scope];
+    if (mapped !== undefined) {
+      const decision = can({ action: mapped, ctx, resource });
+      if (!decision.ok) {
+        return decision;
+      }
+    }
     if (Array.isArray(ctx.scopes) && ctx.scopes.includes(scope)) {
       return { ok: true };
     }

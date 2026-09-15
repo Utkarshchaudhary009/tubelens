@@ -16,7 +16,11 @@
 
 import type { NextRequest, NextResponse } from "next/server";
 import { type AuthContext, type AuthProvider, getAuthProvider } from "./auth";
-import { can, toAuthorizationResponse } from "./authorize";
+import {
+  type AuthorizeAction,
+  can,
+  toAuthorizationResponse,
+} from "./authorize";
 import { ConfigError, getConfig } from "./config";
 import { errorResponse } from "./errors";
 import {
@@ -64,6 +68,14 @@ export interface PipelineOptions {
    * fails closed with a typed 500. Never use for data routes.
    */
   bypassRateLimit?: boolean;
+  /**
+   * Override the authorization-stage baseline action. Tests ONLY — lets a
+   * test force a real pipeline authorization denial (e.g.
+   * `users:mutate-role`) and assert its status/headers. Defaults to
+   * `read:public`, which allows every principal, so production behavior is
+   * byte-identical. Never set in production routes.
+   */
+  authorizationAction?: AuthorizeAction;
 }
 
 /** Bound for best-effort usage accounting: never delay the response. */
@@ -81,14 +93,15 @@ function pick<T>(override: T | undefined, current: T): T {
 }
 
 /**
- * Provider-wired RequestContext factory: authentication → authorization →
- * tier → entitlements → context. The authorization stage evaluates the
- * baseline public-read grant through the Phase 07 matrix (`read:public`
- * allows every principal, anonymous included, so public reads behave
- * exactly as before); per-route sensitive actions are enforced in handlers
- * via `can()` / `requireOwnerOrAdmin()` / `requireScope()`. May throw when
- * a provider throws; `withRequestContext` maps that to a typed 503 — call
- * it directly only where the caller handles failures.
+ * Provider-wired RequestContext factory: authentication → tier →
+ * entitlements → context. This factory does NOT enforce authorization — it
+ * never calls `can()`; the authorization stage lives in
+ * `withRequestContext` below, and per-route sensitive actions are enforced
+ * in handlers via `can()` / `requireOwnerOrAdmin()` / `requireScope()`.
+ * Callers of this factory must not assume the returned context is
+ * authorized for anything beyond identity/tier. May throw when a provider
+ * throws; `withRequestContext` maps that to a typed 503 — call it directly
+ * only where the caller handles failures.
  */
 export async function createRequestContext(
   req: NextRequest,
@@ -108,13 +121,16 @@ export async function createRequestContext(
  *  1. validates config (missing security config → typed 503),
  *  2. resolves identity (auth throw → typed 503) and policy tier +
  *     entitlements (policy throw → typed 503 with its own classification),
- *  3. runs the rate-limit check (deny → 429 with decision headers;
+ *  3. evaluates the authorization baseline through the matrix (deny →
+ *     typed 401/403 with rate-limit headers; the default `read:public`
+ *     baseline allows every principal),
+ *  4. runs the rate-limit check (deny → 429 with decision headers;
  *     liveness bypass honored only on /api/v1/health, else a typed 500),
- *  4. invokes the handler (throw → typed 500, never a stack leak),
- *  5. stamps X-Request-Id / X-RateLimit-* from the limiter decision,
+ *  5. invokes the handler (throw → typed 500, never a stack leak),
+ *  6. stamps X-Request-Id / X-RateLimit-* from the limiter decision,
  *     preserving the Part A wire contract (defaults match the old stubs),
- *  6. records a usage event via the (no-op) recorder (accounting stage),
- *  7. emits trace/log hooks via best-effort observability (never throws).
+ *  7. records a usage event via the (no-op) recorder (accounting stage),
+ *  8. emits trace/log hooks via best-effort observability (never throws).
  */
 export function withRequestContext(
   handler: RouteHandler,
@@ -216,17 +232,20 @@ export function withRequestContext(
       });
     }
 
-    // Authorization stage (Phase 07): the baseline public-read grant is
-    // evaluated through the matrix post-auth instead of a pass-through.
+    // Authorization stage (Phase 07): the baseline grant is evaluated
+    // through the matrix post-auth instead of a pass-through. The default
     // `read:public` allows every principal (anonymous included), so
     // public-route behavior stays byte/shape identical — the stage exists
     // so the decision function is exercised on every request and sensitive
-    // per-route actions reuse it in handlers. A denial here (impossible for
-    // the baseline today; future baselines may narrow it) fails closed
-    // with a typed 401/403, never a handler throw.
+    // per-route actions reuse it in handlers. `options.authorizationAction`
+    // (tests only) swaps the baseline to force a real denial. A denial
+    // fails closed with a typed 401/403, never a handler throw.
     const baselineDenied = toAuthorizationResponse(
       ctx.requestId,
-      can({ action: "read:public", ctx: ctx.auth }),
+      can({
+        action: options.authorizationAction ?? "read:public",
+        ctx: ctx.auth,
+      }),
     );
     if (baselineDenied) {
       span.end();

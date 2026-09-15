@@ -22,7 +22,7 @@ import {
   recordKeyMetadata,
   resetApiKeysClient,
 } from "../api-keys";
-import { clearAuditEvents } from "../audit";
+import { clearAuditEvents, getAuditEvents } from "../audit";
 import { type AuthContext, requireAdmin } from "../auth";
 import {
   can,
@@ -341,6 +341,28 @@ describe("requireScope (Phase 07)", () => {
     ).toMatchObject({ ok: false, status: 403 });
   });
 
+  test("privileged scope strings never authorize api_key administration", () => {
+    const privilegedKey: AuthContext = {
+      ...apiKeyAuth,
+      scopes: ["users:mutate-role", "keys:list", "search:read"],
+    };
+    for (const scope of [
+      "users:mutate-role",
+      "users:mutate-tier",
+      "keys:issue",
+      "keys:revoke",
+      "keys:list",
+    ]) {
+      expect(requireScope(privilegedKey, scope)).toMatchObject({
+        ok: false,
+        code: "forbidden",
+        status: 403,
+      });
+    }
+    // Non-privileged scopes still use membership alone.
+    expect(requireScope(privilegedKey, "search:read")).toEqual({ ok: true });
+  });
+
   test("non-admin session user denied", () => {
     expect(requireScope(userA, "search:read")).toMatchObject({
       ok: false,
@@ -580,11 +602,20 @@ describe("scoped key lookups (Phase 07)", () => {
       revoked: false,
       lastUsedAt: null,
     });
-    const divergent = mockKeys(
+    const divergentBase = mockKeys(
       users,
       [{ id: "key_user_bbb2", subject: "user_bbb2", scopes: [] }],
       { revokeSubject: "user_aaa1" },
     );
+    // Wrap the authority revoke to prove the 409 below does not skip it.
+    let authorityRevokes = 0;
+    const divergent: ApiKeysClient = {
+      ...divergentBase,
+      async revokeKey(params, opts) {
+        authorityRevokes += 1;
+        return divergentBase.revokeKey(params, opts);
+      },
+    };
     const conflict = await handleAdminKeysRevoke(
       "req-r2",
       adminAuth,
@@ -594,6 +625,19 @@ describe("scoped key lookups (Phase 07)", () => {
     );
     expect(conflict.status).toBe(409);
     expect((await errorBody(conflict)).code).toBe("key_owner_mismatch");
+    // The 409 reports the divergence, but the authority revoke was applied
+    // and bookkeeping is intact: exactly one authority call plus an
+    // `api_key.revoked` audit row carrying the authority's subject.
+    expect(authorityRevokes).toBe(1);
+    expect(getKeyMetadata("key_user_bbb2")).toMatchObject({ revoked: true });
+    const revokedRows = getAuditEvents().flatMap((event) =>
+      event.action === "api_key.revoked" ? [event] : [],
+    );
+    expect(
+      revokedRows.some(
+        (row) => row.keyId === "key_user_bbb2" && row.target === "user_aaa1",
+      ),
+    ).toBe(true);
   });
 
   test("list cross-check withholds foreign-subject rows with a warning", async () => {
@@ -666,5 +710,44 @@ describe("pipeline authorization stage (Phase 07)", () => {
     expect(body.page).toEqual({ next: null });
     expect(body.meta.requestId).toBe(requestId);
     expect(body.warnings).toEqual([]);
+  });
+
+  test("forced pipeline authorization denial carries X-Request-Id + X-RateLimit-*", async () => {
+    // The `authorizationAction` override (tests only) swaps the baseline so
+    // the pipeline takes its real early-return denial branch: the handler
+    // never runs, yet the denial still carries the full header contract.
+    let handlerRan = false;
+    const handler = withRequestContext(
+      (_req, ctx) => {
+        handlerRan = true;
+        return successResponse(
+          { hello: "world" },
+          { requestId: ctx.requestId },
+        );
+      },
+      {
+        auth: {
+          resolve(): AuthContext {
+            return { ...anonAuth };
+          },
+        },
+      },
+      "probe",
+      { authorizationAction: "users:mutate-role" },
+    );
+    const sent = new Headers();
+    sent.set("x-request-id", "probe-deny-1");
+    const res = await handler(
+      new NextRequest("http://x/api/v1/search?q=cats", { headers: sent }),
+    );
+    expect(handlerRan).toBe(false);
+    expect(res.status).toBe(401);
+    expect((await errorBody(res)).code).toBe("unauthenticated");
+    expect(res.headers.get("X-Request-Id")).toBe("probe-deny-1");
+    expect(res.headers.get("X-RateLimit-Limit")).toBe("100");
+    expect(res.headers.get("X-RateLimit-Remaining")).toBe("99");
+    const reset = res.headers.get("X-RateLimit-Reset");
+    expect(reset).not.toBeNull();
+    expect(Number(reset)).toBeGreaterThan(0);
   });
 });
