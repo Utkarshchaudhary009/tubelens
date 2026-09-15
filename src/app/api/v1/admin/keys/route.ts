@@ -191,6 +191,39 @@ export async function handleAdminKeysCreate(
       status: 503,
     });
   }
+  // Phase 07 subject verification: the authority must bind the created key
+  // to the REQUESTED subject. On divergence the secret would authenticate
+  // as another subject while metadata/audit/response name this one, so the
+  // minted key is revoked best-effort (same orphan-cleanup pattern as
+  // above) and the request fails closed with 409 `key_owner_mismatch` (the
+  // revoke route's established code for authority/overlay ownership
+  // divergence). The secret is never exposed on any failure path below.
+  if (created.subject !== subject) {
+    let cleanupFailed = false;
+    try {
+      await apiKeys.revokeKey(
+        { apiKeyId: created.id, revocationReason: "subject-mismatch cleanup" },
+        { signal: AbortSignal.timeout(8000) },
+      );
+      markKeyRevoked(created.id, "subject-mismatch cleanup");
+    } catch {
+      cleanupFailed = true;
+    }
+    if (cleanupFailed) {
+      return errorResponse(requestId, {
+        code: "key_authority_error",
+        message: "Key authority bound the key to another subject.",
+        hint: "Issuance outcome is unknown — the divergent key may still exist. List the subject's keys to reconcile before retrying; report the X-Request-Id if the failure persists.",
+        status: 503,
+      });
+    }
+    return errorResponse(requestId, {
+      code: "key_owner_mismatch",
+      message: "Key authority bound the key to another subject.",
+      hint: "The divergent key was revoked — list the subject's keys to confirm, then retry; report the X-Request-Id if the failure persists.",
+      status: 409,
+    });
+  }
   const issuedAt = new Date().toISOString();
   // Phase 07 owner binding: the issuance record is bound to the CALLER
   // (`createdBy === caller.userId`, never client-supplied) alongside the

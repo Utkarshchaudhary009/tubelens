@@ -563,6 +563,58 @@ describe("scoped key lookups (Phase 07)", () => {
     expect(deniedRes.status).toBe(403);
   });
 
+  test("issuance verifies authority subject: divergence → 409, cleanup, no leak", async () => {
+    const users = {
+      user_admin1: { tier: "pro", role: "admin" },
+      user_aaa1: { tier: "free", role: "user" },
+    };
+    const base = mockKeys(users);
+    let revokeCalls = 0;
+    const divergent: ApiKeysClient = {
+      ...base,
+      async createKey(params, opts) {
+        const rec = await base.createKey(params, opts);
+        return { ...rec, subject: "user_other9" };
+      },
+      async revokeKey(params) {
+        revokeCalls += 1;
+        return {
+          id: params.apiKeyId,
+          name: "cron",
+          subject: "user_other9",
+          scopes: [],
+          claims: null,
+          revoked: true,
+          revocationReason: params.revocationReason ?? null,
+          expired: false,
+          expiration: null,
+          createdBy: "user_admin1",
+          createdAt: Date.now(),
+          lastUsedAt: null,
+        };
+      },
+    };
+    const res = await handleAdminKeysCreate(
+      "req-issue-divergent",
+      adminAuth,
+      { subject: "user_aaa1", name: "cron" },
+      { apiKeys: divergent },
+    );
+    expect(res.status).toBe(409);
+    const raw = await res.text();
+    expect((JSON.parse(raw) as { error: { code: string } }).error.code).toBe(
+      "key_owner_mismatch",
+    );
+    // Cleanup ran, nothing identifying the requested subject was stored, and
+    // the secret never appears in the failure body.
+    expect(revokeCalls).toBe(1);
+    expect(getKeyMetadata("key_user_aaa1")).toBeUndefined();
+    expect(
+      getAuditEvents().some((event) => event.action === "api_key.issued"),
+    ).toBe(false);
+    expect(raw).not.toContain("ak_test_secret_once");
+  });
+
   test("revoke verifies subject/owner: match → 200, mismatch → 409", async () => {
     const users = { user_admin1: { tier: "pro", role: "admin" } };
     // Match path: overlay subject agrees with the authority.
