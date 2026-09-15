@@ -449,7 +449,7 @@ Path validation: `:userId` must match `/^user_[A-Za-z0-9]+$/`, else 400 `invalid
 
 ## Phase 05 — Clerk API keys for machine auth
 
-**Status:** `[ ]` not started.
+**Status:** `[x]` done — shipped via PR #24 (merged 2026-09-15): admin-only `POST /api/v1/admin/keys` + `GET /api/v1/admin/keys?subject=` + `POST /api/v1/admin/keys/:keyId/revoke` with `ak_*` Bearer fallback in `clerkAuthProvider` (fail-closed revoked/expired/deleted-subject guards, API-key principals can never pass `requireAdmin`), authoritative `tierAtIssuance` binding with self-grant rejection, secret-once issuance, paged metadata-only listing (abort-aware walk, `truncated` warning past the 1000-key cap), per-mutation audit rows, 742 unit tests + e2e PASS on live upstream.
 
 **Goal:** non-interactive machine authentication for scripts, cron, and
 server-to-server callers — coexisting with interactive MCP user-OAuth
