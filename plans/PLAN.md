@@ -498,7 +498,7 @@ principal model.
 
 ## Phase 07 — Authorization and resource ownership
 
-**Status:** `[~]` in progress — on branch `part-b/phase-07-authorization`: explicit matrix (`src/lib/authorize.ts`), pipeline authorization stage, key-route scoped lookups, ownership tests.
+**Status:** `[x]` done — shipped via PR #25 (merged 2026-09-15): explicit deny-by-default matrix (`src/lib/authorize.ts` — anonymous/user/api_key/support/admin + `requireOwnerOrAdmin`/`requireScope`), pipeline authorization stage, subject-scoped key list/revoke (foreign rows withheld, divergence → 409 `key_owner_mismatch`), authority-subject verification on issuance, key-scope projection, 795 unit tests + e2e PASS on live upstream.
 
 **Build:** Create an explicit authorization matrix for anonymous users, authenticated users, API-key principals, projects, organizations/roles, admins, and future write scopes. Enforce authorization at the resource/service boundary, not only in UI code. Every resource lookup must be scoped to the caller's permitted owner/project/org.
 
