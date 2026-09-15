@@ -16,6 +16,7 @@
 
 import type { NextRequest, NextResponse } from "next/server";
 import { type AuthContext, type AuthProvider, getAuthProvider } from "./auth";
+import { can, toAuthorizationResponse } from "./authorize";
 import { ConfigError, getConfig } from "./config";
 import { errorResponse } from "./errors";
 import {
@@ -80,11 +81,14 @@ function pick<T>(override: T | undefined, current: T): T {
 }
 
 /**
- * Provider-wired RequestContext factory: authentication → tier →
- * entitlements → context. Authorization/quota stages are pass-through in
- * Phase 01 (anonymous callers are authorized for public reads by default).
- * May throw when a provider throws; `withRequestContext` maps that to a
- * typed 503 — call it directly only where the caller handles failures.
+ * Provider-wired RequestContext factory: authentication → authorization →
+ * tier → entitlements → context. The authorization stage evaluates the
+ * baseline public-read grant through the Phase 07 matrix (`read:public`
+ * allows every principal, anonymous included, so public reads behave
+ * exactly as before); per-route sensitive actions are enforced in handlers
+ * via `can()` / `requireOwnerOrAdmin()` / `requireScope()`. May throw when
+ * a provider throws; `withRequestContext` maps that to a typed 503 — call
+ * it directly only where the caller handles failures.
  */
 export async function createRequestContext(
   req: NextRequest,
@@ -210,6 +214,28 @@ export function withRequestContext(
         hint: "Retry shortly; the request was rejected rather than served without an entitlement decision.",
         status: 503,
       });
+    }
+
+    // Authorization stage (Phase 07): the baseline public-read grant is
+    // evaluated through the matrix post-auth instead of a pass-through.
+    // `read:public` allows every principal (anonymous included), so
+    // public-route behavior stays byte/shape identical — the stage exists
+    // so the decision function is exercised on every request and sensitive
+    // per-route actions reuse it in handlers. A denial here (impossible for
+    // the baseline today; future baselines may narrow it) fails closed
+    // with a typed 401/403, never a handler throw.
+    const baselineDenied = toAuthorizationResponse(
+      ctx.requestId,
+      can({ action: "read:public", ctx: ctx.auth }),
+    );
+    if (baselineDenied) {
+      span.end();
+      // Contract: EVERY response carries X-RateLimit-* — stamp the stub
+      // allow-all decision here, exactly like the handler-throw path below
+      // (errorResponse already sets stub values via baseHeaders; this keeps
+      // the pipeline the single stamper so values never drift).
+      stampRateLimitHeaders(baselineDenied, ctx, defaultRateLimitDecision());
+      return baselineDenied;
     }
 
     // Rate-limit stage (Phase 01: allow-all default). Liveness bypasses

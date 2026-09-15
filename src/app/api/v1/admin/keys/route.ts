@@ -192,6 +192,10 @@ export async function handleAdminKeysCreate(
     });
   }
   const issuedAt = new Date().toISOString();
+  // Phase 07 owner binding: the issuance record is bound to the CALLER
+  // (`createdBy === caller.userId`, never client-supplied) alongside the
+  // subject's authoritative `tierAtIssuance` — the tier-rank self-grant
+  // check above stays the mint-time guard.
   recordKeyMetadata({
     keyId: created.id,
     subject,
@@ -285,10 +289,16 @@ export async function handleAdminKeysList(
   // leak through, even if the authority ever returns one on list. The local
   // overlay contributes `tierAtIssuance` (null for keys issued outside this
   // API or before a process restart — Clerk stays the source of truth).
-  // A truncated walk is surfaced honestly via `warnings`, never presented
-  // as a complete listing.
+  // Phase 07 subject cross-check: the authority is asked by subject, but
+  // rows are re-verified locally so a misbehaving authority can never leak
+  // another subject's key metadata through this listing. Dropped rows are
+  // reported honestly via `warnings`, never presented as complete and never
+  // silently kept. A truncated walk is surfaced honestly via `warnings`,
+  // never presented as a complete listing.
+  const scoped = listed.keys.filter((key) => key.subject === subjectParam);
+  const dropped = listed.keys.length - scoped.length;
   return successResponse(
-    listed.keys.map((key) => ({
+    scoped.map((key) => ({
       keyId: key.id,
       name: key.name,
       subject: key.subject,
@@ -312,14 +322,27 @@ export async function handleAdminKeysList(
     {
       requestId,
       cacheControl: CACHE_CONTROL.noStore,
-      ...(listed.truncated
+      ...(listed.truncated || dropped > 0
         ? {
             warnings: [
-              {
-                code: "truncated",
-                message:
-                  "Key listing hit the 1000-key page cap; more keys may exist. Revoke stale keys or narrow the listing before relying on it being complete.",
-              },
+              ...(listed.truncated
+                ? [
+                    {
+                      code: "truncated",
+                      message:
+                        "Key listing hit the 1000-key page cap; more keys may exist. Revoke stale keys or narrow the listing before relying on it being complete.",
+                    },
+                  ]
+                : []),
+              ...(dropped > 0
+                ? [
+                    {
+                      code: "subject_mismatch",
+                      message:
+                        "The key authority returned keys for another subject; they were withheld from this listing. List that subject directly to inspect them.",
+                    },
+                  ]
+                : []),
             ],
           }
         : {}),

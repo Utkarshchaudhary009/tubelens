@@ -2,6 +2,7 @@ import type { NextRequest, NextResponse } from "next/server";
 import {
   type ApiKeysClient,
   getApiKeysClient,
+  getKeyMetadata,
   KEY_ID_PATTERN,
   mapApiKeyBodyError,
   markKeyRevoked,
@@ -103,6 +104,12 @@ export async function handleAdminKeysRevoke(
   if (!callerCheck.ok) {
     return callerCheck.response;
   }
+  // Phase 07 ownership pre-check: fetch the local issuance record FIRST so
+  // the authority result below can be verified against the recorded
+  // subject/owner. Absent overlay (Dashboard-issued keys, or a restarted
+  // process) is not an error — the authority stays the source of truth and
+  // the check is skipped.
+  const known = getKeyMetadata(keyId);
   let revoked: Awaited<ReturnType<ApiKeysClient["revokeKey"]>>;
   try {
     revoked = await apiKeys.revokeKey(
@@ -137,6 +144,19 @@ export async function handleAdminKeysRevoke(
       : {}),
     requestId,
   });
+  // Phase 07 subject/owner verification: the authority result must agree
+  // with the issuance record when one exists. Bookkeeping above is already
+  // consistent (the authority revoke DID apply), but a divergent subject
+  // means the overlay and the authority disagree about who owns this key —
+  // report it as a 409 conflict, never as a clean success.
+  if (known && revoked.subject !== known.subject) {
+    return errorResponse(requestId, {
+      code: "key_owner_mismatch",
+      message: "API key ownership record disagrees with the key authority.",
+      hint: "The authority revoke was applied, but the key's subject does not match the issuance record; list the subject's keys to reconcile and report the X-Request-Id.",
+      status: 409,
+    });
+  }
   return successResponse(
     {
       keyId,
