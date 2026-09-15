@@ -146,8 +146,11 @@ export async function handleRolePatch(
       return clerkErrorResponse(requestId, err);
     }
     // The SDK accepts no AbortSignal, so a timed-out write may still have
-    // landed: one bounded re-fetch decides between "confirmed applied"
-    // (audit it, 504 with reconciled_after_timeout) and "unknown" (504).
+    // landed: one bounded re-fetch decides between "reconciled" (the value is
+    // now as intended — audit it as operation-level reconciliation, 504 with
+    // reconciled_after_timeout) and "unknown" (504). Final-value equality
+    // cannot prove THIS request caused the value, so the row never claims a
+    // confirmed change.
     const latest = await refetchAfterTimeout(clerk, targetUserId, {
       signal: AbortSignal.timeout(8000),
     });
@@ -155,7 +158,7 @@ export async function handleRolePatch(
       return clerkErrorResponse(requestId, err);
     }
     recordAuditEvent({
-      action: "user.role.changed",
+      action: "user.role.change_reconciled",
       actor: caller.userId,
       target: targetUserId,
       targetUserId,

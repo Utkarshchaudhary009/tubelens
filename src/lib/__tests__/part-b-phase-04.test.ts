@@ -10,14 +10,18 @@ import {
   tierBodySchema,
   PATCH as tierPATCH,
 } from "../../app/api/v1/admin/users/[userId]/tier/route";
-import { clearAuditEvents, getAuditEvents } from "../audit";
+import { clearAuditEvents, getAuditEvents, recordAuditEvent } from "../audit";
 import {
   type AuthContext,
   getEffectiveRole,
   normalizeRole,
   requireAdmin,
 } from "../auth";
-import { type ClerkAdminClient, resetClerkAdminClient } from "../clerk-admin";
+import {
+  type ClerkAdminClient,
+  resetClerkAdminClient,
+  withBudget,
+} from "../clerk-admin";
 import { contextFromClerkSession } from "../clerk-auth";
 import { getEffectiveTier } from "../product";
 
@@ -922,8 +926,10 @@ describe("authoritative write path + stale claims (Phase 04)", () => {
     expect(body.warnings).toMatchObject([{ code: "reconciled_after_timeout" }]);
     const rows = getAuditEvents();
     expect(rows).toHaveLength(1);
+    // Attribution: the re-fetch cannot prove THIS request caused the value,
+    // so the row carries the reconciled action, never a confirmed change.
     expect(rows[0]).toMatchObject({
-      action: "user.tier.changed",
+      action: "user.tier.change_reconciled",
       oldTier: "free",
       newTier: "pro",
       requestId: "reconciled-1",
@@ -952,5 +958,59 @@ describe("authoritative write path + stale claims (Phase 04)", () => {
     expect(body.error.code).toBe("upstream_timeout");
     expect(body.error.hint).toMatch(/Outcome unknown/);
     expect(getAuditEvents()).toHaveLength(0);
+  });
+});
+
+describe("audit snapshot isolation + fail-fast budget (Phase 04)", () => {
+  test("getAuditEvents rows are clones — callers cannot mutate the store", () => {
+    recordAuditEvent({
+      action: "user.tier.changed",
+      actor: "user_admin1",
+      target: "user_snap1",
+      targetUserId: "user_snap1",
+      oldTier: "free",
+      newTier: "pro",
+      requestId: "snap-1",
+    });
+    const snapshot = getAuditEvents();
+    expect(snapshot).toHaveLength(1);
+    snapshot[0].actor = "user_tampered";
+    snapshot.push(snapshot[0]);
+    const reread = getAuditEvents();
+    expect(reread).toHaveLength(1);
+    expect(reread[0].actor).toBe("user_admin1");
+  });
+
+  test("withBudget fails bounded when acquisition never resolves", async () => {
+    // A stalled lazy-load/SDK init counts against the same budget as the
+    // call itself: the race rejects on timeout instead of hanging.
+    const start = Date.now();
+    const err = await withBudget(
+      () => new Promise<never>(() => {}),
+      AbortSignal.timeout(50),
+    ).then(
+      () => "resolved",
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(DOMException);
+    expect((err as DOMException).name).toBe("TimeoutError");
+    expect(Date.now() - start).toBeLessThan(5000);
+  });
+
+  test("withBudget rejects before starting when the signal is already dead", async () => {
+    let started = false;
+    const controller = new AbortController();
+    controller.abort(
+      new DOMException("The operation timed out.", "TimeoutError"),
+    );
+    const err = await withBudget(() => {
+      started = true;
+      return Promise.resolve(1);
+    }, controller.signal).then(
+      () => "resolved",
+      (e: unknown) => e,
+    );
+    expect(started).toBe(false);
+    expect((err as DOMException).name).toBe("TimeoutError");
   });
 });

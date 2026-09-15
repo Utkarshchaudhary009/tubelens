@@ -11,7 +11,16 @@
 import type { UserRole } from "./admin-guard";
 import type { Tier } from "./product";
 
-export type AuditAction = "user.tier.changed" | "user.role.changed";
+export type AuditAction =
+  | "user.tier.changed"
+  | "user.role.changed"
+  // Reconciliation rows (timeout write later observed at the intended value):
+  // final-value equality cannot prove THIS request caused the value (a
+  // concurrent update could have produced it, or our write could land after
+  // the re-fetch), so these carry a distinct action conveying operation-level
+  // reconciliation rather than confirmed causation.
+  | "user.tier.change_reconciled"
+  | "user.role.change_reconciled";
 
 interface AuditBase {
   id: string;
@@ -41,13 +50,31 @@ export interface RoleAuditEvent extends AuditBase {
   newRole: UserRole;
 }
 
-export type AuditEvent = TierAuditEvent | RoleAuditEvent;
+export interface TierReconciledEvent extends AuditBase {
+  action: "user.tier.change_reconciled";
+  oldTier: Tier;
+  newTier: Tier;
+}
+
+export interface RoleReconciledEvent extends AuditBase {
+  action: "user.role.change_reconciled";
+  oldRole: UserRole;
+  newRole: UserRole;
+}
+
+export type AuditEvent =
+  | TierAuditEvent
+  | RoleAuditEvent
+  | TierReconciledEvent
+  | RoleReconciledEvent;
 
 // Note: `Omit` over a union collapses to common keys, so the input stays an
 // explicit union — narrowing on `action` keeps old/new tier/role typed.
 export type AuditInput =
   | (Omit<TierAuditEvent, "id" | "ts"> & { ts?: string })
-  | (Omit<RoleAuditEvent, "id" | "ts"> & { ts?: string });
+  | (Omit<RoleAuditEvent, "id" | "ts"> & { ts?: string })
+  | (Omit<TierReconciledEvent, "id" | "ts"> & { ts?: string })
+  | (Omit<RoleReconciledEvent, "id" | "ts"> & { ts?: string });
 
 /** Cap for the process-local buffer: warm servers must not grow it forever. */
 const MAX_AUDIT_EVENTS = 1000;
@@ -71,7 +98,8 @@ export function recordAuditEvent(input: AuditInput): AuditEvent {
     ...(input.reason !== undefined ? { reason: input.reason } : {}),
   };
   const event: AuditEvent =
-    input.action === "user.tier.changed"
+    input.action === "user.tier.changed" ||
+    input.action === "user.tier.change_reconciled"
       ? {
           ...base,
           action: input.action,
@@ -95,9 +123,12 @@ export function recordAuditEvent(input: AuditInput): AuditEvent {
   return event;
 }
 
-/** Snapshot of rows recorded so far (copy — callers cannot mutate the store). */
+/**
+ * Snapshot of rows recorded so far. Each row is shallow-cloned — callers can
+ * neither mutate the store array nor the stored row objects.
+ */
 export function getAuditEvents(): AuditEvent[] {
-  return [...events];
+  return events.map((event) => ({ ...event }));
 }
 
 /** Clear the store (primarily for tests). */

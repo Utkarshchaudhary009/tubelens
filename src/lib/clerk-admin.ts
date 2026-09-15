@@ -45,14 +45,20 @@ export interface ClerkAdminClient {
 }
 
 /**
- * Race a Clerk SDK promise against the caller's fail-fast signal. The SDK
- * takes no signal option, so the race delivers the 8s budget: on abort the
- * caller sees the signal's reason (a `TimeoutError` DOMException for
- * `AbortSignal.timeout`), on settle the abort listener is removed.
+ * Race a Clerk backend task against the caller's fail-fast signal. Takes a
+ * thunk (not a promise) so the whole `import → client → call` chain starts
+ * INSIDE the race: a stalled lazy-load or SDK init counts against the same
+ * 8s budget instead of escaping it. An already-aborted signal rejects before
+ * the task even starts (never begin a mutation with a dead budget). On abort
+ * the caller sees the signal's reason (a `TimeoutError` DOMException for
+ * `AbortSignal.timeout`); on settle the abort listener is removed.
  */
-function withSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+export function withBudget<T>(
+  start: () => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
   if (!signal) {
-    return promise;
+    return start();
   }
   if (signal.aborted) {
     return Promise.reject(
@@ -70,7 +76,7 @@ function withSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
       );
     };
     signal.addEventListener("abort", onAbort, { once: true });
-    promise.then(
+    start().then(
       (value) => {
         signal.removeEventListener("abort", onAbort);
         resolve(value);
@@ -90,23 +96,21 @@ function withSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
  */
 export const liveClerkAdminClient: ClerkAdminClient = {
   async getUser(userId, opts) {
-    const { clerkClient } = await import("@clerk/nextjs/server");
-    const client = await clerkClient();
-    return withSignal(
-      client.users.getUser(userId) as Promise<ClerkUserRecord>,
-      opts?.signal,
-    );
+    return withBudget(async () => {
+      const { clerkClient } = await import("@clerk/nextjs/server");
+      const client = await clerkClient();
+      return (await client.users.getUser(userId)) as ClerkUserRecord;
+    }, opts?.signal);
   },
   async updateUserMetadata(userId, params, opts) {
-    const { clerkClient } = await import("@clerk/nextjs/server");
-    const client = await clerkClient();
-    return withSignal(
-      client.users.updateUserMetadata(
+    return withBudget(async () => {
+      const { clerkClient } = await import("@clerk/nextjs/server");
+      const client = await clerkClient();
+      return (await client.users.updateUserMetadata(
         userId,
         params,
-      ) as Promise<ClerkUserRecord>,
-      opts?.signal,
-    );
+      )) as ClerkUserRecord;
+    }, opts?.signal);
   },
 };
 
@@ -259,8 +263,8 @@ export async function requireAuthoritativeAdmin(
  * ONE bounded best-effort re-fetch after a timed-out write. The Clerk SDK
  * accepts no AbortSignal, so a timed-out `updateUserMetadata` may still have
  * landed server-side — the handler compares this record against the intended
- * value to decide between "confirmed applied" (audit it) and "unknown".
- * Returns undefined when the re-fetch itself fails.
+ * value to decide between "reconciled" (audit it with a `_reconciled`
+ * action) and "unknown". Returns undefined when the re-fetch itself fails.
  */
 export async function refetchAfterTimeout(
   clerk: ClerkAdminClient,
