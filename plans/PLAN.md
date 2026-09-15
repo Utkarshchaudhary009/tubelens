@@ -406,7 +406,7 @@ Do not expose Clerk server secrets to client code. Protected API routes must ret
 
 ## Phase 03 — Clerk tier metadata and session projection
 
-**Status:** `[ ]` not started.
+**Status:** `[x]` done — shipped via PR #22 (merged 2026-09-15): `getEffectiveTier()` claim projection (`tubelens.tier` → ranked tier, invalid/`team`/missing → `free`, never throws) wired through `clerkAuthProvider`/`contextFromClerkSession` into the request pipeline, typed via `CustomJwtSessionClaims`, with 658 unit tests + e2e PASS on live upstream. Note: live authenticated-claim path covered by stub-provider unit tests (no Clerk test credentials in CI); authoritative write-path re-fetch is Phase 04 scope.
 
 **Build:** Implement the tier model from [`PLANS_AND_USAGE.md`](./PLANS_AND_USAGE.md): all new users default to `free`; ranked tiers are `free < plus < pro < enterprise` (`team` is an org concept, never a tier). Store authoritative tier state in Clerk user `publicMetadata`, and project only a small `tubelens.tier` claim into the Clerk session token. Treat the session claim as a fast projection, not the ultimate authority, because session claims can be temporarily stale between refreshes.
 
