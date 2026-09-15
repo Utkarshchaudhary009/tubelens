@@ -27,6 +27,18 @@ export function tunnelBlobPath(slot: TunnelSlot): string {
 const TUNNEL_URL_RE =
   /^https:\/\/[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.trycloudflare\.com(?::\d{1,5})?(?:\/.*)?$/;
 
+/** Full T3 pairing URLs: a quick-tunnel host plus the `/pair#token=`
+ * fragment (the fragment is the auto-pair credential — the bare tunnel root
+ * lands on manual token entry instead). /dev/t3 only redirects to URLs
+ * matching this; anything else falls back to the holding page. */
+const T3_PAIRING_URL_RE =
+  /^https:\/\/[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.trycloudflare\.com(?::\d{1,5})?\/pair#token=\S+$/;
+
+/** True only for full `https://*.trycloudflare.com/pair#token=…` URLs. */
+export function isT3PairingUrl(url: unknown): url is string {
+  return typeof url === "string" && T3_PAIRING_URL_RE.test(url);
+}
+
 export const tunnelUrlBodySchema = z.object({
   name: tunnelSlotSchema,
   url: z
@@ -119,8 +131,10 @@ export async function handleTunnelGet(req: NextRequest, deps: TunnelDeps) {
 }
 
 /** Validate the required `name` slot: missing/blank → 400 missing_name,
- * unknown value → 400 invalid_name. There is intentionally no default slot. */
-function resolveSlot(
+ * unknown value → 400 invalid_name. There is intentionally no default slot.
+ * Exported so route handlers can validate BEFORE any store/token early-outs
+ * (bare GET/?name=nope must be 400, never a 200 null). */
+export function resolveSlot(
   raw: unknown,
   hint = "Pass ?name=t3 or ?name=transcript — e.g. GET /api/v1/tunnel-url?name=t3.",
 ):

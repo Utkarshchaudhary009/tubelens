@@ -1,9 +1,11 @@
 import type { NextRequest } from "next/server";
 import { CACHE_CONTROL, getRequestId, successResponse } from "@/lib/envelope";
+import { errorResponse } from "@/lib/errors";
 import {
   handleTunnelGet,
   handleTunnelWrite,
   parseStoredTunnel,
+  resolveSlot,
   type TunnelDeps,
   type TunnelRecord,
   type TunnelSlot,
@@ -56,10 +58,15 @@ function deps(): TunnelDeps {
 
 // Public read: { data: { url, runId, updatedAt } } or { data: null } when no
 // run has published that slot yet. `?name=` is required (no default slot):
-// bare GET is a 400 missing_name. Private, no-store — pointers change runs.
+// bare GET is a 400 missing_name — validated BEFORE the blob-unconfigured
+// early-out so an invalid slot never returns 200 null. Private, no-store.
 export async function GET(req: NextRequest) {
+  const requestId = getRequestId(req);
+  const slot = resolveSlot(req.nextUrl.searchParams.get("name"));
+  if (!slot.ok) {
+    return errorResponse(requestId, slot.error);
+  }
   if (!process.env.BLOB_READ_WRITE_TOKEN) {
-    const requestId = getRequestId(req);
     return successResponse(null, {
       requestId,
       cacheControl: CACHE_CONTROL.noStore,

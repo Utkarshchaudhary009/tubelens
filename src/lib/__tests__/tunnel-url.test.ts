@@ -4,7 +4,9 @@ import {
   handleTunnelGet,
   handleTunnelWrite,
   isAuthorized,
+  isT3PairingUrl,
   parseStoredTunnel,
+  resolveSlot,
   type TunnelDeps,
   type TunnelRecord,
   type TunnelSlot,
@@ -362,5 +364,47 @@ describe("parseStoredTunnel", () => {
     expect(parseStoredTunnel(null)).toBeNull();
     expect(parseStoredTunnel({ url: "https://example.com" })).toBeNull();
     expect(parseStoredTunnel({})).toBeNull();
+  });
+});
+
+describe("isT3PairingUrl", () => {
+  test("accepts only full quick-tunnel /pair#token= URLs", () => {
+    expect(
+      isT3PairingUrl("https://bright-fox-123.trycloudflare.com/pair#token=ABC234"),
+    ).toBe(true);
+    for (const bad of [
+      "https://bright-fox-123.trycloudflare.com", // bare tunnel root: manual token entry, not auto-pair
+      "https://bright-fox-123.trycloudflare.com/pair", // missing fragment
+      "https://bright-fox-123.trycloudflare.com/pair#token=", // empty token
+      "https://example.com/pair#token=ABC234", // wrong host
+      "http://bright-fox-123.trycloudflare.com/pair#token=ABC234", // not https
+      "",
+      null,
+      undefined,
+      42,
+    ]) {
+      expect(isT3PairingUrl(bad)).toBe(false);
+    }
+  });
+});
+
+describe("resolveSlot", () => {
+  test("maps t3/transcript, rejects missing/unknown (no default)", () => {
+    expect(resolveSlot("t3")).toEqual({ ok: true, slot: "t3" });
+    expect(resolveSlot("transcript")).toEqual({ ok: true, slot: "transcript" });
+    for (const raw of [null, undefined, "", "   "]) {
+      const res = resolveSlot(raw);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.error.code).toBe("missing_name");
+        expect(res.error.status).toBe(400);
+      }
+    }
+    const bad = resolveSlot("nope");
+    expect(bad.ok).toBe(false);
+    if (!bad.ok) {
+      expect(bad.error.code).toBe("invalid_name");
+      expect(bad.error.status).toBe(400);
+    }
   });
 });

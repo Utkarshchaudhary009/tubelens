@@ -2,7 +2,8 @@
 #
 # Trigger: Actions tab -> remote-t3 -> Run workflow. The job runs
 # `npx t3 serve`, exposes :3773 via cloudflared, publishes the pairing URL,
-# then idles ~290 min so the session stays usable (job budget 300 min).
+# then idles ~276 min with a ~4 min pairing re-mint loop so the session stays
+# usable (job budget 300 min).
 #
 # CRITICAL OTP catch (live probe): `npx t3 serve` prints
 #   Connection string: http://127.0.0.1:3773
@@ -16,16 +17,40 @@
 # stored URL verbatim; redirecting to the bare tunnel root would land on
 # manual token entry instead.
 #
-# Secrets:
+# Secrets (repo Settings -> Secrets and variables -> Actions):
 #   TUNNEL_UPDATE_TOKEN — bearer for POST /api/v1/tunnel-url (best-effort;
 #     the t3-url.txt artifact is the fallback). Always $TUNNEL_UPDATE_TOKEN.
-#   PAT — repo PAT (see unit-test.yml convention) for the duplicate-guard
-#     self-cancel and the end-of-run self-chain (`gh workflow run`).
+#     Never put BLOB_READ_WRITE_TOKEN here — publishing goes through the API.
+#   PAT — repo PAT with Actions read/write (see unit-test.yml convention)
+#     for the duplicate-guard self-cancel and the end-of-run self-chain
+#     (`gh workflow run`; the GITHUB_TOKEN cannot trigger another workflow).
 #
 # Resume: the final step always saves `git diff` -> work.patch + run metadata
 # -> state.json into cache key t3-work-<run_number> AND the t3-state
-# artifact (7d). To resume: download t3-state (or restore that cache key)
-# and `git apply work.patch`.
+# artifact (7d). The next chained run RESTORES that cache at job start
+# (exact key t3-work-<prev run> via the t3-work- restore-key prefix) and
+# `git apply work.patch || true`, so uncommitted work carries forward.
+# Artifact fallback: download t3-state and `git apply work.patch` by hand.
+#
+# PAIRING TOKEN TTL (re-minted in the keep-alive loop): the /pair#token=
+# fragment expires ~5 min after minting (t3 pair default TTL 5m), so the
+# keep-alive step re-mints the pairing URL every ~4 min (`npx t3 pair` —
+# CLI syntax unverified, npm was unreachable when this was written; if
+# `pair` prints no pairing URL that cycle just warns and keeps the previous
+# pairing) and re-POSTs it to the t3 slot. Any single re-mint failure is
+# fail-open: the tunnel stays up on the last good pairing.
+# VERIFYING the CLI (do this on a runner, where npm works — e.g. a tmux
+# shell inside a live remote-t3 session, or a throwaway workflow_dispatch
+# run): `npx -y t3@latest pair --help` — confirm the `pair` subcommand
+# exists, what pairing URL it prints (loopback host? which port flag?), and
+# whether a --ttl flag exists (if it takes e.g. hours, prefer one long-lived
+# mint over the 4-min loop). Then update the loop's grep pattern below.
+# STALENESS SURFACING (no silent expiry): every POST refreshes the slot's
+# server-set `updatedAt`, so /dev/t3 treats a record older than ~6 min as
+# stale and shows a warning page (with a manual click-through link) instead
+# of redirecting into a dead token; the save step records `last_remint_at`
+# (last successful re-publish) in state.json, so a loop that keeps missing
+# is visible in the t3-state artifact and the job logs.
 #
 # MULTI-USER LIMITATION (documented, by design): the `t3` slot is a single
 # global pointer — concurrent publishers are last-writer-wins, runId names
@@ -60,9 +85,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # T3 remote envs want Node ^22.16 || ^23.11 || >=24.10 for `npx t3 serve`
+      # (Node 20 is rejected upstream); the repo itself builds fine on 22.
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
+
+      - name: Restore prior work.patch + state.json
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            work.patch
+            state.json
+          key: t3-work-${{ github.run_number }}
+          restore-keys: |
+            t3-work-
+
+      - name: Apply restored work.patch
+        run: |
+          if [ -s "$GITHUB_WORKSPACE/work.patch" ]; then
+            git apply "$GITHUB_WORKSPACE/work.patch" \
+              || echo "work.patch did not apply cleanly; continuing without it."
+          else
+            echo "No prior work.patch to restore."
+          fi
 
       - name: Duplicate guard (yield when another remote-t3 run is live/queued)
         env:
@@ -83,10 +129,17 @@ jobs:
             exit 0
           fi
           if [ -n "$OTHERS" ]; then
-            echo "Another remote-t3 run is active/queued; self-cancelling this duplicate (red here is intentional)."
-            gh run cancel "$ME" || echo "self-cancel API call failed; stopping the job anyway."
-            sleep 5
-            exit 1
+            # Oldest run wins: only self-cancel when a SMALLER (older) run id
+            # is live/queued. Any run seeing another used to cancel itself,
+            # so two starters killed each other and nothing survived.
+            SURVIVOR="$(printf '%s\n' "$LIST" | grep -v '^$' | sort -n | head -n 1)"
+            if [ "$ME" != "$SURVIVOR" ]; then
+              echo "Run $SURVIVOR is older; self-cancelling this duplicate (red here is intentional)."
+              gh run cancel "$ME" || echo "self-cancel API call failed; stopping the job anyway."
+              sleep 5
+              exit 1
+            fi
+            echo "This run ($ME) is the oldest; proceeding."
           fi
           echo "No duplicate remote-t3 run detected; proceeding."
 
@@ -122,7 +175,6 @@ jobs:
         id: tunnel
         env:
           TUNNEL_UPDATE_TOKEN: ${{ secrets.TUNNEL_UPDATE_TOKEN }}
-        continue-on-error: true
         run: |
           nohup cloudflared tunnel --url http://localhost:3773 --no-autoupdate > /tmp/cloudflared.log 2>&1 &
           echo "Waiting for tunnel URL..."
@@ -145,7 +197,7 @@ jobs:
             cat /tmp/t3.log
             exit 1
           fi
-          PAIRING_PUBLIC="$(printf '%s' "$LOCAL_PAIRING" | sed -E "s|http://(127\.0\.0\.1\|0\.0\.0\.0\|localhost):3773|${TUNNEL_HOST}|")"
+          PAIRING_PUBLIC="$(printf '%s' "$LOCAL_PAIRING" | sed -E "s|http://(127\.0\.0\.1|0\.0\.0\.0|localhost):3773|${TUNNEL_HOST}|")"
           case "$PAIRING_PUBLIC" in
             https://*.trycloudflare.com/pair\#token=?*)
               ;;
@@ -154,6 +206,8 @@ jobs:
               exit 1
               ;;
           esac
+          # Mask the token-carrying URL before it hits any log line below.
+          echo "::add-mask::$PAIRING_PUBLIC"
           {
             echo "PUBLIC_TUNNEL=$TUNNEL_HOST"
             echo "PUBLIC_PAIRING=$PAIRING_PUBLIC"
@@ -181,6 +235,10 @@ jobs:
             -d "{\"name\": \"t3\", \"url\": \"$PAIRING_PUBLIC\", \"runId\": \"${{ github.run_id }}\"}"
           echo ""
           echo "Published pairing URL to the t3 slot of the production API"
+          # Seed the last-remint timestamp (refreshed by the keep-alive loop
+          # on every successful re-publish; the save step records it in
+          # state.json so a stale loop is visible in the t3-state artifact).
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > "$GITHUB_WORKSPACE/last-remint.txt"
 
       - name: Upload t3 URL (artifact fallback)
         uses: actions/upload-artifact@v4
@@ -190,24 +248,89 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      - name: Keep alive ~290 min (cancel workflow to stop early)
+      - name: Keep alive ~276 min + re-mint pairing every ~4 min
+        # Fail fast: the tunnel step above no longer uses continue-on-error,
+        # and this belt-and-braces gate keeps a tunnel-less run from burning
+        # budget idling on a dead session.
+        # The stored /pair#token= pairing URL expires ~5 min after minting,
+        # so each ~4 min cycle re-mints it and re-POSTs it to the t3 slot —
+        # /dev/t3 keeps auto-pairing instead of degrading to manual token
+        # entry. Any single cycle failure is fail-open (log + continue).
+        # 69 x 240s = 276 min, leaving budget for save+chain under the
+        # 300 min job timeout. Mask/mint/publish mirror the tunnel step
+        # (sed -E host-swap, ::add-mask:: before echo, bearer POST).
+        if: steps.tunnel.outputs.host != ''
+        env:
+          TUNNEL_UPDATE_TOKEN: ${{ secrets.TUNNEL_UPDATE_TOKEN }}
         run: |
-          echo "T3 session live; sleeping 290 min. /dev/t3 redirects into the pairing URL."
-          sleep 17400
+          TUNNEL_HOST="${{ steps.tunnel.outputs.host }}"
+          echo "T3 session live; re-minting pairing URL every ~4 min for ~276 min."
+          for i in $(seq 1 69); do
+            sleep 240
+            NEW_LOCAL="$(timeout 60 npx -y t3@latest pair 2>/dev/null | grep -oE 'http://(127\.0\.0\.1|0\.0\.0\.0|localhost):3773/pair#token=[A-Za-z0-9]+' | head -n 1 || true)"
+            if [ -z "$NEW_LOCAL" ]; then
+              echo "[$i/69] re-mint: no pairing URL from t3 pair; keeping previous pairing."
+              continue
+            fi
+            NEW_PUBLIC="$(printf '%s' "$NEW_LOCAL" | sed -E "s|http://(127\.0\.0\.1|0\.0\.0\.0|localhost):3773|${TUNNEL_HOST}|")"
+            case "$NEW_PUBLIC" in
+              https://*.trycloudflare.com/pair\#token=?*)
+                ;;
+              *)
+                echo "[$i/69] re-mint: host-swapped URL looks wrong; keeping previous pairing."
+                continue
+                ;;
+            esac
+            echo "::add-mask::$NEW_PUBLIC"
+            if [ -z "$TUNNEL_UPDATE_TOKEN" ]; then
+              echo "[$i/69] re-mint: TUNNEL_UPDATE_TOKEN not set; skipping API publish."
+              continue
+            fi
+            if curl -sf -X POST "https://tubelens.vercel.app/api/v1/tunnel-url" \
+              -H "Authorization: Bearer $TUNNEL_UPDATE_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"name\": \"t3\", \"url\": \"$NEW_PUBLIC\", \"runId\": \"${{ github.run_id }}\"}"; then
+              echo ""
+              echo "[$i/69] re-mint: published a fresh pairing URL to the t3 slot."
+              # Last successful re-mint, picked up into state.json by the save
+              # step so a stale loop is visible in the t3-state artifact.
+              date -u +"%Y-%m-%dT%H:%M:%SZ" > "$GITHUB_WORKSPACE/last-remint.txt"
+            else
+              echo ""
+              echo "[$i/69] re-mint: publish failed; keeping previous pairing."
+            fi
+          done
+          echo "Keep-alive window done; proceeding to save+chain."
 
       - name: Save work.patch + state.json
         if: always()
         run: |
+          # Intent-to-add so UNTRACKED files are included in the diff below.
+          git add -N . || true
           git diff > "$GITHUB_WORKSPACE/work.patch" || true
           wc -c "$GITHUB_WORKSPACE/work.patch"
           TUNNEL_HOST="${{ steps.tunnel.outputs.host }}"
           PAIRING_PUBLIC="${{ steps.tunnel.outputs.pairing }}"
           GITHUB_RUN_NUMBER="${{ github.run_number }}" TUNNEL_HOST="$TUNNEL_HOST" PAIRING_PUBLIC="$PAIRING_PUBLIC" python3 - <<'EOF'
           import json, os
+          try:
+            with open("last-remint.txt") as f:
+              last_remint_at = f.read().strip()
+          except OSError:
+            last_remint_at = ""
           state = {
             "run_number": int(os.environ.get("GITHUB_RUN_NUMBER", "0")),
             "tunnel_url": os.environ.get("TUNNEL_HOST", ""),
             "pairing_url": os.environ.get("PAIRING_PUBLIC", ""),
+            # Last time the keep-alive loop successfully re-published the
+            # pairing URL ("" when only the initial publish happened or the
+            # loop never succeeded). Compare with the slot's `updatedAt`
+            # (server-set on every POST) to spot a silently stale loop.
+            # NOTE: last-remint.txt is written inside $GITHUB_WORKSPACE but
+            # is NOT in the cache/artifact path lists below on purpose —
+            # state.json already carries the timestamp forward.
+            "last_remint_at": last_remint_at,
+          }
           }
           with open("state.json", "w") as f:
             json.dump(state, f, indent=2)

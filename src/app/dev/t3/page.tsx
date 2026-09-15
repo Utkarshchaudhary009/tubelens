@@ -1,5 +1,6 @@
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
+import { isT3PairingUrl } from "@/lib/tunnel-url";
 
 // /dev/t3 — bounce the browser straight into the live T3 remote-dev session.
 //
@@ -14,6 +15,14 @@ import { redirect } from "next/navigation";
 // lands on manual token entry instead.
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
+
+// Staleness guard: the /pair#token= fragment expires ~5 min after minting,
+// and every successful workflow publish (initial capture or re-mint loop)
+// refreshes the slot's server-set `updatedAt`. Past this age auto-pairing
+// has likely expired, so the page shows the stale warning (with a manual
+// click-through link, fail-open) instead of redirecting into a dead token.
+// Kept slightly above the ~5 min TTL as grace for clock skew.
+const STALE_AFTER_MS = 6 * 60 * 1000;
 
 interface TunnelSlotPayload {
   data: { url: string; runId: string; updatedAt: string } | null;
@@ -46,8 +55,45 @@ async function getPairingRecord(): Promise<TunnelSlotPayload["data"]> {
 
 export default async function DevT3Page() {
   const rec = await getPairingRecord();
-  if (rec?.url) {
-    redirect(rec.url);
+  // Only redirect to a genuine pairing URL (quick-tunnel host +
+  // /pair#token=). The stored value is publisher-supplied, so anything else
+  // falls through to the holding page instead of open-redirecting.
+  if (rec?.url && isT3PairingUrl(rec.url)) {
+    const ageMs = Date.now() - Date.parse(rec.updatedAt);
+    if (!Number.isNaN(ageMs) && ageMs <= STALE_AFTER_MS) {
+      redirect(rec.url);
+    }
+    // Fresh-looking shape but expired token: stale warning below (fail-open
+    // with a manual click-through link) instead of a dead-token redirect.
+    const ageMin = Number.isNaN(ageMs)
+      ? "unknown"
+      : `${Math.floor(ageMs / 60000)}`;
+    return (
+      <main className="flex min-h-screen flex-col items-center justify-center gap-4 bg-zinc-50 p-8 text-center dark:bg-black">
+        <meta httpEquiv="refresh" content="15" />
+        <h1 className="text-2xl font-semibold">T3 pairing may be stale</h1>
+        <p className="max-w-md text-zinc-600 dark:text-zinc-400">
+          The stored pairing token is {ageMin} min old (auto-pair tokens expire
+          after ~5 min). The workflow re-mints it every ~4 min — wait a moment
+          and this page will redirect on its own (it retries every 15 seconds).
+        </p>
+        <p className="max-w-md text-zinc-600 dark:text-zinc-400">
+          <a className="underline" href={rec.url}>
+            Try the pairing URL anyway
+          </a>{" "}
+          (lands on manual token entry if the token already expired), or start
+          a fresh session via GitHub → Actions → <code>remote-t3</code> → Run
+          workflow.
+        </p>
+        <p className="max-w-md text-sm text-zinc-500">
+          Slot status:{" "}
+          <a
+            className="underline"
+            href="/api/v1/tunnel-url?name=t3"
+          >{`/api/v1/tunnel-url?name=t3`}</a>
+        </p>
+      </main>
+    );
   }
   // No session published (yet): show a self-refreshing holding page instead
   // of 404ing — the workflow can appear at any time. React 19 hoists this
