@@ -18,6 +18,7 @@
 //   routes opt in the same way: `clerkAuthProvider` + `requireAuth()`.
 // - machine (api-key): deferred to Phase 05 — no route carries it yet.
 
+import { getEffectiveRole } from "./admin-guard";
 import type { AuthContext, AuthProvider } from "./auth";
 import { anonymousAuthContext } from "./auth";
 import { getConfig } from "./config";
@@ -55,10 +56,12 @@ export function hasClerkSecret(
 /**
  * Pure session-to-context projection (no SDK import): maps a Clerk session
  * shape to an AuthContext, normalizing the fast `tubelens.tier` claim via
- * `getEffectiveTier` (missing/invalid → `free`, never self-escalating).
- * Signed-out/malformed sessions resolve anonymous. Exported pure so unit
- * tests cover the claim mapping without initializing the Clerk SDK; the
- * live provider below only handles import/config plumbing.
+ * `getEffectiveTier` (missing/invalid → `free`, never self-escalating) and
+ * the `metadata.role` claim via `getEffectiveRole` (missing/invalid →
+ * `user`, least privilege). Signed-out/malformed sessions resolve
+ * anonymous. Exported pure so unit tests cover the claim mapping without
+ * initializing the Clerk SDK; the live provider below only handles
+ * import/config plumbing.
  */
 export function contextFromClerkSession(
   session:
@@ -76,6 +79,7 @@ export function contextFromClerkSession(
       authenticated: true,
       userId,
       tier: getEffectiveTier(session?.sessionClaims),
+      role: getEffectiveRole(session?.sessionClaims),
     };
   }
   return { ...anonymousAuthContext };

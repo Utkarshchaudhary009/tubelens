@@ -418,7 +418,7 @@ Implement safe fallback to `free` for missing/invalid tier values and keep custo
 
 ## Phase 04 — Tier administration endpoint (Part B)
 
-**Status:** `[ ]` not started.
+**Status:** `[~]` in progress.
 
 **Canonical keys.** Authoritative state lives in Clerk user `publicMetadata` with exactly two keys: `tier: free|plus|pro|enterprise` (ranked `free < plus < pro < enterprise`; `team` is an org concept, not a tier) and `role: admin|support|user`. Backend-written, UI-readable. Never use `unsafeMetadata` for roles/tier; `privateMetadata` is reserved for future internal flags. Session token projects only the tier via the Clerk Dashboard (Sessions → Customize session token), e.g. `{ "metadata": "{{user.public_metadata}}", "tubelens": { "tier": "{{user.public_metadata.tier}}" } }`; keep custom claims under 1.2KB. Orgs are not used — `publicMetadata.role` is the admin signal.
 
