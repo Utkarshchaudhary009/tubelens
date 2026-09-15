@@ -81,8 +81,8 @@ export default async function DevT3Page() {
           <a className="underline" href={rec.url}>
             Try the pairing URL anyway
           </a>{" "}
-          (lands on manual token entry if the token already expired), or start
-          a fresh session via GitHub → Actions → <code>remote-t3</code> → Run
+          (lands on manual token entry if the token already expired), or start a
+          fresh session via GitHub → Actions → <code>remote-t3</code> → Run
           workflow.
         </p>
         <p className="max-w-md text-sm text-zinc-500">
