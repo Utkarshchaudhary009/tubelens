@@ -147,6 +147,11 @@ function clerkStatus(err: unknown): number | undefined {
   return typeof status === "number" ? status : undefined;
 }
 
+/** Backend status code carried by a Clerk SDK error, when present (Phase 05 key routes map 404s to resource-specific codes). */
+export function clerkErrorStatus(err: unknown): number | undefined {
+  return clerkStatus(err);
+}
+
 function clerkRetryAfter(err: unknown): number | undefined {
   if (typeof err !== "object" || err === null) {
     return undefined;

@@ -20,7 +20,13 @@ export type AuditAction =
   // the re-fetch), so these carry a distinct action conveying operation-level
   // reconciliation rather than confirmed causation.
   | "user.tier.change_reconciled"
-  | "user.role.change_reconciled";
+  | "user.role.change_reconciled"
+  | "api_key.issued"
+  | "api_key.revoked";
+// Phase 05 (Part B): API-key issuance / revocation / rotation. Rotation is
+// client-driven (create-new + revoke-old), so it appears as one `issued`
+// row plus one `revoked` row sharing the operator reason. Rows carry key
+// metadata only — never plaintext secrets (PLANS_AND_USAGE.md §10).
 
 interface AuditBase {
   id: string;
@@ -62,11 +68,36 @@ export interface RoleReconciledEvent extends AuditBase {
   newRole: UserRole;
 }
 
+/**
+ * Phase 05: a key was issued. `target`/`targetUserId` carry the key's
+ * `subject`; `tierAtIssuance` is the subject's authoritative tier at issue
+ * time. No secret, ever — the plaintext appears only in the creation
+ * response body.
+ */
+export interface ApiKeyIssuedEvent extends AuditBase {
+  action: "api_key.issued";
+  /** Clerk key reference (never a plaintext secret). */
+  keyId: string;
+  name: string;
+  scopes: string[];
+  tierAtIssuance: Tier;
+}
+
+/** Phase 05: a key was revoked (rotation's second half carries the same shape). */
+export interface ApiKeyRevokedEvent extends AuditBase {
+  action: "api_key.revoked";
+  /** Clerk key reference (never a plaintext secret). */
+  keyId: string;
+  revocationReason?: string;
+}
+
 export type AuditEvent =
   | TierAuditEvent
   | RoleAuditEvent
   | TierReconciledEvent
-  | RoleReconciledEvent;
+  | RoleReconciledEvent
+  | ApiKeyIssuedEvent
+  | ApiKeyRevokedEvent;
 
 // Note: `Omit` over a union collapses to common keys, so the input stays an
 // explicit union — narrowing on `action` keeps old/new tier/role typed.
@@ -74,7 +105,9 @@ export type AuditInput =
   | (Omit<TierAuditEvent, "id" | "ts"> & { ts?: string })
   | (Omit<RoleAuditEvent, "id" | "ts"> & { ts?: string })
   | (Omit<TierReconciledEvent, "id" | "ts"> & { ts?: string })
-  | (Omit<RoleReconciledEvent, "id" | "ts"> & { ts?: string });
+  | (Omit<RoleReconciledEvent, "id" | "ts"> & { ts?: string })
+  | (Omit<ApiKeyIssuedEvent, "id" | "ts"> & { ts?: string })
+  | (Omit<ApiKeyRevokedEvent, "id" | "ts"> & { ts?: string });
 
 /** Cap for the process-local buffer: warm servers must not grow it forever. */
 const MAX_AUDIT_EVENTS = 1000;
@@ -106,12 +139,30 @@ export function recordAuditEvent(input: AuditInput): AuditEvent {
           oldTier: input.oldTier,
           newTier: input.newTier,
         }
-      : {
-          ...base,
-          action: input.action,
-          oldRole: input.oldRole,
-          newRole: input.newRole,
-        };
+      : input.action === "api_key.issued"
+        ? {
+            ...base,
+            action: input.action,
+            keyId: input.keyId,
+            name: input.name,
+            scopes: [...input.scopes],
+            tierAtIssuance: input.tierAtIssuance,
+          }
+        : input.action === "api_key.revoked"
+          ? {
+              ...base,
+              action: input.action,
+              keyId: input.keyId,
+              ...(input.revocationReason !== undefined
+                ? { revocationReason: input.revocationReason }
+                : {}),
+            }
+          : {
+              ...base,
+              action: input.action,
+              oldRole: input.oldRole,
+              newRole: input.newRole,
+            };
   events.push(event);
   // Bounded buffer: drop the oldest row on overflow so a warm process keeps
   // only the last MAX_AUDIT_EVENTS (durable history lands in Postgres,
@@ -120,15 +171,30 @@ export function recordAuditEvent(input: AuditInput): AuditEvent {
     events.shift();
   }
   console.info(JSON.stringify({ level: "audit", ...event }));
-  return event;
+  // Defensive clone: the stored row must not alias the return value, or a
+  // caller mutating it would rewrite history (same shape as the
+  // getAuditEvents snapshot below).
+  return snapshotAuditEvent(event);
+}
+
+/**
+ * Snapshot one stored row. Each row is shallow-cloned (`api_key.issued`
+ * rows additionally clone their `scopes` array) so callers can neither
+ * mutate the store array nor the stored row objects.
+ */
+function snapshotAuditEvent(event: AuditEvent): AuditEvent {
+  return event.action === "api_key.issued"
+    ? { ...event, scopes: [...event.scopes] }
+    : { ...event };
 }
 
 /**
  * Snapshot of rows recorded so far. Each row is shallow-cloned — callers can
- * neither mutate the store array nor the stored row objects.
+ * neither mutate the store array nor the stored row objects (`api_key.issued`
+ * rows additionally clone their `scopes` array).
  */
 export function getAuditEvents(): AuditEvent[] {
-  return events.map((event) => ({ ...event }));
+  return events.map(snapshotAuditEvent);
 }
 
 /** Clear the store (primarily for tests). */

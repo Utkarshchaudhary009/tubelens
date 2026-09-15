@@ -19,10 +19,16 @@
 // - machine (api-key): deferred to Phase 05 — no route carries it yet.
 
 import { getEffectiveRole } from "./admin-guard";
+import {
+  type ApiKeysClient,
+  getApiKeysClient,
+  touchKeyLastUsed,
+} from "./api-keys";
 import type { AuthContext, AuthProvider } from "./auth";
 import { anonymousAuthContext } from "./auth";
+import { clerkErrorStatus } from "./clerk-admin";
 import { getConfig } from "./config";
-import { getEffectiveTier } from "./product";
+import { getEffectiveTier, normalizeTier, type Tier } from "./product";
 
 /** Protected pathnames (exact match); everything else is public. */
 export const AUTHENTICATED_ROUTES = ["/api/v1/me"] as const;
@@ -86,45 +92,143 @@ export function contextFromClerkSession(
 }
 
 /**
- * Resolve the caller principal via the Clerk session.
+ * Resolve the caller principal via the Clerk session, with a Phase 05
+ * machine-auth fallback:
  *
- * Tier projection (Phase 03): `sessionClaims.tubelens.tier` carries the
- * fast claim minted by the Dashboard session-token template
- * (`{"metadata":"{{user.public_metadata}}","tubelens":{"tier":"{{user.public_metadata.tier}}"}}`,
- * custom claims <1.2KB). It is normalized via `getEffectiveTier` onto the
- * returned context so the pipeline's `ctx.tier` reflects the claim without
- * a Backend API call. Signed-out/malformed → anonymous (no tier);
- * authenticated + missing/invalid → `free`;
- * the projection lags metadata changes by ~60s, so security-sensitive
- * write paths must re-fetch authoritative Clerk metadata (Phase 04).
+ * 1. Session-first: the interactive browser session (unchanged Phase 02/03
+ *    behavior, including its tier/role claim projection).
+ * 2. Bearer-fallback: when the session yields anonymous AND the request
+ *    carries `Authorization: Bearer ak_*`, verify the secret as a Clerk API
+ *    key and resolve `{ type: "api_key", keyId, userId: subject, tier }`.
+ *    The tier comes from the subject's authoritative `publicMetadata` via
+ *    the same least-privilege `normalizeTier` fallback `getEffectiveTier`
+ *    uses (missing/invalid → `free`, never throws) — there is no session
+ *    claim for machine callers, so the write-path rule applies here too:
+ *    re-fetch, never trust client input.
+ *
+ * Fail-closed throughout: any verification failure (missing / malformed /
+ * revoked / expired secret, Clerk outage, timeout) resolves anonymous, so
+ * protected routes deny via `requireAuth()` (401) while public routes keep
+ * serving. The plaintext secret is never logged, stored, or audited — it is
+ * held only in the local `secret` binding for the duration of `verify`.
  *
  * - Fail-safe first: when TUBELENS_AUTH_ENFORCEMENT=required without
  *   CLERK_SECRET_KEY, `getConfig` throws a typed ConfigError — protection
  *   is never silently disabled.
  * - Keyless-safe: without a secret (local unit tests, unconfigured envs)
- *   there is no session to resolve — return anonymous, never throw, so
- *   public routes keep serving.
- * - Degrade closed: any Clerk failure (no proxy headers, outage,
- *   misconfiguration) resolves anonymous. Protection still holds because
- *   protected routes deny anonymous via `requireAuth()` (401) while public
- *   routes serve — failures deny, never bypass.
+ *   there is no session to resolve — session resolution is skipped, and the
+ *   Bearer path runs against the configured client (a mock in tests; the
+ *   live client fails closed without a secret). Public routes keep serving.
+ * - Degrade closed: any Clerk failure resolves anonymous. Protection still
+ *   holds because protected routes deny anonymous via `requireAuth()` (401)
+ *   while public routes serve — failures deny, never bypass.
  */
 export const clerkAuthProvider: AuthProvider = {
-  async resolve(_req: Request): Promise<AuthContext> {
+  async resolve(req: Request): Promise<AuthContext> {
     getConfig(process.env);
-    if (!hasClerkSecret()) {
-      return { ...anonymousAuthContext };
+    const sessionCtx = await resolveSessionContext();
+    if (sessionCtx.authenticated) {
+      return sessionCtx;
     }
-    try {
-      // Lazy import: keyless envs and unit tests never initialize the Clerk
-      // SDK. `auth()` is async in the v7 SDK — `await` covers both shapes.
-      // Claim mapping itself lives in the pure `contextFromClerkSession`
-      // above (unit-tested without the SDK); this block is import/config
-      // plumbing only.
-      const { auth } = await import("@clerk/nextjs/server");
-      return contextFromClerkSession(await auth());
-    } catch {
-      return { ...anonymousAuthContext };
-    }
+    return resolveApiKeyContext(extractBearerSecret(req), getApiKeysClient());
   },
 };
+
+/**
+ * Session leg: anonymous when unconfigured (no secret) or on any Clerk
+ * failure. Factored out so the Bearer fallback below runs even in keyless
+ * unit tests (where a mocked key client is injected).
+ */
+async function resolveSessionContext(): Promise<AuthContext> {
+  if (!hasClerkSecret()) {
+    return { ...anonymousAuthContext };
+  }
+  try {
+    // Lazy import: keyless envs and unit tests never initialize the Clerk
+    // SDK. `auth()` is async in the v7 SDK — `await` covers both shapes.
+    // Claim mapping itself lives in the pure `contextFromClerkSession`
+    // above (unit-tested without the SDK); this block is import/config
+    // plumbing only.
+    const { auth } = await import("@clerk/nextjs/server");
+    return contextFromClerkSession(await auth());
+  } catch {
+    return { ...anonymousAuthContext };
+  }
+}
+
+/**
+ * Extract the Bearer secret from `Authorization` (case-insensitive scheme).
+ * Only `ak_*` machine secrets are attempted — anything else (absent header,
+ * wrong scheme, non-key token) yields undefined so non-key bearers never
+ * reach the verify endpoint.
+ */
+export function extractBearerSecret(req: {
+  headers: { get(name: string): string | null };
+}): string | undefined {
+  const header = req.headers.get("authorization");
+  if (!header) {
+    return undefined;
+  }
+  const match = /^bearer\s+(.+)$/i.exec(header.trim());
+  const secret = match?.[1]?.trim();
+  if (!secret || !secret.startsWith("ak_")) {
+    return undefined;
+  }
+  return secret;
+}
+
+/**
+ * Bearer leg: verify a machine secret and project the key principal.
+ * Exported so tests cover the verify→context mapping with a mocked client
+ * without HTTP. `secret === undefined` (no/foreign bearer) resolves
+ * anonymous without a Backend call. Never throws — every failure path
+ * resolves anonymous (fail closed via `requireAuth()` downstream).
+ */
+export async function resolveApiKeyContext(
+  secret: string | undefined,
+  client: ApiKeysClient,
+): Promise<AuthContext> {
+  if (!secret) {
+    return { ...anonymousAuthContext };
+  }
+  let verified: Awaited<ReturnType<ApiKeysClient["verifyKey"]>>;
+  try {
+    verified = await client.verifyKey(secret, {
+      signal: AbortSignal.timeout(8000),
+    });
+  } catch {
+    // Missing/malformed/revoked/expired secret, timeout, or outage: deny
+    // (protected routes 401), never bypass.
+    return { ...anonymousAuthContext };
+  }
+  // Fail-closed guard: never trust a verified payload that already carries
+  // revoked/expired — deny even if the authority resolved instead of threw.
+  if (verified.revoked || verified.expired) {
+    return { ...anonymousAuthContext };
+  }
+  let tier: Tier = "free";
+  try {
+    const subject = await client.getUser(verified.subject, {
+      signal: AbortSignal.timeout(8000),
+    });
+    tier = normalizeTier(subject.publicMetadata?.tier);
+  } catch (err) {
+    // A 404 names a deleted subject — the key no longer binds a live user,
+    // so deny rather than serve a dangling principal. Only transient /
+    // non-404 failures fall back to least-privilege `free` (the key itself
+    // verified, so an unreadable tier must not lock it out — and never an
+    // escalation).
+    if (clerkErrorStatus(err) === 404) {
+      return { ...anonymousAuthContext };
+    }
+    tier = "free";
+  }
+  touchKeyLastUsed(verified.id);
+  return {
+    type: "api_key",
+    authenticated: true,
+    userId: verified.subject,
+    tier,
+    keyId: verified.id,
+  };
+}
