@@ -77,13 +77,16 @@ type MockMeta = { tier?: unknown; role?: unknown };
  * Mocked Clerk backend seam: authoritative metadata lives in `store`, so
  * tests control exactly what `getUser` returns (including values that differ
  * from the caller's stale session claim). Records every call's fail-fast
- * signal for assertions.
+ * signal for assertions, plus write params to pin owned-key-only updates.
  */
 function mockClerk(
   store: Record<string, MockMeta>,
   opts: { failGet?: unknown; failUpdate?: unknown } = {},
-): { client: ClerkAdminClient; seen: { op: string; signal: unknown }[] } {
-  const seen: { op: string; signal: unknown }[] = [];
+): {
+  client: ClerkAdminClient;
+  seen: { op: string; signal: unknown; params?: unknown }[];
+} {
+  const seen: { op: string; signal: unknown; params?: unknown }[] = [];
   const client: ClerkAdminClient = {
     async getUser(userId, o) {
       seen.push({ op: "getUser", signal: o?.signal });
@@ -97,7 +100,7 @@ function mockClerk(
       return { id: userId, publicMetadata: { ...meta } };
     },
     async updateUserMetadata(userId, params, o) {
-      seen.push({ op: "updateUserMetadata", signal: o?.signal });
+      seen.push({ op: "updateUserMetadata", signal: o?.signal, params });
       if (opts.failUpdate !== undefined) {
         throw opts.failUpdate;
       }
@@ -289,6 +292,7 @@ describe("requireAdmin gate (Phase 04)", () => {
 describe("PATCH tier happy path (Phase 04)", () => {
   test("200 upgrades free → pro, preserves role, audits, no-store", async () => {
     const store: Record<string, MockMeta> = {
+      user_admin1: { tier: "pro", role: "admin" },
       user_target1: { tier: "free", role: "user" },
     };
     const { client, seen } = mockClerk(store);
@@ -312,13 +316,23 @@ describe("PATCH tier happy path (Phase 04)", () => {
     expect(body.meta.requestId).toBe("tier-happy-1");
     // Authoritative write preserved the untouched role key.
     expect(store.user_target1).toEqual({ tier: "pro", role: "user" });
-    // Fail-fast signals travelled with both Clerk calls — one fresh 8s
-    // budget per call, never a shared leftover.
-    expect(seen.map((s) => s.op)).toEqual(["getUser", "updateUserMetadata"]);
+    // Fail-fast signals travelled with every Clerk call — one fresh 8s
+    // budget per call, never a shared leftover: caller check, target read,
+    // then the write.
+    expect(seen.map((s) => s.op)).toEqual([
+      "getUser",
+      "getUser",
+      "updateUserMetadata",
+    ]);
     for (const s of seen) {
       expect(s.signal).toBeInstanceOf(AbortSignal);
     }
-    expect(seen[0].signal).not.toBe(seen[1].signal);
+    expect(new Set(seen.map((s) => s.signal)).size).toBe(3);
+    // Owned-key-only write: the untouched role is never resent, so a
+    // concurrent role change cannot be clobbered with a stale value.
+    expect(seen.find((s) => s.op === "updateUserMetadata")?.params).toEqual({
+      publicMetadata: { tier: "pro" },
+    });
     // One sanitized audit row.
     const rows = getAuditEvents();
     expect(rows).toHaveLength(1);
@@ -360,6 +374,7 @@ describe("PATCH tier happy path (Phase 04)", () => {
 describe("PATCH role happy path (Phase 04)", () => {
   test("200 promotes user → support, preserves tier, audits, no-store", async () => {
     const store: Record<string, MockMeta> = {
+      user_admin1: { tier: "pro", role: "admin" },
       user_target2: { tier: "pro", role: "user" },
     };
     const { client, seen } = mockClerk(store);
@@ -381,11 +396,19 @@ describe("PATCH role happy path (Phase 04)", () => {
     });
     expect(body.page).toEqual({ next: null });
     expect(store.user_target2).toEqual({ tier: "pro", role: "support" });
-    expect(seen.map((s) => s.op)).toEqual(["getUser", "updateUserMetadata"]);
+    expect(seen.map((s) => s.op)).toEqual([
+      "getUser",
+      "getUser",
+      "updateUserMetadata",
+    ]);
     for (const s of seen) {
       expect(s.signal).toBeInstanceOf(AbortSignal);
     }
-    expect(seen[0].signal).not.toBe(seen[1].signal);
+    expect(new Set(seen.map((s) => s.signal)).size).toBe(3);
+    // Owned-key-only write: the untouched tier is never resent.
+    expect(seen.find((s) => s.op === "updateUserMetadata")?.params).toEqual({
+      publicMetadata: { role: "support" },
+    });
     const rows = getAuditEvents();
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({
@@ -496,6 +519,59 @@ describe("admin auth matrix (Phase 04)", () => {
     }
     // Blocked before any Clerk write and before any audit row.
     expect(store.user_admin1).toEqual({ tier: "pro", role: "admin" });
+    expect(getAuditEvents()).toHaveLength(0);
+  });
+
+  test("403 demoted caller: admin claim but authoritative role is user", async () => {
+    // The session claim still says admin (~60s lag) but authoritative
+    // metadata was already demoted: the write must fail closed.
+    const store: Record<string, MockMeta> = {
+      user_admin1: { tier: "pro", role: "user" },
+      user_demo1: { tier: "free", role: "user" },
+    };
+    const { client, seen } = mockClerk(store);
+    for (const run of [
+      () =>
+        handleTierPatch(
+          "demoted-tier",
+          adminAuth,
+          "user_demo1",
+          { tier: "pro" },
+          { clerk: client },
+        ),
+      () =>
+        handleRolePatch(
+          "demoted-role",
+          adminAuth,
+          "user_demo1",
+          { role: "support" },
+          { clerk: client },
+        ),
+    ]) {
+      const res = await run();
+      expect(res.status).toBe(403);
+      const body = await res.json();
+      expect(body.error.code).toBe("forbidden");
+      expect(body.error.message).toMatch(/no longer valid/i);
+    }
+    // Fail closed before touching the target: no write, no audit row, and
+    // the target was never even read.
+    expect(seen.some((s) => s.op === "updateUserMetadata")).toBe(false);
+    expect(store.user_demo1).toEqual({ tier: "free", role: "user" });
+    expect(getAuditEvents()).toHaveLength(0);
+  });
+
+  test("503 when the authoritative caller check itself fails", async () => {
+    const { client } = mockClerk({}, { failGet: new Error("clerk down") });
+    const res = await handleTierPatch(
+      "caller-check-down",
+      adminAuth,
+      "user_demo2",
+      { tier: "pro" },
+      { clerk: client },
+    );
+    expect(res.status).toBe(503);
+    expect((await res.json()).error.code).toBe("dependency_unavailable");
     expect(getAuditEvents()).toHaveLength(0);
   });
 
@@ -635,6 +711,7 @@ describe("authoritative write path + stale claims (Phase 04)", () => {
     // metadata already moved to pro: the audit old-value must be pro.
     const staleAdmin: AuthContext = { ...adminAuth, tier: "free" };
     const store: Record<string, MockMeta> = {
+      user_admin1: { tier: "pro", role: "admin" },
       user_stale1: { tier: "pro", role: "user" },
     };
     const { client } = mockClerk(store);
@@ -653,6 +730,7 @@ describe("authoritative write path + stale claims (Phase 04)", () => {
 
   test("missing/invalid authoritative values normalize safely, never escalate", async () => {
     const store: Record<string, MockMeta> = {
+      user_admin1: { tier: "pro", role: "admin" },
       user_weird1: { tier: "team", role: "owner" },
     };
     const { client } = mockClerk(store);
@@ -664,8 +742,9 @@ describe("authoritative write path + stale claims (Phase 04)", () => {
       { clerk: client },
     );
     expect(res.status).toBe(200);
-    // Invalid authoritative tier fell back to free and was preserved as such.
-    expect(store.user_weird1).toEqual({ tier: "free", role: "support" });
+    // Owned-key-only write: the unrecognized authoritative tier is preserved
+    // untouched, never normalize-rewritten to free.
+    expect(store.user_weird1).toEqual({ tier: "team", role: "support" });
     expect(getAuditEvents()[0]).toMatchObject({
       oldRole: "user",
       newRole: "support",
@@ -673,7 +752,9 @@ describe("authoritative write path + stale claims (Phase 04)", () => {
   });
 
   test("unknown target maps to 404 user_not_found with no audit row", async () => {
-    const { client } = mockClerk({});
+    const { client } = mockClerk({
+      user_admin1: { tier: "pro", role: "admin" },
+    });
     const res = await handleTierPatch(
       "missing-target-1",
       adminAuth,
@@ -706,6 +787,7 @@ describe("authoritative write path + stale claims (Phase 04)", () => {
 
   test("backend outage maps to 503 dependency_unavailable with no audit row", async () => {
     const store: Record<string, MockMeta> = {
+      user_admin1: { tier: "pro", role: "admin" },
       user_t6: { tier: "free", role: "user" },
     };
     const { client } = mockClerk(store, {
@@ -761,6 +843,7 @@ describe("authoritative write path + stale claims (Phase 04)", () => {
 
   test("whitespace-only reason is trimmed and dropped from the audit row", async () => {
     const store: Record<string, MockMeta> = {
+      user_admin1: { tier: "pro", role: "admin" },
       user_t9: { tier: "free", role: "user" },
     };
     const { client } = mockClerk(store);
@@ -775,5 +858,99 @@ describe("authoritative write path + stale claims (Phase 04)", () => {
     const rows = getAuditEvents();
     expect(rows).toHaveLength(1);
     expect("reason" in rows[0]).toBe(false);
+  });
+
+  test("Clerk 401/403 describe our backend credential → 503, never caller 4xx", async () => {
+    for (const status of [401, 403]) {
+      const denied = Object.assign(new Error("backend credential rejected"), {
+        status,
+      });
+      const { client } = mockClerk({}, { failGet: denied });
+      const res = await handleTierPatch(
+        `cred-${status}`,
+        adminAuth,
+        "user_t10",
+        { tier: "pro" },
+        { clerk: client },
+      );
+      expect(res.status).toBe(503);
+      const body = await res.json();
+      expect(body.error.code).toBe("dependency_unavailable");
+      expect(body.error.hint).toMatch(/backend credential/);
+    }
+    expect(getAuditEvents()).toHaveLength(0);
+  });
+
+  test("timed-out write confirmed by re-fetch audits and returns 504 + warning", async () => {
+    // The write lands server-side but the response is lost: the handler's
+    // single bounded re-fetch sees the new value, audits it, and answers 504
+    // with reconciled_after_timeout instead of silently dropping the row.
+    const store: Record<string, MockMeta> = {
+      user_admin1: { tier: "pro", role: "admin" },
+      user_rec1: { tier: "free", role: "user" },
+    };
+    const timeout = new DOMException(
+      "The operation timed out.",
+      "TimeoutError",
+    );
+    const seen: { op: string }[] = [];
+    const client: ClerkAdminClient = {
+      async getUser(userId) {
+        seen.push({ op: "getUser" });
+        const meta = store[userId];
+        if (!meta) {
+          throw Object.assign(new Error("not found"), { status: 404 });
+        }
+        return { id: userId, publicMetadata: { ...meta } };
+      },
+      async updateUserMetadata(userId, params) {
+        seen.push({ op: "updateUserMetadata" });
+        store[userId] = { ...(store[userId] ?? {}), ...params.publicMetadata };
+        throw timeout;
+      },
+    };
+    const res = await handleTierPatch(
+      "reconciled-1",
+      adminAuth,
+      "user_rec1",
+      { tier: "pro" },
+      { clerk: client },
+    );
+    expect(res.status).toBe(504);
+    const body = await res.json();
+    expect(body.data.tier).toBe("pro");
+    expect(body.warnings).toMatchObject([{ code: "reconciled_after_timeout" }]);
+    const rows = getAuditEvents();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "user.tier.changed",
+      oldTier: "free",
+      newTier: "pro",
+      requestId: "reconciled-1",
+    });
+  });
+
+  test("timed-out write with unchanged re-fetch returns 504 + no audit row", async () => {
+    const store: Record<string, MockMeta> = {
+      user_admin1: { tier: "pro", role: "admin" },
+      user_rec2: { tier: "free", role: "user" },
+    };
+    const timeout = new DOMException(
+      "The operation timed out.",
+      "TimeoutError",
+    );
+    const { client } = mockClerk(store, { failUpdate: timeout });
+    const res = await handleRolePatch(
+      "unknown-outcome-1",
+      adminAuth,
+      "user_rec2",
+      { role: "support" },
+      { clerk: client },
+    );
+    expect(res.status).toBe(504);
+    const body = await res.json();
+    expect(body.error.code).toBe("upstream_timeout");
+    expect(body.error.hint).toMatch(/Outcome unknown/);
+    expect(getAuditEvents()).toHaveLength(0);
   });
 });

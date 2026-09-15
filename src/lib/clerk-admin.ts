@@ -9,6 +9,7 @@
 // keyless unit tests without initializing the Clerk SDK (same pattern as
 // `clerk-auth.ts`).
 
+import { forbiddenResponse, normalizeRole } from "./admin-guard";
 import { errorResponse } from "./errors";
 
 /** Minimal Clerk user shape the admin write path needs. */
@@ -33,7 +34,8 @@ export interface ClerkAdminClient {
   getUser(userId: string, opts?: ClerkCallOptions): Promise<ClerkUserRecord>;
   /**
    * Dedicated metadata write (deep-merge, `null` removes a key). Callers
-   * pass BOTH tier+role so the untouched key is preserved.
+   * write ONLY the key they own (tier or role) so a concurrent change to
+   * the other field is never clobbered with a stale value.
    */
   updateUserMetadata(
     userId: string,
@@ -125,7 +127,8 @@ export function resetClerkAdminClient(): void {
   current = undefined;
 }
 
-function isTimeout(err: unknown): boolean {
+/** Fail-fast predicate (exported so handlers can reconcile timed-out writes). */
+export function isClerkTimeout(err: unknown): boolean {
   return (
     err instanceof DOMException &&
     (err.name === "TimeoutError" || err.name === "AbortError")
@@ -157,9 +160,12 @@ function clerkRetryAfter(err: unknown): number | undefined {
  * pipeline would mask it as a 500):
  * - fail-fast fired → 504 `upstream_timeout` (Part A fail-fast language).
  *   The SDK promise cannot be cancelled, so the write may still have landed
- *   server-side with no audit row — callers must re-fetch before retrying.
+ *   server-side — the outcome is unknown until re-fetched.
  * - backend 404 → 404 `user_not_found`.
  * - backend 429 → 429 `rate_limited` with `Retry-After` (code style rules).
+ * - backend 401/403 → 503 `dependency_unavailable`: a server-side
+ *   getUser/updateUserMetadata rejection describes OUR backend credential,
+ *   not the caller, so it must never surface as a caller-facing 4xx.
  * - other backend 4xx (validation faults) → same status as `clerk_rejected`,
  *   never misreported as a 503 outage.
  * - anything else → 503 `dependency_unavailable` (fail closed, never serve
@@ -169,11 +175,11 @@ export function clerkErrorResponse(
   requestId: string,
   err: unknown,
 ): ReturnType<typeof errorResponse> {
-  if (isTimeout(err)) {
+  if (isClerkTimeout(err)) {
     return errorResponse(requestId, {
       code: "upstream_timeout",
       message: "Clerk request timed out.",
-      hint: "Retry shortly; the change may not have applied — re-fetch the user before retrying.",
+      hint: "Outcome unknown — re-fetch the user before retrying.",
       status: 504,
     });
   }
@@ -195,6 +201,14 @@ export function clerkErrorResponse(
       retryAfter: clerkRetryAfter(err) ?? 60,
     });
   }
+  if (status === 401 || status === 403) {
+    return errorResponse(requestId, {
+      code: "dependency_unavailable",
+      message: "User directory unavailable.",
+      hint: "Retry shortly; operators must restore the backend credential. The change may not have applied — re-fetch the user before retrying.",
+      status: 503,
+    });
+  }
   if (status !== undefined && status >= 400 && status < 500) {
     return errorResponse(requestId, {
       code: "clerk_rejected",
@@ -209,4 +223,53 @@ export function clerkErrorResponse(
     hint: "Retry shortly; the change may not have applied — re-fetch the user before retrying.",
     status: 503,
   });
+}
+
+/**
+ * Authoritative caller check (stale-claim window): the session claim lags
+ * metadata changes by ~60s, so a just-demoted caller could otherwise still
+ * write. Runs AFTER the `requireAdmin` fast-reject and requires the
+ * caller's authoritative `publicMetadata.role === "admin"`, else 403.
+ * Fails closed — any Clerk failure maps through `clerkErrorResponse`,
+ * never fail-open. Returns undefined when the caller is confirmed admin.
+ */
+export async function requireAuthoritativeAdmin(
+  requestId: string,
+  clerk: ClerkAdminClient,
+  callerUserId: string,
+  opts?: ClerkCallOptions,
+): Promise<ReturnType<typeof errorResponse> | undefined> {
+  let record: ClerkUserRecord;
+  try {
+    record = await clerk.getUser(callerUserId, opts);
+  } catch (err) {
+    return clerkErrorResponse(requestId, err);
+  }
+  if (normalizeRole(record.publicMetadata?.role) !== "admin") {
+    return forbiddenResponse(
+      requestId,
+      "Admin access is no longer valid.",
+      "Your admin role changed or the session is stale; sign in again as an admin and retry.",
+    );
+  }
+  return undefined;
+}
+
+/**
+ * ONE bounded best-effort re-fetch after a timed-out write. The Clerk SDK
+ * accepts no AbortSignal, so a timed-out `updateUserMetadata` may still have
+ * landed server-side — the handler compares this record against the intended
+ * value to decide between "confirmed applied" (audit it) and "unknown".
+ * Returns undefined when the re-fetch itself fails.
+ */
+export async function refetchAfterTimeout(
+  clerk: ClerkAdminClient,
+  userId: string,
+  opts?: ClerkCallOptions,
+): Promise<ClerkUserRecord | undefined> {
+  try {
+    return await clerk.getUser(userId, opts);
+  } catch {
+    return undefined;
+  }
 }

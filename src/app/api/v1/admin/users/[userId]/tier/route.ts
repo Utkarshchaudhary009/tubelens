@@ -5,7 +5,6 @@ import {
   type AuthContext,
   forbiddenResponse,
   mapAdminBodyError,
-  normalizeRole,
   requireAdmin,
   USER_ID_PATTERN,
   unauthenticatedResponse,
@@ -14,6 +13,9 @@ import {
   type ClerkAdminClient,
   clerkErrorResponse,
   getClerkAdminClient,
+  isClerkTimeout,
+  refetchAfterTimeout,
+  requireAuthoritativeAdmin,
 } from "@/lib/clerk-admin";
 import { clerkAuthProvider } from "@/lib/clerk-auth";
 import { CACHE_CONTROL, successResponse } from "@/lib/envelope";
@@ -97,32 +99,82 @@ export async function handleTierPatch(
   }
   const { tier: newTier, reason } = parsed.data;
 
-  // Authoritative write path: re-fetch Clerk metadata (claims lag ~60s) and
-  // record old tier/role from it — never from the session claim. Each Clerk
-  // call mints its own 8s budget: sharing one signal would let the read eat
-  // into the write's fail-fast window.
+  // Authoritative write path: session claims lag ~60s, so after the
+  // `requireAdmin` fast-reject the CALLER is re-verified against authoritative
+  // metadata (a just-demoted caller must fail closed here, never write).
+  // Each Clerk call mints its own 8s budget: sharing one signal would let an
+  // earlier call eat into a later call's fail-fast window.
   const clerk = deps.clerk ?? getClerkAdminClient();
+  const callerCheck = await requireAuthoritativeAdmin(
+    requestId,
+    clerk,
+    caller.userId,
+    { signal: AbortSignal.timeout(8000) },
+  );
+  if (callerCheck) {
+    return callerCheck;
+  }
+  // Target read: existence check + audit old-value. The untouched role key is
+  // deliberately NOT resent on the write below — `updateUserMetadata`
+  // deep-merges, so writing only the owned key can never clobber a concurrent
+  // change (or normalize-rewrite an unrecognized value) on the other field.
   let oldTier: ReturnType<typeof normalizeTier>;
-  let oldRole: ReturnType<typeof normalizeRole>;
   try {
     const record = await clerk.getUser(targetUserId, {
       signal: AbortSignal.timeout(8000),
     });
     oldTier = normalizeTier(record.publicMetadata?.tier);
-    oldRole = normalizeRole(record.publicMetadata?.role);
   } catch (err) {
     return clerkErrorResponse(requestId, err);
   }
   try {
-    // Dedicated metadata method (deep-merge): write BOTH keys so the
-    // untouched role survives the tier change.
     await clerk.updateUserMetadata(
       targetUserId,
-      { publicMetadata: { tier: newTier, role: oldRole } },
+      { publicMetadata: { tier: newTier } },
       { signal: AbortSignal.timeout(8000) },
     );
   } catch (err) {
-    return clerkErrorResponse(requestId, err);
+    if (!isClerkTimeout(err)) {
+      return clerkErrorResponse(requestId, err);
+    }
+    // The SDK accepts no AbortSignal, so a timed-out write may still have
+    // landed: one bounded re-fetch decides between "confirmed applied"
+    // (audit it, 504 with reconciled_after_timeout) and "unknown" (504).
+    const latest = await refetchAfterTimeout(clerk, targetUserId, {
+      signal: AbortSignal.timeout(8000),
+    });
+    if (latest?.publicMetadata?.tier !== newTier) {
+      return clerkErrorResponse(requestId, err);
+    }
+    recordAuditEvent({
+      action: "user.tier.changed",
+      actor: caller.userId,
+      target: targetUserId,
+      targetUserId,
+      oldTier,
+      newTier,
+      requestId,
+      ...(reason ? { reason } : {}),
+    });
+    return successResponse(
+      {
+        userId: targetUserId,
+        tier: newTier,
+        sessionTokenMayRefreshWithinSeconds: 60,
+      },
+      {
+        requestId,
+        cacheControl: CACHE_CONTROL.noStore,
+        status: 504,
+        warnings: [
+          {
+            code: "reconciled_after_timeout",
+            message:
+              "The write timed out but a re-fetch confirmed it applied; the change has been audited.",
+          },
+        ],
+      },
+    );
   }
 
   recordAuditEvent({
