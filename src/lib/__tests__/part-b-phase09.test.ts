@@ -275,8 +275,10 @@ describe("security headers", () => {
 });
 
 describe("CORS discipline", () => {
-  test("no Origin → no CORS headers", () => {
-    expect(corsHeaders(null, CORS_ENV)).toEqual({});
+  test("absent/blank Origin → Vary only, never a grant", () => {
+    for (const origin of [null, "", "   "]) {
+      expect(corsHeaders(origin, CORS_ENV)).toEqual({ Vary: "Origin" });
+    }
   });
 
   test("allowed origin echoed + Vary + methods/headers/max-age, never *", () => {
@@ -455,6 +457,19 @@ describe("CORS discipline", () => {
     expect(res.status).toBe(204);
     expect(res.headers.get("Access-Control-Allow-Origin")).toBeNull();
     expect(res.headers.get("Vary")).toBe("Origin");
+    expectSecurityHeaders(res);
+  });
+
+  test("preflight OPTIONS: absent origin → 204 with Vary, no Allow-Origin", () => {
+    const res = handlePreflight(
+      req("http://localhost/api/v1/search"),
+      "r1",
+      CORS_ENV,
+    );
+    expect(res.status).toBe(204);
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBeNull();
+    expect(res.headers.get("Vary")).toBe("Origin");
+    expect(res.headers.get("X-Request-Id")).toBe("r1");
     expectSecurityHeaders(res);
   });
 });

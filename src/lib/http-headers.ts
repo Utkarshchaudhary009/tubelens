@@ -60,18 +60,20 @@ export function isAllowedOrigin(
 }
 
 /**
- * CORS headers for a request origin. Returns {} when there is no Origin
- * header at all. A present-but-disallowed origin still gets `Vary: Origin`
- * (caches must not conflate the two verdicts) but no Allow-Origin grant —
- * the request is still served with same-origin semantics. Never emits `*`
- * and never sets Allow-Credentials.
+ * CORS headers for a request origin. Every verdict carries `Vary: Origin` —
+ * even when this request sent no Origin at all — because the response varies
+ * by origin (allowed→grant, disallowed→no grant) and shared caches must key
+ * on it to avoid serving a cached grant (or lack of one) to the wrong
+ * origin. Only allowlisted origins get the Allow-Origin grant; anything else
+ * is served with same-origin semantics. Never emits `*` and never sets
+ * Allow-Credentials.
  */
 export function corsHeaders(
   origin: string | null,
   env: Record<string, string | undefined> = process.env,
 ): Record<string, string> {
   if (!origin || origin.trim() === "") {
-    return {};
+    return { Vary: "Origin" };
   }
   const trimmed = origin.trim();
   if (!isAllowedOrigin(trimmed, env)) {
@@ -107,10 +109,10 @@ function mergeVary(headers: Headers, value: string): void {
 }
 
 /**
- * Stamp CORS grant headers onto an existing Headers. Vary merges (never
- * clobbers a handler-set value); everything else sets. Effectively a no-op
- * for the grant when the origin is absent or disallowed — except Vary, which
- * is always stamped when an Origin was sent.
+ * Stamp CORS headers onto an existing Headers. Vary merges (never clobbers
+ * a handler-set value) and is always present afterwards — caches must key
+ * on Origin regardless of this request's verdict. The Allow-Origin grant
+ * applies only for allowlisted origins. Never `*`, no credentials.
  */
 export function applyCorsHeaders(
   headers: Headers,
