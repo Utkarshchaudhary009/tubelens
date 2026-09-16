@@ -508,7 +508,7 @@ principal model.
 
 ## Phase 08 — Input schema and request-size validation
 
-**Status:** `[~]` in progress.
+**Status:** `[x]` done — shipped via PR #26 (merged 2026-09-16): centralized bounds in `validate.ts` (q 200, cursor 2048, url 4000, body 100KB streamed UTF-8 bytes with 413 on overrun) enforced before cache/upstream on every route, legacy limit-clamp/region-fallback/error shapes preserved, with 841 unit tests + e2e PASS on live upstream.
 
 **Build:** Standardize Zod/request schema validation before business logic. Bound query lengths, pagination, limits, batch sizes, URL lengths, numeric ranges, enum values, request bodies, and any user-controlled filtering. Normalize input once and pass validated types downstream. Reject malformed payloads before expensive work or upstream calls.
 
