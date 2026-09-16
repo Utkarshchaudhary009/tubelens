@@ -39,23 +39,28 @@ jobs:
         run: |
           set -u
           scan() {
-            desc="$1"; pattern="$2"
+            desc="$1"; pattern="$2"; hits=0
+            # Per-file loop prints only file + line metadata, never matched
+            # text — a detected leak must not itself leak into Actions logs.
             # NUL-delimited throughout so filenames with spaces survive;
             # xargs -r runs nothing on an empty list (grep would otherwise
             # read stdin and hang); `--` guards patterns starting with `-`.
-            hits="$(git ls-files -z | grep -zv '__tests__' | grep -zv '\.test\.' | xargs -0r grep -nE -- "$pattern" 2>/dev/null || true)"
-            if [ -z "$hits" ]; then
-              echo "secret-scan OK: $desc"
-              return 0
-            fi
-            # Drop documentation/placeholder lines (mirrors isPlaceholderLine).
-            hits="$(printf '%s\n' "$hits" | grep -viE '<|USER|PASSWORD|HOST|example|YOUR_|changeme|placeholder|\.\.\.|\$\{\{|secrets\.|process\.env' || true)"
-            # The unicode ellipsis cannot sit in the bracket above in some
-            # locales, so filter it explicitly as well.
-            hits="$(printf '%s\n' "$hits" | grep -v '…' || true)"
-            if [ -n "$hits" ]; then
-              echo "secret-scan FAIL: $desc"
-              printf '%s\n' "$hits" | cut -c1-160
+            while IFS= read -r -d '' file; do
+              matches="$(grep -nE -- "$pattern" "$file" 2>/dev/null || true)"
+              [ -z "$matches" ] && continue
+              # Drop documentation/placeholder lines (mirrors
+              # isPlaceholderLine in src/lib/redact.ts).
+              matches="$(printf '%s\n' "$matches" | grep -viE '<|YOUR_|\b(USER|PASSWORD|HOST|example)\b|changeme|placeholder|\.\.\.|\$\{\{|secrets\.' || true)"
+              # The unicode ellipsis cannot sit in the bracket above in some
+              # locales, so filter it explicitly as well.
+              matches="$(printf '%s\n' "$matches" | grep -v '…' || true)"
+              [ -z "$matches" ] && continue
+              lines="$(printf '%s\n' "$matches" | cut -d: -f1 | paste -sd' ' -)"
+              echo "secret-scan HIT: $desc :: $file :: line(s) $lines"
+              hits=$((hits + 1))
+            done < <(git ls-files -z | grep -zv '__tests__' | grep -zv '\.test\.')
+            if [ "$hits" -gt 0 ]; then
+              echo "secret-scan FAIL: $desc ($hits file(s) with matches)"
               return 1
             fi
             echo "secret-scan OK: $desc"

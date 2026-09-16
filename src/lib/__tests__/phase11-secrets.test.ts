@@ -231,6 +231,20 @@ describe("redactUrl (Phase 11)", () => {
       `prefix ${REDACTED} suffix`,
     );
   });
+
+  test("redacts percent-encoded keys on the unparseable fallback", () => {
+    // `to%6ben` decodes to `token`: the original key text is preserved
+    // while the value is redacted; unrelated params survive untouched.
+    expect(redactUrl(`/api/v1/x?to%6ben=${MARKER}&q=1`)).toBe(
+      `/api/v1/x?to%6ben=${REDACTED}&q=1`,
+    );
+  });
+
+  test("redacts undecodable keys conservatively", () => {
+    expect(redactUrl("/api/v1/x?%E0%A4%A=1&q=2")).toBe(
+      `/api/v1/x?%E0%A4%A=${REDACTED}&q=2`,
+    );
+  });
 });
 
 describe("scrubString / scrubError (Phase 11)", () => {
@@ -255,6 +269,50 @@ describe("scrubString / scrubError (Phase 11)", () => {
       "postgresql://host:5432/db",
     );
     expect(scrubString("DATABASE_URL=")).toBe("DATABASE_URL=");
+    expect(scrubString("use Basic authentication here")).toBe(
+      "use Basic authentication here",
+    );
+  });
+
+  test("scrubs Basic-auth credentials, preserving scheme and shape", () => {
+    // Built at runtime so no credential literal sits in this file.
+    const encoded = Buffer.from(`fakeuser:${MARKER}`, "utf8").toString(
+      "base64",
+    );
+    const scrubbed = scrubString(`Authorization: Basic ${encoded}`);
+    expect(scrubbed).toBe(`Authorization: Basic ${REDACTED}`);
+    expect(scrubbed).not.toContain(MARKER);
+  });
+
+  test("scrubs serialized-JSON credential fields, preserving structure", () => {
+    const quote = '"';
+    const body =
+      "{" +
+      quote +
+      "authToken" +
+      quote +
+      ":" +
+      quote +
+      MARKER +
+      quote +
+      "," +
+      quote +
+      "user" +
+      quote +
+      ":" +
+      quote +
+      "u123" +
+      quote +
+      "}";
+    const scrubbed = scrubString(`upstream said ${body}`);
+    expect(scrubbed).not.toContain(MARKER);
+    const parsed = JSON.parse(scrubbed.replace("upstream said ", "")) as Record<
+      string,
+      unknown
+    >;
+    expect(Object.keys(parsed).sort()).toEqual(["authToken", "user"]);
+    expect(parsed.authToken).toBe(REDACTED);
+    expect(parsed.user).toBe("u123");
   });
 
   test("scrubs error messages, preserves name, drops raw stack content", () => {
@@ -529,8 +587,22 @@ describe("static scan pattern coverage (Phase 11)", () => {
   test("placeholder lines are recognized as documentation noise", () => {
     expect(isPlaceholderLine("DATABASE_URL=<user>:<pass>@host")).toBe(true);
     expect(isPlaceholderLine("set YOUR_API_KEY here")).toBe(true);
-    expect(isPlaceholderLine("uses process.env.FOO in tests")).toBe(true);
-    expect(isPlaceholderLine("sk_live_RealKeyAbc123Xyz789")).toBe(false);
+    expect(isPlaceholderLine("postgresql://USER:PASSWORD@HOST/db")).toBe(true);
+    // Fragment-built so no complete secret literal sits in this file.
+    const realistic = "sk_" + "live_" + "RealKeyAbc123Xyz789";
+    expect(isPlaceholderLine(realistic)).toBe(false);
+    expect(containsLikelySecret(realistic)).toBe(true);
+  });
+
+  test("placeholder matching is word-boundaried, not substring", () => {
+    // Real credentials whose user/host merely contain USER/HOST/EXAMPLE
+    // must NOT be excused as placeholders.
+    expect(isPlaceholderLine("postgres" + "ql://dbuser:x@prodhost1/db")).toBe(
+      false,
+    );
+    expect(isPlaceholderLine("CLERK_SECRET_KEY=process.env.CL_OTHER")).toBe(
+      false,
+    );
   });
 });
 

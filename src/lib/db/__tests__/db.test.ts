@@ -350,10 +350,12 @@ describe("secret scan", () => {
       } catch {
         continue;
       }
-      for (const line of text.split("\n")) {
+      for (const [idx, line] of text.split("\n").entries()) {
         credentialUrl.lastIndex = 0;
         if (credentialUrl.test(line) && !isPlaceholderLine(line)) {
-          hits.push(`${file}: ${line.trim().slice(0, 80)}`);
+          // Location metadata only — never the matched text, so a failure
+          // cannot print credential content into test output.
+          hits.push(`${file}:${idx + 1} [credential-url]`);
         }
       }
     }
@@ -380,7 +382,7 @@ describe("secret scan", () => {
       } catch {
         continue;
       }
-      for (const line of text.split("\n")) {
+      for (const [idx, line] of text.split("\n").entries()) {
         if (isPlaceholderLine(line)) {
           continue;
         }
@@ -390,7 +392,9 @@ describe("secret scan", () => {
             return pattern.test(line);
           })
         ) {
-          hits.push(`${file}: ${line.trim().slice(0, 80)}`);
+          // Location metadata only — never the matched text, so a failure
+          // cannot print credential content into test output.
+          hits.push(`${file}:${idx + 1} [secret-value]`);
         }
       }
     }

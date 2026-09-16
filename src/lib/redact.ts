@@ -67,6 +67,19 @@ const SCRUB_RULES: Array<[RegExp, string]> = [
     /\bBearer\s+[A-Za-z0-9._~+/-]{8,}(?![A-Za-z0-9._~+/-=])/g,
     `Bearer ${REDACTED}`,
   ],
+  // Basic-auth credentials. The lookahead requires a digit or base64
+  // symbol somewhere in the token so prose like `Basic authentication`
+  // survives while real base64 credentials are redacted.
+  [
+    /\bBasic\s+(?=[A-Za-z0-9+/]*[0-9+/=])[A-Za-z0-9+/]{8,}={0,2}(?![A-Za-z0-9+/=])/g,
+    `Basic ${REDACTED}`,
+  ],
+  // Serialized-JSON credential fields (`"authToken":"…"`, `"password":"…"`).
+  // The field name and JSON structure survive; only the value is redacted.
+  [
+    /("(?:authToken|apiKey|api_key|accessToken|token|password|passwd|secret|clientSecret)")\s*:\s*"[^"]*"/g,
+    `$1:"${REDACTED}"`,
+  ],
 ];
 
 /**
@@ -274,7 +287,15 @@ function redactPairs(pairs: string): string {
         return part;
       }
       const key = part.slice(0, eq);
-      return isSensitiveKey(key) ? `${key}=${REDACTED}` : part;
+      let checkKey = key;
+      try {
+        checkKey = decodeURIComponent(key);
+      } catch {
+        // Undecodable keys redact conservatively rather than leaking
+        // through unexamined; the original key text is preserved.
+        return `${key}=${REDACTED}`;
+      }
+      return isSensitiveKey(checkKey) ? `${key}=${REDACTED}` : part;
     })
     .join("&");
 }
@@ -344,16 +365,20 @@ export const SECRET_SCAN_PATTERNS: readonly RegExp[] = [
 ];
 
 /**
- * Placeholder/empty markers that prove a matched line is documentation or a
- * fixture, not a credential: template brackets, well-known placeholder
- * words, ellipsis, workflow secret references (`${{ secrets.… }}`), and
- * `process.env` test assignments. Deliberately NOT word-matching
- * test/fake/mock — committed test-mode keys literally contain those
- * substrings, so excluding them would blind the scan; test *files* are
- * excluded by path instead (see the db.test.ts scan + CI job).
+ * Placeholder markers that prove a matched line is documentation, not a
+ * credential: template brackets (`<user>`), `YOUR_`-style template names,
+ * standalone `USER`/`PASSWORD`/`HOST`/`example` words (word-boundaried, so
+ * `dbuser`/`prodhost1`/`myexamplehost` in real credentials still match),
+ * well-known placeholder words, ellipsis, and workflow secret references
+ * (`${{ secrets.… }}`). Deliberately NOT matching `process.env` (an
+ * assignment is an assignment — a `process.env` mention must not excuse a
+ * committed value) and NOT word-matching test/fake/mock — committed
+ * test-mode keys literally contain those substrings, so excluding them
+ * would blind the scan; test *files* are excluded by path instead (see the
+ * db.test.ts scan + CI job).
  */
 export const PLACEHOLDER_PATTERN =
-  /<|USER|PASSWORD|HOST|example|YOUR_|changeme|placeholder|\.\.\.|…|\$\{\{|secrets\.|process\.env/i;
+  /<|YOUR_|\b(USER|PASSWORD|HOST|example)\b|changeme|placeholder|\.\.\.|…|\$\{\{|secrets\./i;
 
 /** True when a matched line is documentation/fixture noise, not a leak. */
 export function isPlaceholderLine(line: string): boolean {
