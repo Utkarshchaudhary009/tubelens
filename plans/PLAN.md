@@ -528,7 +528,7 @@ principal model.
 
 ## Phase 10 — SSRF and outbound-request boundary
 
-**Status:** `[ ]` not started.
+**Status:** `[x]` done — shipped via PR #28 (merged 2026-09-16): `src/lib/safe-fetch.ts` boundary (https-only, allowlist pin, loopback/RFC1918/link-local/metadata blocks, decimal/octal/hex IP decoding, credentialed-URL rejection, default DNS pinning fail-closed, manual redirects re-validated per hop, 8s fail-fast) migrated across community/audio/transcript/batch/tunnel call sites, with 909 unit tests + e2e PASS on live upstream. Note: connection-level DNS-rebinding pinning documented as residual (global fetch has no lookup hook; all prod hostnames are fixed allowlist entries).
 
 **Build:** Audit every feature that accepts or constructs URLs. For arbitrary user-supplied URLs, apply strict allowlisting/validation and block loopback, private, link-local, metadata-service, and other internal destinations where applicable. Prefer fixed upstream hostnames for TubeLens-owned integrations. Put outbound requests behind one safe client abstraction with timeout and redirect rules.
 
