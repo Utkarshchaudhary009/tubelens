@@ -518,7 +518,7 @@ principal model.
 
 ## Phase 09 — HTTP and security-header hardening
 
-**Status:** `[ ]` not started.
+**Status:** `[x]` done — shipped via PR #27 (merged 2026-09-16): centralized security baseline (nosniff, DENY, no-referrer, Permissions-Policy, API CSP, HSTS) on every /api/v1 success/error/raw response, allowlist-only CORS via `TUBELENS_ALLOWED_ORIGINS` (never `*`, always `Vary: Origin`) with central OPTIONS preflight, typed JSON 404 `[[...notFound]]` catch-all, with 879 unit tests + e2e PASS on live upstream.
 
 **Build:** Establish deliberate API HTTP behavior for content types, HSTS where appropriate for production, `X-Content-Type-Options`, cache controls, CORS, and other applicable security headers. Avoid permissive wildcard CORS for authenticated browser flows unless explicitly justified. Ensure API endpoints do not accidentally render framework HTML error pages.
 
