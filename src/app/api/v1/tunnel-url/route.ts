@@ -1,6 +1,7 @@
 import type { NextRequest } from "next/server";
 import { CACHE_CONTROL, getRequestId, successResponse } from "@/lib/envelope";
 import { errorResponse } from "@/lib/errors";
+import { safeFetch } from "@/lib/safe-fetch";
 import {
   handleTunnelGet,
   handleTunnelWrite,
@@ -40,9 +41,13 @@ const blobStore: TunnelStore = {
     }
     // Content still comes from the CDN URL, so bust the edge cache: unique
     // query per read + explicit no-cache request headers + no-store mode.
+    // The stored Blob URL is re-validated through the SSRF boundary (https +
+    // Vercel Blob host allowlist, redirect hops re-checked) before fetching:
+    // a poisoned pointer can never pull the read off-host.
     const sep = url.includes("?") ? "&" : "?";
-    const res = await fetch(`${url}${sep}t=${Date.now()}`, {
-      signal: AbortSignal.timeout(8000),
+    const res = await safeFetch(`${url}${sep}t=${Date.now()}`, {
+      allowHosts: [/\.blob\.vercel-storage\.com$/],
+      timeoutMs: 8000,
       cache: "no-store",
       headers: { "Cache-Control": "no-cache", Pragma: "no-cache" },
     });

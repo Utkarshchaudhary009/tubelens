@@ -1,5 +1,6 @@
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
+import { isLoopbackHost, safeFetch } from "@/lib/safe-fetch";
 import { isT3PairingUrl } from "@/lib/tunnel-url";
 
 // /dev/t3 — bounce the browser straight into the live T3 remote-dev session.
@@ -39,9 +40,23 @@ async function getPairingRecord(): Promise<TunnelSlotPayload["data"]> {
     h.get("x-forwarded-proto")?.split(",")[0]?.trim() ||
     (process.env.NODE_ENV === "development" ? "http" : "https");
   try {
-    const res = await fetch(`${proto}://${host}/api/v1/tunnel-url?name=t3`, {
+    // SSRF boundary (Part B Phase 10): the target host comes from request
+    // headers, so the read is pinned to that first-hop host and every
+    // redirect hop re-validates against it. Loopback http is allowed for
+    // local dev only (mirrors the proto selection below).
+    const target = `${proto}://${host}/api/v1/tunnel-url?name=t3`;
+    let targetHost: string;
+    try {
+      targetHost = new URL(target).hostname.toLowerCase();
+    } catch {
+      return null;
+    }
+    const res = await safeFetch(target, {
+      allowHosts: [targetHost],
+      allowLoopback:
+        process.env.NODE_ENV !== "production" && isLoopbackHost(targetHost),
+      timeoutMs: 8000,
       cache: "no-store",
-      signal: AbortSignal.timeout(8000),
     });
     if (!res.ok) {
       return null;
