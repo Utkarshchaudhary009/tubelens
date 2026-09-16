@@ -388,14 +388,18 @@ describe("phase 08 readBoundedJson", () => {
   test("oversize verdict is sticky when cancel rejects", async () => {
     // A hostile stream that crosses the cap, then fails cancel(): the body
     // is already known-oversize, so the result must stay 413, never
-    // downgrade to 400 invalid_body.
+    // downgrade to 400 invalid_body. The stream is deliberately left OPEN
+    // (no close in start): closing it would let reader.cancel() resolve
+    // without invoking source cancel, and the sticky catch path would never
+    // run — the cancelCalled flag below proves it genuinely did.
     const enc = new TextEncoder();
+    let cancelCalled = false;
     const stream = new ReadableStream<Uint8Array>({
       start(c) {
         c.enqueue(enc.encode(`{"pad":"${"x".repeat(MAX_BODY_BYTES)}"}`));
-        c.close();
       },
       cancel() {
+        cancelCalled = true;
         return Promise.reject(new Error("cancel boom"));
       },
     });
@@ -406,6 +410,7 @@ describe("phase 08 readBoundedJson", () => {
       duplex: "half",
     });
     const res = await readBoundedJson(req);
+    expect(cancelCalled).toBe(true);
     expect(res.ok).toBe(false);
     if (!res.ok) {
       expect(res.error.code).toBe("body_too_large");
@@ -438,6 +443,21 @@ describe("phase 08 readBoundedJson", () => {
       headers: {
         "content-type": "application/json",
         "content-length": "100abc",
+        "x-request-id": "p8",
+      },
+      body: '{"requests":[]}',
+    });
+    const res = await readBoundedJson(req);
+    expect(res).toEqual({ ok: true, value: { requests: [] } });
+  });
+
+  test("leading-zero Content-Length is judged by numeric value, not digits", async () => {
+    // "0000100" is 7 digits but numerically 100 ≤ cap — must not fast-reject.
+    const req = new NextRequest("http://x/api/v1/batch", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "content-length": "0000100",
         "x-request-id": "p8",
       },
       body: '{"requests":[]}',

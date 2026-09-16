@@ -330,7 +330,8 @@ export interface BoundedJsonOptions {
  * Bounded replacement for unbounded `req.json()`. Pre-checks the
  * Content-Length header when present (413 without reading the stream;
  * unparseable/negative values are treated as absent, while huge all-decimal
- * values are rejected by digit length before Number precision matters), else
+ * values are rejected by digit length — leading zeros stripped first — before
+ * Number precision matters), else
  * streams the body through a reader with a running UTF-8 byte counter — the
  * reader is cancelled the moment the cap is exceeded, so a spoofed
  * small/absent Content-Length can never force full allocation of a huge
@@ -352,7 +353,9 @@ export async function readBoundedJson(
     const trimmed = declared.trim();
     // Any decimal integer with >6 digits is >= 1_000_000 > cap — reject
     // without parsing, so values overflowing Number precision still 413.
-    if (/^\d+$/.test(trimmed) && trimmed.length > 6) {
+    // Leading zeros are stripped first ("0000100" is 100, not oversize).
+    const digits = trimmed.replace(/^0+(?=\d)/, "");
+    if (/^\d+$/.test(trimmed) && digits.length > 6) {
       return { ok: false, error: bodyTooLargeError() };
     }
     const n = Number.parseInt(trimmed, 10);
