@@ -44,6 +44,7 @@ import { errorResponse } from "@/lib/errors";
 import { mapSearchItem, type SearchResultDTO } from "@/lib/mappers";
 import {
   DEFAULT_LIMIT,
+  parseBoundedCursor,
   parseLang,
   parseLimit,
   parseRegion,
@@ -178,8 +179,13 @@ export async function handleFeed(
   const scope = feedScope(kind);
 
   // Cursor requests skip re-fetching page 1 — only limit/region/lang apply.
-  // Unknown/expired cursors yield [] + next: null, never an error.
-  const cursor = params.get("cursor");
+  // Unknown/expired cursors yield [] + next: null, never an error. An
+  // overlong cursor is rejected BEFORE any cache/upstream work.
+  const cursorCheck = parseBoundedCursor(params.get("cursor"));
+  if (!cursorCheck.ok) {
+    return errorResponse(requestId, { ...cursorCheck.error });
+  }
+  const cursor = cursorCheck.value;
   if (cursor) {
     return serveFeedContinuation(
       requestId,

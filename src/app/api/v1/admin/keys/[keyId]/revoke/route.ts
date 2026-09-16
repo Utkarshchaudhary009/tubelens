@@ -21,6 +21,7 @@ import { clerkAuthProvider } from "@/lib/clerk-auth";
 import { CACHE_CONTROL, successResponse } from "@/lib/envelope";
 import { errorResponse } from "@/lib/errors";
 import { withRequestContext } from "@/lib/pipeline";
+import { readBoundedJson } from "@/lib/validate";
 
 export const runtime = "nodejs";
 
@@ -39,14 +40,13 @@ export async function POST(
   return withRequestContext(
     async (r, c) => {
       // The body is optional (bare `POST` revokes without a reason): an
-      // empty body normalizes to `{}`, malformed JSON is 400.
-      let rawBody: unknown = {};
-      try {
-        const text = await r.text();
-        if (text.trim() !== "") {
-          rawBody = JSON.parse(text);
+      // empty body normalizes to `{}`, malformed JSON is 400, oversized is
+      // 413 — all decided by the bounded reader before any Clerk call.
+      const body = await readBoundedJson(r, { emptyValue: {} });
+      if (!body.ok) {
+        if (body.error.code === "body_too_large") {
+          return errorResponse(c.requestId, { ...body.error });
         }
-      } catch {
         return errorResponse(c.requestId, {
           code: "invalid_body",
           message: "Request body must be valid JSON.",
@@ -54,6 +54,7 @@ export async function POST(
           status: 400,
         });
       }
+      const rawBody: unknown = body.value;
       return handleAdminKeysRevoke(c.requestId, c.auth, keyId, rawBody);
     },
     { auth: clerkAuthProvider },

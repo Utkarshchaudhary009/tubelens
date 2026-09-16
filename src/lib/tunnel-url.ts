@@ -2,6 +2,7 @@ import type { NextRequest } from "next/server";
 import { z } from "zod";
 import { CACHE_CONTROL, getRequestId, successResponse } from "./envelope";
 import { errorResponse } from "./errors";
+import { readBoundedJson } from "./validate";
 
 // Throwaway tunnel pointers stored in Vercel Blob as `tunnel-url-<name>.json`
 // (one blob per named slot). The GitHub Action publishes the current
@@ -179,10 +180,13 @@ export async function handleTunnelWrite(req: NextRequest, deps: TunnelDeps) {
       status: 401,
     });
   }
-  let raw: unknown;
-  try {
-    raw = await req.json();
-  } catch {
+  // Bounded pre-parse: oversized bodies are 413 before JSON.parse ever runs;
+  // anything else malformed keeps the legacy invalid_body shape below.
+  const body = await readBoundedJson(req);
+  if (!body.ok) {
+    if (body.error.code === "body_too_large") {
+      return errorResponse(requestId, { ...body.error });
+    }
     return errorResponse(requestId, {
       code: "invalid_body",
       message: "Request body must be valid JSON.",
@@ -190,6 +194,7 @@ export async function handleTunnelWrite(req: NextRequest, deps: TunnelDeps) {
       status: 400,
     });
   }
+  const raw: unknown = body.value;
   // `name` is required with no default: prefer the body field, accept the
   // ?name= query param as an alternative. Missing → 400 missing_name,
   // unknown value → 400 invalid_name.

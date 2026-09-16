@@ -508,7 +508,7 @@ principal model.
 
 ## Phase 08 — Input schema and request-size validation
 
-**Status:** `[ ]` not started.
+**Status:** `[~]` in progress.
 
 **Build:** Standardize Zod/request schema validation before business logic. Bound query lengths, pagination, limits, batch sizes, URL lengths, numeric ranges, enum values, request bodies, and any user-controlled filtering. Normalize input once and pass validated types downstream. Reject malformed payloads before expensive work or upstream calls.
 

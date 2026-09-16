@@ -22,6 +22,7 @@ import { errorResponse } from "@/lib/errors";
 import { type Thumbnail, textOf } from "@/lib/mappers";
 import {
   DEFAULT_LIMIT,
+  parseBoundedCursor,
   parseLang,
   parseLimit,
   parseRegion,
@@ -863,7 +864,12 @@ export async function handlePlaylistFeed(
     return invalidLimitResponse(requestId);
   }
 
-  const cursor = params.get("cursor");
+  // Overlong cursors are rejected BEFORE any cache/upstream work below.
+  const cursorCheck = parseBoundedCursor(params.get("cursor"));
+  if (!cursorCheck.ok) {
+    return errorResponse(requestId, { ...cursorCheck.error });
+  }
+  const cursor = cursorCheck.value;
 
   try {
     const playlistId = parsed.value.value;
@@ -1067,7 +1073,13 @@ export async function handleChannelPlaylists(
     return invalidLimitResponse(requestId);
   }
 
-  const cursor = params.get("cursor");
+  // Overlong cursors are rejected BEFORE the channel-address resolution
+  // (upstream) and any cache work below.
+  const cursorCheck = parseBoundedCursor(params.get("cursor"));
+  if (!cursorCheck.ok) {
+    return errorResponse(requestId, { ...cursorCheck.error });
+  }
+  const cursor = cursorCheck.value;
 
   // Channel-address failures (bad id/handle, unknown channel) keep the
   // Phase 4 channel error shapes; playlist-feed failures use the playlist

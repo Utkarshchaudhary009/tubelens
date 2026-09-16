@@ -38,6 +38,7 @@ import {
 } from "@/lib/mappers";
 import {
   isPlausibleVideoId,
+  parseBoundedCursor,
   parseLang,
   parseLimit,
   parseRegion,
@@ -985,7 +986,12 @@ export async function handleRadio(
   }
 
   const scope = `radio:${id}`;
-  const cursor = params.get("cursor");
+  // An overlong cursor is rejected BEFORE any cache/upstream work.
+  const cursorCheck = parseBoundedCursor(params.get("cursor"));
+  if (!cursorCheck.ok) {
+    return errorResponse(requestId, { ...cursorCheck.error });
+  }
+  const cursor = cursorCheck.value;
   if (cursor) {
     return serveRadioCursor(requestId, region, lang, scope, cursor, limit);
   }

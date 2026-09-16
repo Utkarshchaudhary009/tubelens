@@ -21,6 +21,7 @@ import { errorResponse } from "@/lib/errors";
 import { type Thumbnail, textOf } from "@/lib/mappers";
 import {
   DEFAULT_LIMIT,
+  parseBoundedCursor,
   parseLang,
   parseLimit,
   parseRegion,
@@ -960,7 +961,13 @@ export async function handleChannelFeed(
   }
 
   const mapItem = feedMapper(kind);
-  const cursor = params.get("cursor");
+  // Overlong cursors are rejected BEFORE the channel-address resolution
+  // (upstream) and any cache work below.
+  const cursorCheck = parseBoundedCursor(params.get("cursor"));
+  if (!cursorCheck.ok) {
+    return errorResponse(requestId, { ...cursorCheck.error });
+  }
+  const cursor = cursorCheck.value;
 
   try {
     // Resolve first so scope + cache key are always the canonical UC id —
