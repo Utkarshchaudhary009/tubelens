@@ -1625,8 +1625,7 @@ export function buildOpenApiDocument() {
               content: { "application/json": { schema: { $ref: errorRef } } },
             },
             401: {
-              description:
-                "unauthorized; missing or invalid bearer token.",
+              description: "unauthorized; missing or invalid bearer token.",
               content: { "application/json": { schema: { $ref: errorRef } } },
             },
             429: rateLimitedResponse,
