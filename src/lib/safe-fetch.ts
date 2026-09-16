@@ -31,9 +31,9 @@
 //   credentials must never ride an outbound fetch;
 // - DNS pinning on every non-literal hop via node:dns (default; overridable
 //   with `resolveFn`, skippable with `resolveFn: null` for injected test
-//   transports): a hostname resolving to a blocked IP — or failing to
-//   resolve at all — throws before any socket opens, closing the
-//   DNS-rebinding window between check and fetch as far as a pre-check can;
+//   transports): raced against the hop's composed budget signal, so a
+//   stalled resolver cannot exceed it; a hostname resolving to a blocked IP
+//   — or failing to resolve at all — throws before any socket opens;
 
 import { lookup } from "node:dns/promises";
 
@@ -63,6 +63,16 @@ export type SafeFetchFn = (
   init?: RequestInit,
 ) => Promise<SafeFetchResponse>;
 
+/**
+ * DNS lookup: hostname -> resolved IP strings. Receives the hop's composed
+ * abort signal; resolvers should stop work when it fires (extra parameters
+ * are optional, so existing single-arg stubs keep working).
+ */
+export type ResolveFn = (
+  hostname: string,
+  signal?: AbortSignal,
+) => Promise<string[]>;
+
 export interface SafeFetchOptions {
   /** Pinned destination hosts: exact (case-insensitive), leading-dot suffix
    * (".example.com" matches "example.com" + subdomains), or RegExp. */
@@ -70,7 +80,8 @@ export interface SafeFetchOptions {
   /** Permit loopback literals/names (+ http for those only). Batch local-dev
    * origins only — default false. */
   allowLoopback?: boolean;
-  /** Per-hop fail-fast budget (default 8000, matching the route checklist). */
+  /** Per-hop fail-fast budget (default 8000, matching the route checklist).
+   * Bounds the whole hop: DNS validation first, then the fetch. */
   timeoutMs?: number;
   /** Max redirect hops followed (default 3); exceeding throws. */
   maxRedirects?: number;
@@ -86,7 +97,7 @@ export interface SafeFetchOptions {
    * (default) uses node:dns/promises `lookup` (fail closed on error);
    * pass `null` to skip DNS validation (injected test transports only —
    * production callers must not skip). */
-  resolveFn?: ((hostname: string) => Promise<string[]>) | null;
+  resolveFn?: ResolveFn | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -486,12 +497,51 @@ const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
  * transport wiring can pass it through; safeFetch uses it whenever
  * `resolveFn` is left `undefined`.
  */
-export async function dnsResolve(hostname: string): Promise<string[]> {
-  const records = await lookup(hostname, { all: true });
+export async function dnsResolve(
+  hostname: string,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const records = await resolveWithSignal(
+    lookup(hostname, { all: true }),
+    signal,
+  );
   return records.map((r) => r.address);
 }
 
-async function checkUrl(raw: string, opts: SafeFetchOptions): Promise<URL> {
+/** Races a task against an abort signal (node:dns has no signal hook). */
+function resolveWithSignal<T>(
+  task: Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (!signal) {
+    return task;
+  }
+  if (signal.aborted) {
+    return Promise.reject(abortError());
+  }
+  let onAbort: (() => void) | undefined;
+  const gate = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(abortError());
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  return Promise.race([task, gate]).finally(() => {
+    if (onAbort) {
+      signal.removeEventListener("abort", onAbort);
+    }
+  });
+}
+
+function abortError(): Error {
+  return Object.assign(new Error("DNS lookup aborted (hop budget)"), {
+    name: "AbortError",
+  });
+}
+
+async function checkUrl(
+  raw: string,
+  opts: SafeFetchOptions,
+  signal?: AbortSignal,
+): Promise<URL> {
   let url: URL;
   try {
     url = new URL(raw);
@@ -523,13 +573,19 @@ async function checkUrl(raw: string, opts: SafeFetchOptions): Promise<URL> {
   }
   // DNS pinning (skipped for IP literals — already validated above — and
   // for `resolveFn: null` test transports). Default is a real node:dns
-  // lookup; any failure fails closed since the destination is unverifiable.
+  // lookup raced against the hop's composed signal, so a stalled resolver
+  // cannot exceed the per-hop budget or an outer shared deadline; any
+  // failure fails closed since the destination is unverifiable.
+  // NOTE (residual TOCTOU): the validated address is not pinned to the
+  // connection — global fetch performs its own lookup. Connection-level
+  // pinning (custom dispatcher/connect hook) was deemed disproportionate:
+  // prod hostnames are fixed allowlist entries or our own origin.
   const isLiteral = parseIPv4Literal(host) !== null || host.includes(":");
   if (!isLiteral && opts.resolveFn !== null) {
     const resolve = opts.resolveFn ?? dnsResolve;
     let addrs: string[];
     try {
-      addrs = await resolve(host);
+      addrs = await resolveWithSignal(resolve(host, signal), signal);
     } catch {
       // Unverifiable destination: fail closed.
       throw new SsrfBlockedError("destination unverifiable");
@@ -565,18 +621,24 @@ export async function safeFetch(
   let method = (opts.method ?? "GET").toUpperCase();
   let body = opts.body ?? undefined;
   // Bounded hop loop (maxRedirects + 1 fetches max): provably terminating,
-  // no unbounded redirect chasing.
+  // no unbounded redirect chasing. The per-hop timeout is created BEFORE
+  // validation so DNS stalling counts against the same budget as the fetch;
+  // it resets every hop (redirect chains re-spend it) while an outer
+  // opts.signal spans the whole chain.
   for (let hop = 0; hop <= maxRedirects; hop += 1) {
-    const url = await checkUrl(current, opts);
-    const fetchFn = opts.fetchFn ?? globalThis.fetch;
     const timeout = AbortSignal.timeout(timeoutMs);
+    const signal = opts.signal
+      ? AbortSignal.any([timeout, opts.signal])
+      : timeout;
+    const url = await checkUrl(current, opts, signal);
+    const fetchFn = opts.fetchFn ?? globalThis.fetch;
     const res = await fetchFn(url.href, {
       method,
       headers: opts.headers,
       body,
       cache: opts.cache,
       redirect: "manual",
-      signal: opts.signal ? AbortSignal.any([timeout, opts.signal]) : timeout,
+      signal,
     });
     const location = res.headers.get("location");
     if (!REDIRECT_STATUS.has(res.status) || !location) {

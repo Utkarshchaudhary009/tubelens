@@ -13,6 +13,7 @@ import {
   type TranscriptSegmentDTO,
 } from "./mappers";
 import {
+  type ResolveFn,
   type SafeFetchFn,
   type SafeFetchResponse,
   safeFetch,
@@ -471,7 +472,7 @@ export interface TranscriptRunnerDeps {
    * the production route passes `dnsResolve` explicitly. Tests with injected
    * transports pass the documented `null` skip sentinel to stay
    * offline-deterministic under bun:test. */
-  resolveFn?: ((hostname: string) => Promise<string[]>) | null;
+  resolveFn?: ResolveFn | null;
   env?: Record<string, string | undefined>;
   now?: () => number;
   /** Single overall fail-fast budget; per-provider caps clamp to remaining. */
@@ -837,6 +838,10 @@ async function runHttpProvider(
   const res = await safeFetch(endpoint, {
     allowHosts: pin.length > 0 ? pin : TRANSCRIPT_PROVIDER_HOSTS,
     timeoutMs: stepMs,
+    // Absolute step deadline: safeFetch composes it with the per-hop
+    // timeout, so a redirect chain cannot re-spend stepMs per hop and
+    // overrun the waterfall budget.
+    signal: AbortSignal.timeout(stepMs),
     method: def.method,
     headers,
     body: rawBody,
@@ -963,9 +968,13 @@ async function runVttPayload(
     } catch {
       listingHosts = TRANSCRIPT_PROVIDER_HOSTS;
     }
+    // Remaining step budget as BOTH the per-hop timeout and the absolute
+    // signal (same bounding rationale as the listing call above).
+    const trackBudget = remainingStepMs();
     const trackRes = await safeFetch(absolute, {
       allowHosts: listingHosts,
-      timeoutMs: remainingStepMs(),
+      timeoutMs: trackBudget,
+      signal: AbortSignal.timeout(trackBudget),
       fetchFn: adaptFetchLike(fetchFn),
       resolveFn,
     });

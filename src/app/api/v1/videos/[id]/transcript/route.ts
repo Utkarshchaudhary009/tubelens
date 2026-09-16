@@ -7,7 +7,7 @@ import {
   mapTranscriptInfo,
   type TranscriptSegmentDTO,
 } from "@/lib/mappers";
-import { dnsResolve } from "@/lib/safe-fetch";
+import { dnsResolve, type ResolveFn } from "@/lib/safe-fetch";
 import {
   type FetchLike,
   runTranscriptWaterfall,
@@ -36,7 +36,7 @@ export interface TranscriptDeps {
    * stays offline-deterministic — or pass the documented `null` skip
    * sentinel / an explicit stub.
    */
-  resolveFn?: ((hostname: string) => Promise<string[]>) | null;
+  resolveFn?: ResolveFn | null;
   /**
    * Single overall fail-fast budget wrapper (default: lib/youtube
    * withTimeout, lazily imported). Injectable so unit tests never touch the

@@ -56,6 +56,9 @@ const publicDns = async () => ["93.184.216.34"];
 
 const ok = (text = "ok"): Response => new Response(text, { status: 200 });
 
+const sleep = (ms: number): Promise<void> =>
+  new Promise<void>((r) => setTimeout(r, ms));
+
 const redirectTo = (location: string, status = 302): Response =>
   new Response(null, { status, headers: { Location: location } });
 
@@ -385,6 +388,38 @@ describe("safe-fetch dns pinning and matching", () => {
     expect(fetchFn.calls).toEqual(["https://yttools.co/api/t"]);
   });
 
+  test("stalled DNS cannot exceed the hop budget, fails closed typed", async () => {
+    const seen: (AbortSignal | undefined)[] = [];
+    const stalled = (
+      _host: string,
+      signal?: AbortSignal,
+    ): Promise<string[]> => {
+      seen.push(signal);
+      return new Promise<string[]>((_resolve, reject) => {
+        if (signal?.aborted) {
+          reject(new Error("aborted"));
+          return;
+        }
+        signal?.addEventListener("abort", () => reject(new Error("aborted")), {
+          once: true,
+        });
+      });
+    };
+    const started = Date.now();
+    const err = await ssrfOf(
+      safeFetch("https://yttools.co/api/t", {
+        allowHosts: ["yttools.co"],
+        timeoutMs: 50,
+        fetchFn: mustNotFetch,
+        resolveFn: stalled,
+      }),
+    );
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(err.code).toBe("ssrf_blocked");
+    // The resolver observed the hop's composed abort signal.
+    expect(seen[0]).toBeInstanceOf(AbortSignal);
+  });
+
   test("isAllowedHost: exact, suffix, regex, case-insensitive", () => {
     expect(isAllowedHost("sponsor.ajay.app", ["sponsor.ajay.app"])).toBe(true);
     expect(isAllowedHost("Sponsor.Ajay.App", ["sponsor.ajay.app"])).toBe(true);
@@ -588,6 +623,64 @@ describe("safe-fetch caller regressions", () => {
       }),
     ).rejects.toBeInstanceOf(SsrfBlockedError);
     expect(calls).toHaveLength(1);
+  });
+
+  test("transcript redirect chain cannot overrun the step budget", async () => {
+    // Hop 1 burns 240ms of a 300ms step then redirects same-host; hop 2
+    // hangs unless aborted (like a real fetch). Without the absolute step
+    // signal the fresh per-hop timeout would spend another ~300ms (≈540ms
+    // total); with it the chain dies at the ~300ms step deadline.
+    const calls: string[] = [];
+    const aborted = (): Error =>
+      Object.assign(new Error("aborted"), { name: "AbortError" });
+    const fetchFn = (async (url: string, init?: RequestInit) => {
+      calls.push(url);
+      if (url.endsWith("/start")) {
+        await sleep(240);
+        return {
+          ok: false,
+          status: 302,
+          headers: {
+            get: (name: string) =>
+              name.toLowerCase() === "location" ? "/next" : null,
+          },
+          json: async () => ({}),
+          text: async () => "",
+        };
+      }
+      await new Promise<never>((_resolve, reject) => {
+        const sig = init?.signal;
+        if (sig?.aborted) {
+          reject(aborted());
+          return;
+        }
+        sig?.addEventListener("abort", () => reject(aborted()), {
+          once: true,
+        });
+      });
+      throw new Error("unreachable");
+    }) as unknown as FetchLike;
+    const yttools = TRANSCRIPT_PROVIDERS[1];
+    if (!yttools) {
+      throw new Error("registry fixture missing");
+    }
+    const started = Date.now();
+    await expect(
+      runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+        fetchNative: async () => {
+          throw new Error("no native");
+        },
+        fetchFn,
+        resolveFn: null,
+        budgetMs: 10000,
+        providers: [
+          { ...yttools, url: () => "https://yttools.co/start", timeoutMs: 300 },
+        ],
+      }),
+    ).rejects.toThrow();
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(calls).toHaveLength(2);
+    expect(calls.every((u) => u.startsWith("https://yttools.co/"))).toBe(true);
   });
 
   test("shouldAllowLoopback is dev-only, never production", () => {
