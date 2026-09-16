@@ -329,14 +329,17 @@ export interface BoundedJsonOptions {
 /**
  * Bounded replacement for unbounded `req.json()`. Pre-checks the
  * Content-Length header when present (413 without reading the stream;
- * unparseable/negative values are treated as absent), else streams the body
- * through a reader with a running UTF-8 byte counter — the reader is
- * cancelled the moment the cap is exceeded, so a spoofed small/absent
- * Content-Length can never force full allocation of a huge body. Bytes (not
- * UTF-16 code units) are counted so multibyte chars cannot smuggle past the
- * cap. A null body counts as empty. The joined text then JSON.parses in
- * try/catch (400 invalid_body when malformed). The 413 shape passes straight
- * to `errorResponse()`; non-413 failures let each call site map to its legacy
+ * unparseable/negative values are treated as absent, while huge all-decimal
+ * values are rejected by digit length before Number precision matters), else
+ * streams the body through a reader with a running UTF-8 byte counter — the
+ * reader is cancelled the moment the cap is exceeded, so a spoofed
+ * small/absent Content-Length can never force full allocation of a huge
+ * body. Bytes (not UTF-16 code units) are counted so multibyte chars cannot
+ * smuggle past the cap, and the oversize verdict is sticky: once the cap is
+ * crossed the result is 413 no matter what cancel/decode do afterward. A
+ * null body counts as empty. The joined text then JSON.parses in try/catch
+ * (400 invalid_body when malformed). The 413 shape passes straight to
+ * `errorResponse()`; non-413 failures let each call site map to its legacy
  * code (batch keeps invalid_batch, admin/tunnel keep invalid_body with their
  * own hints).
  */
@@ -346,7 +349,13 @@ export async function readBoundedJson(
 ): Promise<BoundedJsonResult> {
   const declared = req.headers.get("content-length");
   if (declared !== null) {
-    const n = Number.parseInt(declared.trim(), 10);
+    const trimmed = declared.trim();
+    // Any decimal integer with >6 digits is >= 1_000_000 > cap — reject
+    // without parsing, so values overflowing Number precision still 413.
+    if (/^\d+$/.test(trimmed) && trimmed.length > 6) {
+      return { ok: false, error: bodyTooLargeError() };
+    }
+    const n = Number.parseInt(trimmed, 10);
     if (Number.isFinite(n) && n > MAX_BODY_BYTES) {
       return { ok: false, error: bodyTooLargeError() };
     }
@@ -360,6 +369,7 @@ export async function readBoundedJson(
   const reader = req.body.getReader();
   const chunks: Uint8Array[] = [];
   let seen = 0;
+  let oversized = false;
   try {
     for (;;) {
       const { done, value } = await reader.read();
@@ -368,12 +378,17 @@ export async function readBoundedJson(
       }
       seen += value.byteLength;
       if (seen > MAX_BODY_BYTES) {
+        // Sticky: the body IS oversize even if cancel() below throws.
+        oversized = true;
         await reader.cancel();
         return { ok: false, error: bodyTooLargeError() };
       }
       chunks.push(value);
     }
   } catch {
+    if (oversized) {
+      return { ok: false, error: bodyTooLargeError() };
+    }
     // A stream error mid-read is malformed input, same as a JSON.parse
     // failure below — a typed 400, never a bare 500.
     return { ok: false, error: invalidJsonBodyError() };

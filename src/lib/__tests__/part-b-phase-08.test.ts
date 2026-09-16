@@ -384,6 +384,67 @@ describe("phase 08 readBoundedJson", () => {
     );
     expect(allowed).toEqual({ ok: true, value: {} });
   });
+
+  test("oversize verdict is sticky when cancel rejects", async () => {
+    // A hostile stream that crosses the cap, then fails cancel(): the body
+    // is already known-oversize, so the result must stay 413, never
+    // downgrade to 400 invalid_body.
+    const enc = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(enc.encode(`{"pad":"${"x".repeat(MAX_BODY_BYTES)}"}`));
+        c.close();
+      },
+      cancel() {
+        return Promise.reject(new Error("cancel boom"));
+      },
+    });
+    const req = new NextRequest("http://x/api/v1/batch", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-request-id": "p8" },
+      body: stream,
+      duplex: "half",
+    });
+    const res = await readBoundedJson(req);
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.error.code).toBe("body_too_large");
+      expect(res.error.status).toBe(413);
+    }
+  });
+
+  test("400-digit Content-Length is 413 without reading the body", async () => {
+    const req = new NextRequest("http://x/api/v1/batch", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "content-length": "9".repeat(400),
+        "x-request-id": "p8",
+      },
+      body: '{"requests":[]}',
+    });
+    const res = await readBoundedJson(req);
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.error.code).toBe("body_too_large");
+      expect(res.error.status).toBe(413);
+    }
+    expect(req.bodyUsed).toBe(false);
+  });
+
+  test("trailing-garbage Content-Length is treated as absent", async () => {
+    const req = new NextRequest("http://x/api/v1/batch", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "content-length": "100abc",
+        "x-request-id": "p8",
+      },
+      body: '{"requests":[]}',
+    });
+    const res = await readBoundedJson(req);
+    expect(res).toEqual({ ok: true, value: { requests: [] } });
+  });
 });
 
 describe("phase 08 search-family q/cursor caps (no upstream on reject)", () => {
