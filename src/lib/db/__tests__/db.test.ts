@@ -15,6 +15,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { isPlaceholderLine, SECRET_SCAN_PATTERNS } from "../../redact";
 import {
   createDbStore,
   DB_FAIL_FAST_MS,
@@ -336,13 +337,11 @@ function walkRepoFiles(): string[] {
 
 describe("secret scan", () => {
   test("no credential-shaped database URL literal lives in repo files", () => {
-    // Matches scheme + userinfo (user:pass@). Built by concatenation so this
-    // file's own pattern source cannot match itself.
-    const credentialUrl = new RegExp(
-      "postgres(?:ql)?://" + "[^\\s'\"]*:[^\\s'\"]*@",
-    );
-    const placeholder =
-      /<|USER|PASSWORD|HOST|example|YOUR_|changeme|placeholder/i;
+    // The database-URL shape is SECRET_SCAN_PATTERNS[0]; the remaining
+    // value shapes are covered by the shippable-source scan below. Kept as
+    // its own full-repo assertion (including fixtures) because a committed
+    // credential URL is severe wherever it sits.
+    const credentialUrl = SECRET_SCAN_PATTERNS[0];
     const hits: string[] = [];
     for (const file of repoTextFiles()) {
       let text: string;
@@ -351,9 +350,51 @@ describe("secret scan", () => {
       } catch {
         continue;
       }
-      for (const line of text.split("\n")) {
-        if (credentialUrl.test(line) && !placeholder.test(line)) {
-          hits.push(`${file}: ${line.trim().slice(0, 80)}`);
+      for (const [idx, line] of text.split("\n").entries()) {
+        credentialUrl.lastIndex = 0;
+        if (credentialUrl.test(line) && !isPlaceholderLine(line)) {
+          // Location metadata only — never the matched text, so a failure
+          // cannot print credential content into test output.
+          hits.push(`${file}:${idx + 1} [credential-url]`);
+        }
+      }
+    }
+    expect(hits).toEqual([]);
+  });
+
+  test("no secret-shaped token or assignment lives in shippable source", () => {
+    // Phase 11: extends the scan to the centralized value shapes
+    // (Stripe-shaped keys, machine keys, non-empty secret assignments).
+    // Test fixtures are intentionally fake (`ak_test_…` literals abound in
+    // unit tests), so this scan covers shippable files only — __tests__
+    // dirs and *.test.* files are skipped. Fixture detection itself is
+    // proved in-memory by the Phase 11 suite (`containsLikelySecret`), and
+    // the credential-URL scan above still covers the whole repo.
+    const valueShapes = SECRET_SCAN_PATTERNS.slice(1);
+    const hits: string[] = [];
+    for (const file of repoTextFiles()) {
+      if (file.includes("__tests__") || /\.test\.[^.]+$/.test(file)) {
+        continue;
+      }
+      let text: string;
+      try {
+        text = readFileSync(file, "utf8");
+      } catch {
+        continue;
+      }
+      for (const [idx, line] of text.split("\n").entries()) {
+        if (isPlaceholderLine(line)) {
+          continue;
+        }
+        if (
+          valueShapes.some((pattern) => {
+            pattern.lastIndex = 0;
+            return pattern.test(line);
+          })
+        ) {
+          // Location metadata only — never the matched text, so a failure
+          // cannot print credential content into test output.
+          hits.push(`${file}:${idx + 1} [secret-value]`);
         }
       }
     }
