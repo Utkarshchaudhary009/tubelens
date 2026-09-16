@@ -16,6 +16,7 @@ import {
   runTranscriptWaterfall,
   TRANSCRIPT_PROVIDERS,
   type TranscriptProviderDef,
+  type TranscriptRunnerDeps,
 } from "../transcript-providers";
 
 beforeEach(() => {
@@ -77,6 +78,19 @@ function makeFetch(
 const notCalled = (): FetchLike => async () => {
   throw new Error("fetchFn must not run");
 };
+
+/**
+ * Offline waterfall runner: pins resolveFn to the documented null skip
+ * sentinel so registry tests never touch real DNS (safeFetch otherwise
+ * defaults to node:dns pinning). A per-test resolveFn still wins via spread.
+ */
+function runOfflineWaterfall(
+  id: string,
+  lang: string,
+  deps: TranscriptRunnerDeps,
+): ReturnType<typeof runTranscriptWaterfall> {
+  return runTranscriptWaterfall(id, lang, { resolveFn: null, ...deps });
+}
 
 const nativeThrow = (msg: string) => async () => {
   throw new Error(msg);
@@ -252,7 +266,7 @@ describe("registry contract", () => {
       status: 200,
       jsonBody: { transcript: [{ text: "hi", offset: 0, duration: 1 }] },
     }));
-    const out = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+    const out = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
       fetchNative: nativeThrow("no native"),
       fetchFn,
       providers: [extra],
@@ -389,7 +403,7 @@ describe("VTT / json3 parsers", () => {
 describe("provider fixtures", () => {
   test("innertube fast path wins; fetchFn never runs; no provider tag", async () => {
     const segments = [{ startSeconds: 0, text: "fast" }];
-    const out = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+    const out = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
       fetchNative: async () => segments,
       fetchFn: notCalled(),
     });
@@ -403,7 +417,7 @@ describe("provider fixtures", () => {
       expect(url).toContain("lang=en");
       return { ok: true, status: 200, jsonBody: YTTOOLS_FIXTURE };
     });
-    const out = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+    const out = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
       fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
       fetchFn,
     });
@@ -424,7 +438,7 @@ describe("provider fixtures", () => {
       }
       throw new Error(`unexpected fetch ${url}`);
     });
-    const out = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+    const out = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
       fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
       // yttools fails fast so the chain reaches youtube-transcript-ai.
       fetchFn: async (url, init) => {
@@ -465,7 +479,7 @@ describe("provider fixtures", () => {
       }
       return { ok: false, status: 422, jsonBody: {} };
     });
-    const out = await runTranscriptWaterfall("dQw4w9WgXcQ", "fr", {
+    const out = await runOfflineWaterfall("dQw4w9WgXcQ", "fr", {
       fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
       fetchFn,
     });
@@ -489,7 +503,7 @@ describe("provider fixtures", () => {
       expect(String(body.video_id)).toContain("watch?v=dQw4w9WgXcQ");
       return { ok: true, status: 200, jsonBody: KOME_FIXTURE };
     });
-    const out = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+    const out = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
       fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
       fetchFn: async (url, init) => {
         if (
@@ -515,7 +529,7 @@ describe("provider fixtures", () => {
       }
       return { ok: false, status: 422, jsonBody: {} };
     });
-    const err = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+    const err = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
       fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
       fetchFn,
     }).then(
@@ -544,7 +558,7 @@ describe("provider fixtures", () => {
       return stubRes({ ok: false, status: 422, jsonBody: {} });
     };
     // No key -> supadata never hit, chain ends transcript-scoped.
-    const err = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+    const err = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
       fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
       fetchFn: failing,
       env: {},
@@ -561,7 +575,7 @@ describe("provider fixtures", () => {
       "supadata",
     );
     // Key set -> supadata serves with the key header.
-    const out = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+    const out = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
       fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
       fetchFn: failing,
       env: { SUPADATA_API_KEY: "secret-key" },
@@ -594,7 +608,7 @@ describe("waterfall", () => {
       }
       throw new Error(`unexpected ${url}`);
     });
-    const out = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+    const out = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
       fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
       fetchFn,
     });
@@ -614,7 +628,7 @@ describe("waterfall", () => {
     const providers: TranscriptProviderDef[] = TRANSCRIPT_PROVIDERS.map((d) =>
       d.name === "yttools" ? { ...d, enabled: false } : d,
     );
-    const out = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+    const out = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
       fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
       fetchFn,
       providers,
@@ -629,7 +643,7 @@ describe("waterfall", () => {
       status: 200,
       jsonBody: YTTOOLS_FIXTURE,
     }));
-    const err = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+    const err = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
       fetchNative: nativeThrow("Video deleted or removed"),
       fetchFn,
     }).then(
@@ -658,7 +672,7 @@ describe("waterfall", () => {
       }
       return { ok: true, status: 200, jsonBody: YTTOOLS_FIXTURE };
     });
-    const privErr = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+    const privErr = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
       fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
       fetchFn: priv.fetchFn,
     }).then(
@@ -682,7 +696,7 @@ describe("waterfall", () => {
       }
       return { ok: false, status: 422, jsonBody: {} };
     });
-    const out = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+    const out = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
       fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
       fetchFn: bare.fetchFn,
     });
@@ -712,7 +726,7 @@ describe("waterfall", () => {
         );
       });
     const started = Date.now();
-    const err = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+    const err = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
       fetchNative: hanging,
       fetchFn: notCalled(),
       budgetMs: 50,
@@ -841,7 +855,7 @@ describe("follow-up edge cases", () => {
       }
       return { ok: false, status: 422, jsonBody: {} };
     });
-    const out = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+    const out = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
       fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
       fetchFn,
     });
@@ -877,7 +891,7 @@ describe("follow-up edge cases", () => {
       status: 200,
       jsonThrows: true,
     }));
-    const err = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+    const err = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
       fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
       fetchFn,
       providers: [bad],
@@ -920,7 +934,7 @@ describe("follow-up edge cases", () => {
       }
       return stubRes({ ok: false, status: 422, jsonBody: {} });
     };
-    const out = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+    const out = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
       fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
       fetchFn: failing,
       env: { SUPADATA_API_KEY: "secret-key" },
@@ -987,7 +1001,7 @@ describe("review fixes", () => {
       jsonBody: {},
       retryAfter: "120",
     }));
-    const err = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+    const err = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
       fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
       fetchFn,
     }).then(
@@ -1029,7 +1043,7 @@ describe("review fixes", () => {
         jsonBody: {},
         retryAfter,
       }));
-      const err = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+      const err = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
         fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
         fetchFn,
       }).then(
@@ -1054,7 +1068,7 @@ describe("review fixes", () => {
       jsonBody: {},
       retryAfter: future,
     }));
-    const futureErr = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+    const futureErr = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
       fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
       fetchFn: futureFetch.fetchFn,
     }).then(
@@ -1081,7 +1095,7 @@ describe("review fixes", () => {
         jsonBody: {},
         retryAfter: new Date(pinned + 2500).toUTCString(),
       }));
-      const fracErr = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+      const fracErr = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
         fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
         fetchFn: fracFetch.fetchFn,
       }).then(
@@ -1104,7 +1118,7 @@ describe("review fixes", () => {
       jsonBody: {},
       retryAfter: "Sun, 06 Nov 1994 08:49:37 GMT",
     }));
-    const pastErr = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+    const pastErr = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
       fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
       fetchFn: pastFetch.fetchFn,
     }).then(
@@ -1131,7 +1145,7 @@ describe("review fixes", () => {
         textBody: "This video is unavailable right now",
       };
     });
-    const out = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+    const out = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
       fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
       fetchFn,
     });
@@ -1144,7 +1158,7 @@ describe("review fixes", () => {
         jsonBody: {},
         textBody: "This video is unavailable right now",
       });
-    const err = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+    const err = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
       fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
       fetchFn: allDown,
     }).then(
@@ -1181,7 +1195,7 @@ describe("review fixes", () => {
     });
     // Requested French is untagged anywhere: the malformed first track is
     // dropped, so the well-formed English track serves (never MALFORMED).
-    const out = await runTranscriptWaterfall("dQw4w9WgXcQ", "fr", {
+    const out = await runOfflineWaterfall("dQw4w9WgXcQ", "fr", {
       fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
       fetchFn,
     });
@@ -1206,7 +1220,7 @@ describe("review fixes", () => {
       }
       return { ok: false, status: 422, jsonBody: {} };
     });
-    const out = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+    const out = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
       fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
       fetchFn,
     });
@@ -1232,7 +1246,7 @@ describe("review fixes", () => {
       }
       return { ok: false, status: 422, jsonBody: {} };
     });
-    const out = await runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+    const out = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
       fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
       fetchFn,
     });

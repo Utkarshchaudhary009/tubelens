@@ -466,9 +466,11 @@ export interface TranscriptRunnerDeps {
   ) => Promise<TranscriptSegmentDTO[]>;
   /** Omit to disable HTTP providers (unit-test/offline mode). */
   fetchFn?: FetchLike;
-  /** Opt-in DNS pinning for provider + track-follow-up fetches (safeFetch).
-   * Omit (or leave undefined) to skip DNS — the waterfall's injected
-   * transports must stay offline-deterministic under bun:test. */
+  /** DNS pinning for provider + track-follow-up fetches (safeFetch).
+   * `undefined` (default) falls through to safeFetch's node:dns pinning —
+   * the production route passes `dnsResolve` explicitly. Tests with injected
+   * transports pass the documented `null` skip sentinel to stay
+   * offline-deterministic under bun:test. */
   resolveFn?: ((hostname: string) => Promise<string[]>) | null;
   env?: Record<string, string | undefined>;
   now?: () => number;
@@ -828,8 +830,9 @@ async function runHttpProvider(
   // SSRF boundary pinned to the entry's own declared host (same 8s-clamped
   // step budget) — a compromised listing cannot redirect the request
   // off-host, not even laterally to another provider, and SsrfBlockedError
-  // simply fails over to the next provider. DNS stays skipped unless the
-  // caller passes resolveFn explicitly (offline unit-test determinism).
+  // simply fails over to the next provider. `undefined` resolveFn falls
+  // through to safeFetch's default node:dns pinning (production); tests
+  // pass the documented `null` skip sentinel.
   const pin = providerPin(endpoint);
   const res = await safeFetch(endpoint, {
     allowHosts: pin.length > 0 ? pin : TRANSCRIPT_PROVIDER_HOSTS,
@@ -838,7 +841,7 @@ async function runHttpProvider(
     headers,
     body: rawBody,
     fetchFn: adaptFetchLike(fetchFn),
-    resolveFn: deps.resolveFn ?? null,
+    resolveFn: deps.resolveFn,
   });
   if (!res.ok) {
     // A bare 4xx is transcript-scoped (never video_not_found): only
@@ -865,7 +868,7 @@ async function runHttpProvider(
       lang,
       remainingStepMs,
       fetchFn,
-      deps.resolveFn ?? null,
+      deps.resolveFn,
     );
   }
   let json: unknown;

@@ -588,7 +588,7 @@ const VERCEL_HOST = /^[a-z0-9]([a-z0-9.-]{0,253}[a-z0-9])?$/i;
 /**
  * Loopback opt-in for the batch fan-out's SSRF boundary (Part B Phase 10):
  * local-dev loopback origins only — NEVER production, where a loopback Host
- * proves nothing about trust. Shared with the dev/t3 pairing read.
+ * proves nothing about trust.
  */
 export function shouldAllowLoopback(host: string): boolean {
   return process.env.NODE_ENV !== "production" && isLoopbackHost(host);

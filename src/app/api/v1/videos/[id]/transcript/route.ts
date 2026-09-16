@@ -7,6 +7,7 @@ import {
   mapTranscriptInfo,
   type TranscriptSegmentDTO,
 } from "@/lib/mappers";
+import { dnsResolve } from "@/lib/safe-fetch";
 import {
   type FetchLike,
   runTranscriptWaterfall,
@@ -28,6 +29,14 @@ export interface TranscriptDeps {
   ) => Promise<TranscriptSegmentDTO[]>;
   fetchFn?: FetchLike;
   env?: Record<string, string | undefined>;
+  /**
+   * DNS pinning for the provider + track-follow-up fetches (safeFetch).
+   * Production defaultDeps passes `dnsResolve`; tests injecting a mock
+   * fetchFn omit it (see the fetchFn-tied default below) so the waterfall
+   * stays offline-deterministic — or pass the documented `null` skip
+   * sentinel / an explicit stub.
+   */
+  resolveFn?: ((hostname: string) => Promise<string[]>) | null;
   /**
    * Single overall fail-fast budget wrapper (default: lib/youtube
    * withTimeout, lazily imported). Injectable so unit tests never touch the
@@ -191,6 +200,7 @@ function normalizeCachedTranscript(value: unknown): CachedTranscript {
 
 const defaultDeps: TranscriptDeps = {
   fetchFn: fetch as unknown as FetchLike,
+  resolveFn: dnsResolve,
 };
 
 export async function GET(
@@ -245,6 +255,11 @@ export async function handleTranscript(
   // (that import stalls ~20s under bun before throwing); the production path
   // (default fetchNative) reuses lib/youtube's wrapper via lazy import.
   const fetchNative = deps.fetchNative ?? defaultFetchNative;
+  // DNS follows the transport: the default global fetch gets real node:dns
+  // pinning, while an injected test double skips it (offline determinism)
+  // unless the caller passes resolveFn explicitly.
+  const resolveFn =
+    deps.resolveFn ?? (deps.fetchFn === undefined ? dnsResolve : null);
   const withTimeout =
     deps.withTimeout ??
     (deps.fetchNative ? localWithTimeout : defaultWithTimeout);
@@ -262,6 +277,7 @@ export async function handleTranscript(
           const out = await runTranscriptWaterfall(id, lang, {
             fetchNative,
             fetchFn: deps.fetchFn,
+            resolveFn,
             env: deps.env,
           });
           if (out.segments.length === 0) {
