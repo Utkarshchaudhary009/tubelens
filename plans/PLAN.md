@@ -538,7 +538,7 @@ principal model.
 
 ## Phase 11 — Secret management and secret-leak prevention
 
-**Status:** `[~]` in progress — branch `part-b/phase-11-secret-management`: centralized `src/lib/redact.ts` (redactHeaders/redactObject/redactUrl/scrubString/scrubError + shared scan patterns), pipeline telemetry scrubbing, audit free-text scrub/truncate, extended repo secret scan, CI secret-scan job, Phase 11 leak-prevention suite.
+**Status:** `[x]` done — shipped via PR #29 (merged 2026-09-16): centralized `src/lib/redact.ts` (redactHeaders/redactObject/redactUrl/scrubString/scrubError + shared scan patterns) wired into pipeline telemetry and audit rows, tokenless CI secret-scan job + extended repo scan, 979 unit tests + e2e PASS on live upstream.
 
 **Build:** Inventory all credentials and keep them in deployment/environment secret storage. Add automated secret scanning to CI. Centralize redaction for `Authorization`, cookies, API keys, Clerk secrets, Redis credentials, database URLs, and similar values. Ensure errors and telemetry never serialize raw request headers or secret-bearing objects.
 
