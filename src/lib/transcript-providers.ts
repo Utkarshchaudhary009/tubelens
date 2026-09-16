@@ -12,6 +12,12 @@ import {
   isUpstreamTimeout,
   type TranscriptSegmentDTO,
 } from "./mappers";
+import {
+  type ResolveFn,
+  type SafeFetchFn,
+  type SafeFetchResponse,
+  safeFetch,
+} from "./safe-fetch";
 
 export type TranscriptProviderKind = "native" | "json" | "vtt" | "text";
 
@@ -461,6 +467,12 @@ export interface TranscriptRunnerDeps {
   ) => Promise<TranscriptSegmentDTO[]>;
   /** Omit to disable HTTP providers (unit-test/offline mode). */
   fetchFn?: FetchLike;
+  /** DNS pinning for provider + track-follow-up fetches (safeFetch).
+   * `undefined` (default) falls through to safeFetch's node:dns pinning —
+   * the production route passes `dnsResolve` explicitly. Tests with injected
+   * transports pass the documented `null` skip sentinel to stay
+   * offline-deterministic under bun:test. */
+  resolveFn?: ResolveFn | null;
   env?: Record<string, string | undefined>;
   now?: () => number;
   /** Single overall fail-fast budget; per-provider caps clamp to remaining. */
@@ -499,7 +511,9 @@ function httpError(name: string, status: number, retryAfter?: number): Error {
 }
 
 /** Upstream Retry-After seconds when the response carries a parseable one. */
-function retryAfterOf(res: Awaited<ReturnType<FetchLike>>): number | undefined {
+function retryAfterOf(
+  res: SafeFetchResponse | Awaited<ReturnType<FetchLike>>,
+): number | undefined {
   const headers = (res as { headers?: unknown }).headers;
   if (typeof headers !== "object" || headers === null) {
     return undefined;
@@ -563,6 +577,59 @@ function throwForHttpStatus(
     throw httpError(name, status, retryAfter);
   }
   throw new Error(`transcript_unavailable: ${name} returned HTTP ${status}`);
+}
+
+/** Registry-wide SSRF pin for the HTTP providers (mirrors every `url()`
+ * entry below; extend it when a provider host is added or retired). A new
+ * entry's own host is additionally pinned per-request (providerPin), so the
+ * chain enforces the boundary before this list is extended. */
+export const TRANSCRIPT_PROVIDER_HOSTS = [
+  "yttools.co",
+  "youtube-transcript.ai",
+  "kome.ai",
+  "api.supadata.ai",
+];
+
+/**
+ * The listing fetch's own declared host (a code constant per dict entry).
+ * Unioned with TRANSCRIPT_PROVIDER_HOSTS at the call site so a new entry
+ * still needs no route edit — its first hop is pinned to its own host while
+ * every redirect hop re-validates against the union. Unparseable endpoints
+ * contribute nothing (checkUrl rejects them first).
+ */
+function providerPin(endpoint: string): string[] {
+  try {
+    const host = new URL(endpoint).hostname.toLowerCase();
+    return host === "" ? [] : [host];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Adapts an injected FetchLike transport to the safeFetch transport shape.
+ * Real Response headers are preserved when present (production global fetch)
+ * so redirect Locations stay visible to the boundary; header-less test
+ * doubles read as "no Location" (no redirect hop is simulated).
+ */
+function adaptFetchLike(fetchFn: FetchLike): SafeFetchFn {
+  return async (input: string, init?: RequestInit) => {
+    const res = await fetchFn(input, init);
+    const headersOf = (
+      res as unknown as {
+        headers?: { get(name: string): string | null };
+      }
+    ).headers;
+    return {
+      ok: res.ok,
+      status: res.status,
+      headers: { get: (name: string) => headersOf?.get(name) ?? null },
+      arrayBuffer: async () =>
+        new TextEncoder().encode(await res.text()).buffer as ArrayBuffer,
+      json: () => res.json(),
+      text: () => res.text(),
+    };
+  };
 }
 
 /** kome's "transcripts aren't available" apology: rejected, never emitted. */
@@ -752,20 +819,35 @@ async function runHttpProvider(
   ) {
     headers["x-api-key"] = env[def.apiKeyEnv] as string;
   }
-  const init: RequestInit = {
-    method: def.method,
-    headers,
-    signal: AbortSignal.timeout(stepMs),
-  };
+  let rawBody: string | undefined;
   if (def.body) {
-    init.body = JSON.stringify(def.body(id, lang));
+    rawBody = JSON.stringify(def.body(id, lang));
     if (headers["content-type"] === undefined) {
-      (headers as Record<string, string>)["content-type"] = "application/json";
+      headers["content-type"] = "application/json";
     }
   }
   // Network/abort errors propagate as-is (timeouts classify 504 and stay
-  // stale-eligible via the route's predicate).
-  const res = await fetchFn(endpoint, init);
+  // stale-eligible via the route's predicate). The fetch runs through the
+  // SSRF boundary pinned to the entry's own declared host (same 8s-clamped
+  // step budget) — a compromised listing cannot redirect the request
+  // off-host, not even laterally to another provider, and SsrfBlockedError
+  // simply fails over to the next provider. `undefined` resolveFn falls
+  // through to safeFetch's default node:dns pinning (production); tests
+  // pass the documented `null` skip sentinel.
+  const pin = providerPin(endpoint);
+  const res = await safeFetch(endpoint, {
+    allowHosts: pin.length > 0 ? pin : TRANSCRIPT_PROVIDER_HOSTS,
+    timeoutMs: stepMs,
+    // Absolute step deadline: safeFetch composes it with the per-hop
+    // timeout, so a redirect chain cannot re-spend stepMs per hop and
+    // overrun the waterfall budget.
+    signal: AbortSignal.timeout(stepMs),
+    method: def.method,
+    headers,
+    body: rawBody,
+    fetchFn: adaptFetchLike(fetchFn),
+    resolveFn: deps.resolveFn,
+  });
   if (!res.ok) {
     // A bare 4xx is transcript-scoped (never video_not_found): only
     // video-scoped wording over a definitive 4xx short-circuits the chain
@@ -784,7 +866,15 @@ async function runHttpProvider(
     // already spent (now - stepStarted), so the second clamps to min(stepMs,
     // remaining) — never stacked full budgets against the overall deadline.
     const remainingStepMs = () => Math.max(1, stepMs - (nowFn() - stepStarted));
-    return runVttPayload(def, res, endpoint, lang, remainingStepMs, fetchFn);
+    return runVttPayload(
+      def,
+      res,
+      endpoint,
+      lang,
+      remainingStepMs,
+      fetchFn,
+      deps.resolveFn,
+    );
   }
   let json: unknown;
   try {
@@ -819,11 +909,12 @@ async function runHttpProvider(
 
 async function runVttPayload(
   def: TranscriptProviderDef,
-  res: Awaited<ReturnType<FetchLike>>,
+  res: SafeFetchResponse,
   endpoint: string,
   lang: string,
   remainingStepMs: () => number,
   fetchFn: FetchLike,
+  resolveFn?: ((hostname: string) => Promise<string[]>) | null,
 ): Promise<TranscriptSegmentDTO[]> {
   let json: unknown;
   try {
@@ -867,8 +958,25 @@ async function runVttPayload(
       );
     }
     const absolute = resolveTrackUrl(def.name, trackUrl, endpoint);
-    const trackRes = await fetchFn(absolute, {
-      signal: AbortSignal.timeout(remainingStepMs()),
+    // Same-host re-validation through the SSRF boundary: pinned to the
+    // listing host (resolveTrackUrl above already enforced same-host +
+    // https), so redirect escapes and literal-IP tricks in the track URL
+    // throw instead of fetching.
+    let listingHosts: (string | RegExp)[];
+    try {
+      listingHosts = [new URL(endpoint).hostname.toLowerCase()];
+    } catch {
+      listingHosts = TRANSCRIPT_PROVIDER_HOSTS;
+    }
+    // Remaining step budget as BOTH the per-hop timeout and the absolute
+    // signal (same bounding rationale as the listing call above).
+    const trackBudget = remainingStepMs();
+    const trackRes = await safeFetch(absolute, {
+      allowHosts: listingHosts,
+      timeoutMs: trackBudget,
+      signal: AbortSignal.timeout(trackBudget),
+      fetchFn: adaptFetchLike(fetchFn),
+      resolveFn,
     });
     if (!trackRes.ok) {
       let detail = "";

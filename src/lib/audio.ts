@@ -36,6 +36,7 @@ import {
   mapRelatedItem,
   textOf,
 } from "@/lib/mappers";
+import { SsrfBlockedError, safeFetch } from "@/lib/safe-fetch";
 import {
   isPlausibleVideoId,
   parseBoundedCursor,
@@ -198,6 +199,18 @@ function isDefinitiveAudioError(err: unknown): boolean {
  * raw URL ever reaches an error body.
  */
 export function classifyAudioError(err: unknown): ClassifiedVideoError {
+  // SSRF-filter rejections must map BEFORE the definitive-wording check
+  // below: the error name itself ("SsrfBlockedError") would otherwise match
+  // /blocked/i and latch the per-video kill switch with a 410. A rejected
+  // googlevideo hop is transient upstream degradation (502, never latched).
+  if (err instanceof SsrfBlockedError) {
+    return {
+      code: "upstream_degraded",
+      message: "Audio lookup failed upstream.",
+      hint: "Retry shortly; include X-Request-Id in bug reports.",
+      status: 502,
+    };
+  }
   if (isUpstreamTimeout(err)) {
     return {
       code: "upstream_timeout",
@@ -298,7 +311,10 @@ function audioUpstreamError(status: number): Error {
  * total comes only from the Content-Range suffix (unknown when absent);
  * for full 200 bodies Content-Length is the total. Pure for unit tests.
  */
-export function deriveAudioTotal(status: number, headers: Headers): number {
+export function deriveAudioTotal(
+  status: number,
+  headers: { get(name: string): string | null },
+): number {
   if (status === 206) {
     const total = /\/(\d+)\s*$/.exec(headers.get("content-range") ?? "");
     return total?.[1] ? Number(total[1]) : -1;
@@ -347,7 +363,16 @@ async function fetchAudioUpstream(
       `bytes=${range.start}-${range.end !== undefined ? range.end : ""}`,
     );
   }
-  const res = await fetch(url, { signal: AbortSignal.timeout(8000), headers });
+  const res = await safeFetch(url, {
+    // Deciphered stream URLs are googlevideo hosts (getStreamingData never
+    // returns youtube.com watch URLs here); the allowlist pins exactly that,
+    // and every redirect hop re-validates — a hijacked Location cannot pull
+    // the byte proxy off-host. Thrown messages carry statuses only — the raw
+    // URL never escapes.
+    allowHosts: [/\.googlevideo\.com$/],
+    timeoutMs: 8000,
+    headers,
+  });
   if (isTakedownStatus(res.status)) {
     throw audioTakedownError(res.status);
   }

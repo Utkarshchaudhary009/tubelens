@@ -29,6 +29,7 @@ import {
   mapVideoDetails,
   type VideoDetailsDTO,
 } from "@/lib/mappers";
+import { SsrfBlockedError, safeFetch } from "@/lib/safe-fetch";
 import { isPlausibleVideoId, parseLang, parseRegion } from "@/lib/validate";
 
 export interface SponsorSegmentDTO {
@@ -260,6 +261,16 @@ export function classifyCommunityError(
       : source === "dislikes"
         ? "Dislike stats"
         : "DeArrow branding";
+  // SSRF-filter rejections (redirect escape attempts against the pinned
+  // provider hosts) are a typed 502 with a hint — never a bare 500.
+  if (err instanceof SsrfBlockedError) {
+    return {
+      code: "upstream_degraded",
+      message: `${label} destination rejected by the outbound request filter.`,
+      hint: "Retry shortly; include X-Request-Id in bug reports.",
+      status: 502,
+    };
+  }
   if (isUpstreamTimeout(err)) {
     return {
       code: "upstream_timeout",
@@ -326,7 +337,9 @@ function upstreamStatusError(
  * empty, non-numeric, or negative values yield undefined so callers fall
  * back to the 60s default (note: Number("") is 0, so the raw value must be
  * checked for emptiness before parsing). */
-function upstreamRetryAfter(res: Response): number | undefined {
+function upstreamRetryAfter(res: {
+  headers: { get(name: string): string | null };
+}): number | undefined {
   const raw = (res.headers.get("retry-after") ?? "").trim();
   if (!raw) {
     return undefined;
@@ -342,7 +355,10 @@ export async function fetchSponsorsUpstream(
   const url =
     `https://sponsor.ajay.app/api/skipSegments?videoID=${encodeURIComponent(id)}` +
     `&categories=${encodeURIComponent(JSON.stringify(SPONSOR_CATEGORIES))}&actionType=skip`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+  const res = await safeFetch(url, {
+    allowHosts: ["sponsor.ajay.app"],
+    timeoutMs: 8000,
+  });
   if (res.status === 404) {
     return [];
   }
@@ -361,7 +377,10 @@ export async function fetchDislikesUpstream(
   id: string,
 ): Promise<DislikesDTO | null> {
   const url = `https://returnyoutubedislikeapi.com/votes?videoId=${encodeURIComponent(id)}`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+  const res = await safeFetch(url, {
+    allowHosts: ["returnyoutubedislikeapi.com"],
+    timeoutMs: 8000,
+  });
   if (res.status === 404) {
     return null;
   }
@@ -380,7 +399,10 @@ export async function fetchDeArrowUpstream(
   id: string,
 ): Promise<DeArrowDTO | null> {
   const url = `https://sponsor.ajay.app/api/branding?videoID=${encodeURIComponent(id)}`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+  const res = await safeFetch(url, {
+    allowHosts: ["sponsor.ajay.app"],
+    timeoutMs: 8000,
+  });
   if (res.status === 404) {
     return null;
   }

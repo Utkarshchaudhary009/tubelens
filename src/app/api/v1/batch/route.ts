@@ -1,5 +1,6 @@
 import type { NextRequest, NextResponse } from "next/server";
-import { type BatchDeps, handleBatch } from "@/lib/utils";
+import { SsrfBlockedError, safeFetch } from "@/lib/safe-fetch";
+import { type BatchDeps, handleBatch, shouldAllowLoopback } from "@/lib/utils";
 
 export const runtime = "nodejs";
 
@@ -10,14 +11,28 @@ export const runtime = "nodejs";
 // youtubei singleton. Tests inject mocks here. Each item resolves via the
 // JSON-only v1 allowlist with per-item error isolation; the batch itself is
 // private, no-store.
+//
+// The sub-fetch runs through the SSRF boundary pinned to the first-hop
+// origin host (handleBatch built the URL from the trusted origin +
+// allowlisted path above): every redirect hop re-validates against THIS
+// host, so a cross-origin Location cannot escape the fan-out. Loopback http
+// is allowed only when the pinned origin itself is loopback local-dev.
 const defaultDeps: BatchDeps = {
   async execute(url: string, requestId: string, signal?: AbortSignal) {
+    let originHost: string;
+    try {
+      originHost = new URL(url).hostname.toLowerCase();
+    } catch {
+      throw new SsrfBlockedError("unparseable URL");
+    }
     // Per-call 8s fail-fast AND the batch shared deadline (whichever fires
     // first aborts the sub-fetch).
-    const timeout = AbortSignal.timeout(8000);
-    const res = await fetch(url, {
-      signal: signal ? AbortSignal.any([timeout, signal]) : timeout,
+    const res = await safeFetch(url, {
+      allowHosts: [originHost],
+      allowLoopback: shouldAllowLoopback(originHost),
+      timeoutMs: 8000,
       headers: { "x-request-id": requestId },
+      signal,
     });
     const text = await res.text();
     let body: unknown;

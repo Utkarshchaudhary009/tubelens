@@ -1,5 +1,5 @@
-import { headers } from "next/headers";
 import { redirect } from "next/navigation";
+import { readTunnelRecord } from "@/lib/tunnel-blob";
 import { isT3PairingUrl } from "@/lib/tunnel-url";
 
 // /dev/t3 — bounce the browser straight into the live T3 remote-dev session.
@@ -29,25 +29,15 @@ interface TunnelSlotPayload {
 }
 
 async function getPairingRecord(): Promise<TunnelSlotPayload["data"]> {
-  const h = await headers();
-  const host =
-    h.get("x-forwarded-host")?.split(",")[0]?.trim() || h.get("host");
-  if (!host) {
+  // Direct same-process Blob read (Part B Phase 10): the previous
+  // implementation self-fetched /api/v1/tunnel-url over HTTP from a
+  // Host-derived URL, trusting the request Host header for a server-side
+  // fetch. The store read needs no Host at all.
+  if (!process.env.BLOB_READ_WRITE_TOKEN) {
     return null;
   }
-  const proto =
-    h.get("x-forwarded-proto")?.split(",")[0]?.trim() ||
-    (process.env.NODE_ENV === "development" ? "http" : "https");
   try {
-    const res = await fetch(`${proto}://${host}/api/v1/tunnel-url?name=t3`, {
-      cache: "no-store",
-      signal: AbortSignal.timeout(8000),
-    });
-    if (!res.ok) {
-      return null;
-    }
-    const body = (await res.json()) as TunnelSlotPayload;
-    return body.data;
+    return await readTunnelRecord("t3");
   } catch {
     return null;
   }

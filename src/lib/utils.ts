@@ -25,6 +25,7 @@ import {
 } from "@/lib/envelope";
 import { errorResponse } from "@/lib/errors";
 import { isUpstreamTimeout, textOf } from "@/lib/mappers";
+import { isLoopbackHost } from "@/lib/safe-fetch";
 import { isPlausibleVideoId, readBoundedJson } from "@/lib/validate";
 
 // ---------------------------------------------------------------------------
@@ -583,6 +584,15 @@ function validateBatchItem(
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
 const VERCEL_HOST = /^[a-z0-9]([a-z0-9.-]{0,253}[a-z0-9])?$/i;
+
+/**
+ * Loopback opt-in for the batch fan-out's SSRF boundary (Part B Phase 10):
+ * local-dev loopback origins only — NEVER production, where a loopback Host
+ * proves nothing about trust.
+ */
+export function shouldAllowLoopback(host: string): boolean {
+  return process.env.NODE_ENV !== "production" && isLoopbackHost(host);
+}
 
 /**
  * Trusted sub-request origin for the batch fan-out. NEVER the raw request
