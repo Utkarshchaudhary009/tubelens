@@ -804,7 +804,7 @@ describe("phase 10 openapi registration", () => {
     expect(Object.keys(rssResponses["200"]?.content ?? {})).toContain(
       "application/rss+xml",
     );
-    expect(Object.keys(doc.paths)).toHaveLength(37);
+    expect(Object.keys(doc.paths)).toHaveLength(38);
   });
 
   test("mixes spec pattern mirrors parseMixSeed boundaries", () => {

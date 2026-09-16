@@ -331,7 +331,6 @@ jobs:
             # state.json already carries the timestamp forward.
             "last_remint_at": last_remint_at,
           }
-          }
           with open("state.json", "w") as f:
             json.dump(state, f, indent=2)
           print(open("state.json").read())

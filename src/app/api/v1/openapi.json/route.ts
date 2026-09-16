@@ -3,7 +3,7 @@ import { baseHeaders, CACHE_CONTROL, getRequestId } from "@/lib/envelope";
 
 export const runtime = "nodejs";
 
-// OpenAPI 3.1 full spec for Phase 10: documents all 37 shipped endpoints.
+// OpenAPI 3.1 full spec for Phase 10: documents all 38 shipped endpoints.
 // Exported as a pure builder so tests can validate it without HTTP.
 export function buildOpenApiDocument() {
   const envelopeRef = "#/components/schemas/Envelope";
@@ -1549,6 +1549,88 @@ export function buildOpenApiDocument() {
               },
             },
             429: rateLimitedResponse,
+          },
+        },
+      },
+      "/tunnel-url": {
+        get: {
+          operationId: "getTunnelUrl",
+          summary: "Read a published throwaway tunnel URL",
+          description:
+            "Public read of one named tunnel slot (?name=t3 or ?name=transcript, always required): { data: { url, runId, updatedAt } } or { data: null } when nothing has published that slot yet. Private, no-store. /dev/t3 redirects to the t3 slot's full /pair#token= pairing URL when fresh.",
+          parameters: [
+            {
+              name: "name",
+              in: "query",
+              required: true,
+              schema: { type: "string", enum: ["t3", "transcript"] },
+              description:
+                "Tunnel slot: t3 (T3 remote-dev pairing URL) or transcript (throwaway tts-test helper).",
+            },
+          ],
+          responses: {
+            200: {
+              description:
+                "Stored tunnel record, or data:null when the slot is empty (or the Blob store is unconnected, with a blob_unconfigured warning).",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description: "missing_name or invalid_name.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
+            502: degradedResponse,
+            504: timeoutResponse,
+          },
+        },
+        post: {
+          operationId: "postTunnelUrl",
+          summary: "Publish a throwaway tunnel URL (bearer-gated)",
+          description:
+            "Publisher write: body {name, url, runId?} with Authorization: Bearer <TUNNEL_UPDATE_TOKEN> overwrites one slot's pointer. PUT is an alias. url must be an https://*.trycloudflare.com URL. Private, no-store.",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["name", "url"],
+                  properties: {
+                    name: {
+                      type: "string",
+                      enum: ["t3", "transcript"],
+                    },
+                    url: {
+                      type: "string",
+                      example: "https://<name>.trycloudflare.com",
+                    },
+                    runId: { type: "string", example: "123" },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: "data is the saved { url, runId, updatedAt }.",
+              content: {
+                "application/json": { schema: { $ref: envelopeRef } },
+              },
+            },
+            400: {
+              description:
+                "missing_name, invalid_name, invalid_tunnel_url, or invalid_body.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            401: {
+              description:
+                "unauthorized; missing or invalid bearer token.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
+            429: rateLimitedResponse,
+            502: degradedResponse,
           },
         },
       },

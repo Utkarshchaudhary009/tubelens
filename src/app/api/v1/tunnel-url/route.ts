@@ -22,15 +22,29 @@ export const runtime = "nodejs";
 const blobStore: TunnelStore = {
   async read(slot: TunnelSlot) {
     const pathname = tunnelBlobPath(slot);
-    const { list } = await import("@vercel/blob");
-    const { blobs } = await list({ prefix: pathname });
-    const hit = blobs.find((b) => b.pathname === pathname) ?? blobs[0];
-    if (!hit) {
-      return null;
+    const { head } = await import("@vercel/blob");
+    // `head` hits the Blob API directly (never the CDN), so it always sees
+    // the latest write — `list` + bare fetch can replay a stale edge copy
+    // for up to ~60s after a re-publish. A missing blob is "none", not 502.
+    let url: string;
+    try {
+      url = (await head(pathname)).url;
+    } catch (err) {
+      if (
+        err instanceof Error &&
+        (err.name === "BlobNotFoundError" || /not[ -]?found/i.test(err.message))
+      ) {
+        return null;
+      }
+      throw err;
     }
-    const res = await fetch(hit.url, {
+    // Content still comes from the CDN URL, so bust the edge cache: unique
+    // query per read + explicit no-cache request headers + no-store mode.
+    const sep = url.includes("?") ? "&" : "?";
+    const res = await fetch(`${url}${sep}t=${Date.now()}`, {
       signal: AbortSignal.timeout(8000),
       cache: "no-store",
+      headers: { "Cache-Control": "no-cache", Pragma: "no-cache" },
     });
     if (res.status === 404) {
       return null;
