@@ -1,11 +1,10 @@
 import type { NextRequest } from "next/server";
 import { CACHE_CONTROL, getRequestId, successResponse } from "@/lib/envelope";
 import { errorResponse } from "@/lib/errors";
-import { safeFetch } from "@/lib/safe-fetch";
+import { readTunnelRecord } from "@/lib/tunnel-blob";
 import {
   handleTunnelGet,
   handleTunnelWrite,
-  parseStoredTunnel,
   resolveSlot,
   type TunnelDeps,
   type TunnelRecord,
@@ -17,48 +16,12 @@ import {
 export const runtime = "nodejs";
 
 // Vercel Blob pointers for throwaway tunnel URLs (one blob per `name` slot:
-// `tunnel-url-t3.json`, `tunnel-url-transcript.json`). @vercel/blob is
-// imported lazily so this module stays importable without Blob credentials
-// (tests inject mock stores into the lib handlers and never touch Blob).
+// `tunnel-url-t3.json`, `tunnel-url-transcript.json`). Reads go through the
+// shared lib helper (same read the /dev/t3 page uses directly — no HTTP
+// self-fetch); @vercel/blob `put` stays lazy so this module is importable
+// without Blob credentials (tests inject mock stores and never touch Blob).
 const blobStore: TunnelStore = {
-  async read(slot: TunnelSlot) {
-    const pathname = tunnelBlobPath(slot);
-    const { head } = await import("@vercel/blob");
-    // `head` hits the Blob API directly (never the CDN), so it always sees
-    // the latest write — `list` + bare fetch can replay a stale edge copy
-    // for up to ~60s after a re-publish. A missing blob is "none", not 502.
-    let url: string;
-    try {
-      url = (await head(pathname)).url;
-    } catch (err) {
-      if (
-        err instanceof Error &&
-        (err.name === "BlobNotFoundError" || /not[ -]?found/i.test(err.message))
-      ) {
-        return null;
-      }
-      throw err;
-    }
-    // Content still comes from the CDN URL, so bust the edge cache: unique
-    // query per read + explicit no-cache request headers + no-store mode.
-    // The stored Blob URL is re-validated through the SSRF boundary (https +
-    // Vercel Blob host allowlist, redirect hops re-checked) before fetching:
-    // a poisoned pointer can never pull the read off-host.
-    const sep = url.includes("?") ? "&" : "?";
-    const res = await safeFetch(`${url}${sep}t=${Date.now()}`, {
-      allowHosts: [/\.blob\.vercel-storage\.com$/],
-      timeoutMs: 8000,
-      cache: "no-store",
-      headers: { "Cache-Control": "no-cache", Pragma: "no-cache" },
-    });
-    if (res.status === 404) {
-      return null;
-    }
-    if (!res.ok) {
-      throw new Error(`tunnel blob fetch failed: ${res.status}`);
-    }
-    return parseStoredTunnel((await res.json()) as unknown);
-  },
+  read: (slot: TunnelSlot) => readTunnelRecord(slot),
   async write(slot: TunnelSlot, rec: TunnelRecord) {
     const { put } = await import("@vercel/blob");
     await put(tunnelBlobPath(slot), JSON.stringify(rec), {

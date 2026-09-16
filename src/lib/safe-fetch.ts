@@ -27,12 +27,15 @@
 // - error messages carry a reason category only, never the URL (credentials,
 //   query, and path are never logged or surfaced).
 //
-// Opt-in DNS pinning via `resolveFn`: when provided, every hop's hostname is
-// resolved and any blocked resolved IP (or any lookup failure — the
-// destination is then unverifiable) throws `SsrfBlockedError`. DNS is
-// deliberately opt-in rather than default-on so unit tests with injected
-// transports stay offline-deterministic; the static literal/hostname checks,
-// the allowlist pin, and redirect re-validation always run.
+// - URLs carrying userinfo (username/password) are rejected outright —
+//   credentials must never ride an outbound fetch;
+// - DNS pinning on every non-literal hop via node:dns (default; overridable
+//   with `resolveFn`, skippable with `resolveFn: null` for injected test
+//   transports): a hostname resolving to a blocked IP — or failing to
+//   resolve at all — throws before any socket opens, closing the
+//   DNS-rebinding window between check and fetch as far as a pre-check can;
+
+import { lookup } from "node:dns/promises";
 
 export class SsrfBlockedError extends Error {
   readonly code = "ssrf_blocked" as const;
@@ -79,10 +82,11 @@ export interface SafeFetchOptions {
   signal?: AbortSignal;
   /** Injectable transport for tests (default global fetch). */
   fetchFn?: SafeFetchFn;
-  /** Injectable DNS lookup for tests: hostname -> resolved IP strings. When
-   * provided, every hop is DNS-pinned (blocked resolved IP or lookup failure
-   * throws). When omitted, DNS validation is skipped. */
-  resolveFn?: (hostname: string) => Promise<string[]>;
+  /** Injectable DNS lookup: hostname -> resolved IP strings. `undefined`
+   * (default) uses node:dns/promises `lookup` (fail closed on error);
+   * pass `null` to skip DNS validation (injected test transports only —
+   * production callers must not skip). */
+  resolveFn?: ((hostname: string) => Promise<string[]>) | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -477,12 +481,28 @@ export function isAllowedHost(
 
 const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
 
+/**
+ * Default DNS pinning (node:dns/promises). Exported so routes with explicit
+ * transport wiring can pass it through; safeFetch uses it whenever
+ * `resolveFn` is left `undefined`.
+ */
+export async function dnsResolve(hostname: string): Promise<string[]> {
+  const records = await lookup(hostname, { all: true });
+  return records.map((r) => r.address);
+}
+
 async function checkUrl(raw: string, opts: SafeFetchOptions): Promise<URL> {
   let url: URL;
   try {
     url = new URL(raw);
   } catch {
     throw new SsrfBlockedError("unparseable URL");
+  }
+  // Credentials must never ride an outbound fetch (checked per hop, so a
+  // redirect cannot smuggle userinfo in either). Reason-only message: the
+  // URL itself is never surfaced.
+  if (url.username !== "" || url.password !== "") {
+    throw new SsrfBlockedError("credentialed URL");
   }
   const allowLoopback = opts.allowLoopback === true;
   const host = normalizeHost(url.hostname);
@@ -501,12 +521,15 @@ async function checkUrl(raw: string, opts: SafeFetchOptions): Promise<URL> {
   if (!isAllowedHost(host, opts.allowHosts)) {
     throw new SsrfBlockedError("destination not allowlisted");
   }
-  // Opt-in DNS pinning (skipped for IP literals — already validated above).
+  // DNS pinning (skipped for IP literals — already validated above — and
+  // for `resolveFn: null` test transports). Default is a real node:dns
+  // lookup; any failure fails closed since the destination is unverifiable.
   const isLiteral = parseIPv4Literal(host) !== null || host.includes(":");
-  if (!isLiteral && opts.resolveFn) {
+  if (!isLiteral && opts.resolveFn !== null) {
+    const resolve = opts.resolveFn ?? dnsResolve;
     let addrs: string[];
     try {
-      addrs = await opts.resolveFn(host);
+      addrs = await resolve(host);
     } catch {
       // Unverifiable destination: fail closed.
       throw new SsrfBlockedError("destination unverifiable");

@@ -1,6 +1,6 @@
 import type { NextRequest, NextResponse } from "next/server";
-import { isLoopbackHost, SsrfBlockedError, safeFetch } from "@/lib/safe-fetch";
-import { type BatchDeps, handleBatch } from "@/lib/utils";
+import { SsrfBlockedError, safeFetch } from "@/lib/safe-fetch";
+import { type BatchDeps, handleBatch, shouldAllowLoopback } from "@/lib/utils";
 
 export const runtime = "nodejs";
 
@@ -29,7 +29,7 @@ const defaultDeps: BatchDeps = {
     // first aborts the sub-fetch).
     const res = await safeFetch(url, {
       allowHosts: [originHost],
-      allowLoopback: isLoopbackHost(originHost),
+      allowLoopback: shouldAllowLoopback(originHost),
       timeoutMs: 8000,
       headers: { "x-request-id": requestId },
       signal,

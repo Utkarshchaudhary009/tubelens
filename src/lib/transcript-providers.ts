@@ -466,8 +466,10 @@ export interface TranscriptRunnerDeps {
   ) => Promise<TranscriptSegmentDTO[]>;
   /** Omit to disable HTTP providers (unit-test/offline mode). */
   fetchFn?: FetchLike;
-  /** Opt-in DNS pinning for provider + track-follow-up fetches (safeFetch). */
-  resolveFn?: (hostname: string) => Promise<string[]>;
+  /** Opt-in DNS pinning for provider + track-follow-up fetches (safeFetch).
+   * Omit (or leave undefined) to skip DNS — the waterfall's injected
+   * transports must stay offline-deterministic under bun:test. */
+  resolveFn?: ((hostname: string) => Promise<string[]>) | null;
   env?: Record<string, string | undefined>;
   now?: () => number;
   /** Single overall fail-fast budget; per-provider caps clamp to remaining. */
@@ -823,18 +825,20 @@ async function runHttpProvider(
   }
   // Network/abort errors propagate as-is (timeouts classify 504 and stay
   // stale-eligible via the route's predicate). The fetch runs through the
-  // SSRF boundary pinned to the registry's provider hosts plus the entry's
-  // own declared host (same 8s-clamped step budget); a compromised listing
-  // cannot redirect the request off-host, and SsrfBlockedError simply fails
-  // over to the next provider.
+  // SSRF boundary pinned to the entry's own declared host (same 8s-clamped
+  // step budget) — a compromised listing cannot redirect the request
+  // off-host, not even laterally to another provider, and SsrfBlockedError
+  // simply fails over to the next provider. DNS stays skipped unless the
+  // caller passes resolveFn explicitly (offline unit-test determinism).
+  const pin = providerPin(endpoint);
   const res = await safeFetch(endpoint, {
-    allowHosts: [...TRANSCRIPT_PROVIDER_HOSTS, ...providerPin(endpoint)],
+    allowHosts: pin.length > 0 ? pin : TRANSCRIPT_PROVIDER_HOSTS,
     timeoutMs: stepMs,
     method: def.method,
     headers,
     body: rawBody,
     fetchFn: adaptFetchLike(fetchFn),
-    resolveFn: deps.resolveFn,
+    resolveFn: deps.resolveFn ?? null,
   });
   if (!res.ok) {
     // A bare 4xx is transcript-scoped (never video_not_found): only
@@ -861,7 +865,7 @@ async function runHttpProvider(
       lang,
       remainingStepMs,
       fetchFn,
-      deps.resolveFn,
+      deps.resolveFn ?? null,
     );
   }
   let json: unknown;
@@ -902,7 +906,7 @@ async function runVttPayload(
   lang: string,
   remainingStepMs: () => number,
   fetchFn: FetchLike,
-  resolveFn?: (hostname: string) => Promise<string[]>,
+  resolveFn?: ((hostname: string) => Promise<string[]>) | null,
 ): Promise<TranscriptSegmentDTO[]> {
   let json: unknown;
   try {

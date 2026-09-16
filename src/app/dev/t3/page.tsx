@@ -1,6 +1,5 @@
-import { headers } from "next/headers";
 import { redirect } from "next/navigation";
-import { isLoopbackHost, safeFetch } from "@/lib/safe-fetch";
+import { readTunnelRecord } from "@/lib/tunnel-blob";
 import { isT3PairingUrl } from "@/lib/tunnel-url";
 
 // /dev/t3 — bounce the browser straight into the live T3 remote-dev session.
@@ -30,39 +29,15 @@ interface TunnelSlotPayload {
 }
 
 async function getPairingRecord(): Promise<TunnelSlotPayload["data"]> {
-  const h = await headers();
-  const host =
-    h.get("x-forwarded-host")?.split(",")[0]?.trim() || h.get("host");
-  if (!host) {
+  // Direct same-process Blob read (Part B Phase 10): the previous
+  // implementation self-fetched /api/v1/tunnel-url over HTTP from a
+  // Host-derived URL, trusting the request Host header for a server-side
+  // fetch. The store read needs no Host at all.
+  if (!process.env.BLOB_READ_WRITE_TOKEN) {
     return null;
   }
-  const proto =
-    h.get("x-forwarded-proto")?.split(",")[0]?.trim() ||
-    (process.env.NODE_ENV === "development" ? "http" : "https");
   try {
-    // SSRF boundary (Part B Phase 10): the target host comes from request
-    // headers, so the read is pinned to that first-hop host and every
-    // redirect hop re-validates against it. Loopback http is allowed for
-    // local dev only (mirrors the proto selection below).
-    const target = `${proto}://${host}/api/v1/tunnel-url?name=t3`;
-    let targetHost: string;
-    try {
-      targetHost = new URL(target).hostname.toLowerCase();
-    } catch {
-      return null;
-    }
-    const res = await safeFetch(target, {
-      allowHosts: [targetHost],
-      allowLoopback:
-        process.env.NODE_ENV !== "production" && isLoopbackHost(targetHost),
-      timeoutMs: 8000,
-      cache: "no-store",
-    });
-    if (!res.ok) {
-      return null;
-    }
-    const body = (await res.json()) as TunnelSlotPayload;
-    return body.data;
+    return await readTunnelRecord("t3");
   } catch {
     return null;
   }

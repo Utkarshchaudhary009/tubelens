@@ -6,6 +6,7 @@ import { NextRequest } from "next/server";
 import { classifyAudioError } from "../audio";
 import { handleSponsors } from "../community";
 import {
+  dnsResolve,
   isAllowedHost,
   isBlockedAddress,
   isLoopbackHost,
@@ -19,7 +20,12 @@ import {
   runTranscriptWaterfall,
   TRANSCRIPT_PROVIDERS,
 } from "../transcript-providers";
-import { handleBatch } from "../utils";
+import {
+  handleTunnelGet,
+  type TunnelRecord,
+  type TunnelSlot,
+} from "../tunnel-url";
+import { handleBatch, shouldAllowLoopback } from "../utils";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -150,6 +156,7 @@ describe("safe-fetch static boundary", () => {
     expect(parseIPv4Literal("0x7f.000.000.001")).toEqual([127, 0, 0, 1]);
     expect(parseIPv4Literal("0xC0.168.1.1")).toEqual([192, 168, 1, 1]);
     expect(parseIPv4Literal("3232235777")).toEqual([192, 168, 1, 1]);
+    expect(parseIPv4Literal("0x7f.1")).toEqual([127, 0, 0, 1]);
     for (const host of [
       "2130706433",
       "0x7f.0.0.1",
@@ -157,10 +164,24 @@ describe("safe-fetch static boundary", () => {
       "0x7f.000.000.001",
       "0xC0.168.1.1",
       "3232235777",
-      "285203 whitenoise",
+      "0x7f.1",
+      "127%2E0%2E0%2E1",
+      "127%252E0%252E0%252E1",
     ]) {
       expect(isBlockedAddress(host)).toBe(true);
     }
+  });
+
+  test("IPv6 transition tricks decode to blocked/private", () => {
+    // IPv4-mapped with a decimal tail.
+    expect(isBlockedAddress("::ffff:127.0.0.1")).toBe(true);
+    expect(isBlockedAddress("[::ffff:127.0.0.1]")).toBe(true);
+    expect(isBlockedAddress("::ffff:10.0.0.1")).toBe(true);
+    expect(isBlockedAddress("::ffff:8.8.8.8")).toBe(false);
+    // 6to4 2002::/16 embeds the IPv4 destination.
+    expect(isBlockedAddress("2002:7f00:1::")).toBe(true);
+    expect(isBlockedAddress("2002:0a00:0001::")).toBe(true);
+    expect(isBlockedAddress("2002:0808:0808::")).toBe(false);
   });
 
   test("trick-encoded URLs blocked at safeFetch without fetching", async () => {
@@ -190,15 +211,32 @@ describe("safe-fetch static boundary", () => {
     );
   });
 
-  test("rejection carries no credentials", async () => {
+  test("credentialed URLs rejected on first hop, never fetched", async () => {
     const err = await ssrfOf(
-      safeFetch("https://user:s3cret@evil.example/", {
+      safeFetch("https://user:s3cret@yttools.co/api/t", {
         allowHosts: ["yttools.co"],
         fetchFn: mustNotFetch,
+        resolveFn: mustNotResolve,
       }),
     );
+    expect(err.message).toContain("credentialed URL");
     expect(String(err)).not.toContain("s3cret");
     expect(String(err)).not.toContain("user");
+  });
+
+  test("credentialed redirect targets rejected, never fetched", async () => {
+    const fetchFn = mockFetch(() =>
+      redirectTo("https://user:s3cret@yttools.co/other"),
+    );
+    const err = await ssrfOf(
+      safeFetch("https://yttools.co/start", {
+        allowHosts: ["yttools.co"],
+        fetchFn,
+        resolveFn: publicDns,
+      }),
+    );
+    expect(err.message).toContain("credentialed URL");
+    expect(fetchFn.calls).toEqual(["https://yttools.co/start"]);
   });
 });
 
@@ -301,6 +339,43 @@ describe("safe-fetch dns pinning and matching", () => {
         },
       }),
     );
+  });
+
+  test("default resolveFn is real node:dns and fails closed offline-safe", async () => {
+    // localhost resolves via the OS (no network needed): the default path
+    // returns loopback IPs, which the boundary then rejects — all without
+    // passing resolveFn explicitly.
+    const addrs = await dnsResolve("localhost");
+    expect(addrs.length).toBeGreaterThan(0);
+    expect(
+      addrs.every((a) => isBlockedAddress(a, { allowLoopback: false })),
+    ).toBe(true);
+    await ssrfOf(
+      safeFetch("https://localhost/", {
+        allowHosts: ["localhost"],
+        fetchFn: mustNotFetch,
+      }),
+    );
+    // ... while allowLoopback lets the same default-DNS hop through.
+    const fetchFn = mockFetch(() => ok("local"));
+    const res = await safeFetch("https://localhost/", {
+      allowHosts: ["localhost"],
+      allowLoopback: true,
+      fetchFn,
+    });
+    expect(res.status).toBe(200);
+    expect(fetchFn.calls).toEqual(["https://localhost/"]);
+  });
+
+  test("resolveFn: null skips DNS for injected transports", async () => {
+    const fetchFn = mockFetch(() => ok("done"));
+    const res = await safeFetch("https://yttools.co/api/t", {
+      allowHosts: ["yttools.co"],
+      fetchFn,
+      resolveFn: null,
+    });
+    expect(res.status).toBe(200);
+    expect(fetchFn.calls).toEqual(["https://yttools.co/api/t"]);
   });
 
   test("isAllowedHost: exact, suffix, regex, case-insensitive", () => {
@@ -473,5 +548,80 @@ describe("safe-fetch caller regressions", () => {
     expect(result.segments).toHaveLength(1);
     expect(calls).toHaveLength(2);
     expect(calls.every((u) => !u.includes("evil.example"))).toBe(true);
+  });
+
+  test("transcript lateral redirect to another provider is blocked", async () => {
+    const calls: string[] = [];
+    const fetchFn = (async (url: string) => {
+      calls.push(url);
+      return {
+        ok: false,
+        status: 302,
+        headers: {
+          get: (name: string) =>
+            name.toLowerCase() === "location" ? "https://kome.ai/other" : null,
+        },
+        json: async () => ({}),
+        text: async () => "",
+      };
+    }) as unknown as FetchLike;
+    const yttools = TRANSCRIPT_PROVIDERS[1];
+    if (!yttools) {
+      throw new Error("registry fixture missing");
+    }
+    await expect(
+      runTranscriptWaterfall("dQw4w9WgXcQ", "en", {
+        fetchNative: async () => {
+          throw new Error("no native");
+        },
+        fetchFn,
+        providers: [yttools],
+      }),
+    ).rejects.toBeInstanceOf(SsrfBlockedError);
+    expect(calls).toHaveLength(1);
+  });
+
+  test("shouldAllowLoopback is dev-only, never production", () => {
+    // NODE_ENV is typed readonly: write through a string index like the
+    // batch env helper in phase10.test.ts.
+    const env = process.env as Record<string, string | undefined>;
+    const saved = env.NODE_ENV;
+    try {
+      env.NODE_ENV = "production";
+      expect(shouldAllowLoopback("127.0.0.1")).toBe(false);
+      expect(shouldAllowLoopback("localhost")).toBe(false);
+      env.NODE_ENV = "development";
+      expect(shouldAllowLoopback("127.0.0.1")).toBe(true);
+      expect(shouldAllowLoopback("localhost")).toBe(true);
+      expect(shouldAllowLoopback("10.0.0.1")).toBe(false);
+      expect(shouldAllowLoopback("example.com")).toBe(false);
+    } finally {
+      if (saved === undefined) {
+        delete env.NODE_ENV;
+      } else {
+        env.NODE_ENV = saved;
+      }
+    }
+  });
+
+  test("tunnel read maps SsrfBlockedError to typed 502 hint", async () => {
+    const res = await handleTunnelGet(
+      req("http://x/api/v1/tunnel-url?name=t3"),
+      {
+        store: {
+          read: async () => {
+            throw new SsrfBlockedError("blocked destination");
+          },
+          write: async (_slot: TunnelSlot, rec: TunnelRecord) => rec,
+        },
+        expectedToken: undefined,
+      },
+    );
+    expect(res.status).toBe(502);
+    expect(res.headers.get("X-Request-Id")).toBe("ssrf");
+    const body = await res.json();
+    expect(body.error.code).toBe("upstream_degraded");
+    expect(typeof body.error.hint).toBe("string");
+    expect(JSON.stringify(body)).not.toContain("at ");
   });
 });
