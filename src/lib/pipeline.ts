@@ -23,6 +23,7 @@ import {
 } from "./authorize";
 import { ConfigError, getConfig } from "./config";
 import { errorResponse } from "./errors";
+import { applyCorsHeaders, applySecurityHeaders } from "./http-headers";
 import {
   getObservabilityProvider,
   type ObservabilityProvider,
@@ -150,6 +151,10 @@ export function withRequestContext(
     // Pre-derive the id so even config/auth failures carry request-id
     // headers and meta.
     const requestId = resolveRequestId(req);
+    // Phase 09: the request Origin threads into every error/success return
+    // below so real responses carry the CORS grant for allowlisted origins
+    // (never `*`, no credentials).
+    const origin = req.headers.get("origin");
 
     // Liveness-only invariant: bypassRateLimit is honored exclusively on
     // the approved liveness path. Any other route requesting it is a
@@ -171,6 +176,7 @@ export function withRequestContext(
         message: "Service route misconfigured.",
         hint: "Report the X-Request-Id; operators must remove bypassRateLimit from this route.",
         status: 500,
+        origin,
       });
     }
 
@@ -188,6 +194,7 @@ export function withRequestContext(
           message: "Service configuration is incomplete.",
           hint: "Retry shortly; operators must restore the missing security configuration.",
           status: 503,
+          origin,
         });
       }
       throw err;
@@ -209,6 +216,7 @@ export function withRequestContext(
         message: "Authentication service unavailable.",
         hint: "Retry shortly; the request was rejected rather than served without identity.",
         status: 503,
+        origin,
       });
     }
 
@@ -229,6 +237,7 @@ export function withRequestContext(
         message: "Product policy unavailable.",
         hint: "Retry shortly; the request was rejected rather than served without an entitlement decision.",
         status: 503,
+        origin,
       });
     }
 
@@ -253,7 +262,12 @@ export function withRequestContext(
       // allow-all decision here, exactly like the handler-throw path below
       // (errorResponse already sets stub values via baseHeaders; this keeps
       // the pipeline the single stamper so values never drift).
-      stampRateLimitHeaders(baselineDenied, ctx, defaultRateLimitDecision());
+      stampRateLimitHeaders(
+        baselineDenied,
+        ctx,
+        defaultRateLimitDecision(),
+        origin,
+      );
       return baselineDenied;
     }
 
@@ -283,6 +297,7 @@ export function withRequestContext(
           message: "Rate limiter unavailable.",
           hint: "Retry shortly; the request was not served without protection.",
           status: 503,
+          origin,
         });
       }
     }
@@ -294,6 +309,7 @@ export function withRequestContext(
         hint: "Slow down and retry after the time in Retry-After.",
         status: 429,
         retryAfter: decision.retryAfter ?? 60,
+        origin,
       });
       // Stamp the limiter decision's values, not the stub defaults.
       res.headers.set("X-RateLimit-Limit", String(decision.limit));
@@ -314,12 +330,13 @@ export function withRequestContext(
         message: "Internal server error.",
         hint: "Retry the request; report the X-Request-Id if the failure persists.",
         status: 500,
+        origin,
       });
-      stampRateLimitHeaders(res, ctx, decision);
+      stampRateLimitHeaders(res, ctx, decision, origin);
       return res;
     }
 
-    stampRateLimitHeaders(res, ctx, decision);
+    stampRateLimitHeaders(res, ctx, decision, origin);
 
     // Accounting stage (Phase 01: no-op recorder). Best-effort and bounded:
     // recorder invocation is dispatched in a later macrotask so it runs
@@ -366,6 +383,7 @@ function stampRateLimitHeaders(
   res: NextResponse,
   ctx: RequestContext,
   decision: RateLimitDecision,
+  origin?: string | null,
 ): void {
   if (!res.headers.get("X-Request-Id")) {
     res.headers.set("X-Request-Id", ctx.requestId);
@@ -373,6 +391,11 @@ function stampRateLimitHeaders(
   res.headers.set("X-RateLimit-Limit", String(decision.limit));
   res.headers.set("X-RateLimit-Remaining", String(decision.remaining));
   res.headers.set("X-RateLimit-Reset", String(decision.reset));
+  // Phase 09: handler-built raw responses bypass baseHeaders — backfill the
+  // security baseline here so headers survive every status incl. 4xx/5xx.
+  // The request origin grants CORS the same way (never `*`, no credentials).
+  applySecurityHeaders(res.headers);
+  applyCorsHeaders(res.headers, origin ?? null);
 }
 
 function usageRecord(

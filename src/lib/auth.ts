@@ -91,13 +91,18 @@ export function resetAuthProvider(): void {
 /**
  * Typed 401 JSON for unauthenticated callers. Machine-readable by design:
  * protected API routes must return this, never a browser redirect or 404.
+ * The optional origin grants CORS so browser clients can read the denial.
  */
-export function unauthenticatedResponse(requestId: string): NextResponse {
+export function unauthenticatedResponse(
+  requestId: string,
+  origin?: string | null,
+): NextResponse {
   return errorResponse(requestId, {
     code: "unauthenticated",
     message: "Authentication is required.",
     hint: "Sign in and retry with a valid session; anonymous callers cannot access this endpoint.",
     status: 401,
+    origin: origin ?? null,
   });
 }
 
@@ -113,11 +118,12 @@ export function unauthenticatedResponse(requestId: string): NextResponse {
 export function requireAuth(ctx: {
   auth: AuthContext;
   requestId: string;
+  origin?: string | null;
 }): NextResponse | undefined {
   if (ctx.auth.authenticated) {
     return undefined;
   }
-  return unauthenticatedResponse(ctx.requestId);
+  return unauthenticatedResponse(ctx.requestId, ctx.origin ?? null);
 }
 
 export type {

@@ -58,16 +58,27 @@ export async function PATCH(
       const body = await readBoundedJson(r);
       if (!body.ok) {
         if (body.error.code === "body_too_large") {
-          return errorResponse(c.requestId, { ...body.error });
+          return errorResponse(c.requestId, {
+            ...body.error,
+            origin: r.headers.get("origin"),
+          });
         }
         return errorResponse(c.requestId, {
           code: "invalid_body",
           message: "Request body must be valid JSON.",
           hint: 'Send a JSON body like { "role": "support" } with Content-Type: application/json.',
           status: 400,
+          origin: r.headers.get("origin"),
         });
       }
-      return handleRolePatch(c.requestId, c.auth, userId, body.value);
+      return handleRolePatch(
+        c.requestId,
+        c.auth,
+        userId,
+        body.value,
+        {},
+        r.headers.get("origin"),
+      );
     },
     { auth: clerkAuthProvider },
     "admin.users.role",
@@ -82,12 +93,13 @@ export async function handleRolePatch(
   targetUserId: string,
   rawBody: unknown,
   deps: RolePatchDeps = {},
+  origin?: string | null,
 ): Promise<NextResponse> {
   const caller = requireAdmin(auth);
   if (!caller.ok) {
     return caller.code === "unauthenticated"
-      ? unauthenticatedResponse(requestId)
-      : forbiddenResponse(requestId);
+      ? unauthenticatedResponse(requestId, origin)
+      : forbiddenResponse(requestId, undefined, undefined, origin);
   }
   if (!USER_ID_PATTERN.test(targetUserId)) {
     return errorResponse(requestId, {
@@ -95,12 +107,17 @@ export async function handleRolePatch(
       message: "Invalid user id.",
       hint: "Use a Clerk user id like user_abc123; it must match /^user_[A-Za-z0-9]+$/.",
       status: 400,
+      origin: origin ?? null,
     });
   }
   const parsed = roleBodySchema.safeParse(rawBody);
   if (!parsed.success) {
     const mapped = mapAdminBodyError("role", parsed.error.issues);
-    return errorResponse(requestId, { ...mapped, status: 400 });
+    return errorResponse(requestId, {
+      ...mapped,
+      status: 400,
+      origin: origin ?? null,
+    });
   }
   const { role: newRole, reason } = parsed.data;
   if (caller.userId === targetUserId && newRole !== "admin") {
@@ -108,6 +125,7 @@ export async function handleRolePatch(
       requestId,
       "Self-demotion is not allowed.",
       "Admins cannot change their own role to a non-admin value; ask another admin to make this change.",
+      origin,
     );
   }
 
@@ -122,6 +140,7 @@ export async function handleRolePatch(
     clerk,
     caller.userId,
     { signal: AbortSignal.timeout(8000) },
+    origin,
   );
   if (callerCheck) {
     return callerCheck;
@@ -137,7 +156,7 @@ export async function handleRolePatch(
     });
     oldRole = normalizeRole(record.publicMetadata?.role);
   } catch (err) {
-    return clerkErrorResponse(requestId, err);
+    return clerkErrorResponse(requestId, err, origin);
   }
   try {
     await clerk.updateUserMetadata(
@@ -147,7 +166,7 @@ export async function handleRolePatch(
     );
   } catch (err) {
     if (!isClerkTimeout(err)) {
-      return clerkErrorResponse(requestId, err);
+      return clerkErrorResponse(requestId, err, origin);
     }
     // The SDK accepts no AbortSignal, so a timed-out write may still have
     // landed: one bounded re-fetch decides between "reconciled" (the value is
@@ -159,7 +178,7 @@ export async function handleRolePatch(
       signal: AbortSignal.timeout(8000),
     });
     if (latest?.publicMetadata?.role !== newRole) {
-      return clerkErrorResponse(requestId, err);
+      return clerkErrorResponse(requestId, err, origin);
     }
     recordAuditEvent({
       action: "user.role.change_reconciled",
@@ -181,6 +200,7 @@ export async function handleRolePatch(
         requestId,
         cacheControl: CACHE_CONTROL.noStore,
         status: 504,
+        origin: origin ?? null,
         warnings: [
           {
             code: "reconciled_after_timeout",
@@ -208,6 +228,6 @@ export async function handleRolePatch(
       role: newRole,
       sessionTokenMayRefreshWithinSeconds: 60,
     },
-    { requestId, cacheControl: CACHE_CONTROL.noStore },
+    { requestId, cacheControl: CACHE_CONTROL.noStore, origin: origin ?? null },
   );
 }

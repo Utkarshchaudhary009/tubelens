@@ -557,12 +557,13 @@ export async function requireAuthoritativeCaller(
   apiKeys: ApiKeysClient,
   callerUserId: string,
   opts?: ClerkCallOptions,
+  origin?: string | null,
 ): Promise<AuthoritativeCaller> {
   let record: ClerkUserRecord;
   try {
     record = await apiKeys.getUser(callerUserId, opts);
   } catch (err) {
-    return { ok: false, response: clerkErrorResponse(requestId, err) };
+    return { ok: false, response: clerkErrorResponse(requestId, err, origin) };
   }
   const role: UserRole = normalizeRole(record.publicMetadata?.role);
   if (role !== "admin") {
@@ -573,6 +574,7 @@ export async function requireAuthoritativeCaller(
         message: "Admin access is no longer valid.",
         hint: "Your admin role changed or the session is stale; sign in again as an admin and retry.",
         status: 403,
+        origin: origin ?? null,
       }),
     };
   }

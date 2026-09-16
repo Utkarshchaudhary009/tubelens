@@ -100,12 +100,14 @@ export function forbiddenResponse(
   requestId: string,
   message = "Admin access required.",
   hint = "Sign in as an admin user; non-admin callers cannot change tiers or roles.",
+  origin?: string | null,
 ): ReturnType<typeof errorResponse> {
   return errorResponse(requestId, {
     code: "forbidden",
     message,
     hint,
     status: 403,
+    origin: origin ?? null,
   });
 }
 
