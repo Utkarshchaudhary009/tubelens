@@ -33,10 +33,14 @@ jobs:
             echo "PAT secret not set; skipping watchdog (fail-open)."
             exit 0
           fi
-          LIVE="$(gh run list --workflow remote-t3.yml --limit 10 --json status --jq '[.[] | select(.status == "in_progress" or .status == "queued")] | length' || true)"
-          if [ "$LIVE" != "0" ]; then
-            echo "remote-t3 already live/queued (${LIVE:-unknown}); nothing to do."
+          LIVE="$(gh run list --workflow remote-t3.yml -R "${{ github.repository }}" --limit 10 --json status --jq '[.[] | select(.status == "in_progress" or .status == "queued")] | length' || echo ERROR)"
+          if [ -z "$LIVE" ] || [ "$LIVE" = "ERROR" ]; then
+            echo "remote-t3 status unknown; skipping dispatch (fail-open)."
             exit 0
           fi
-          gh workflow run remote-t3.yml --ref main
+          if [ "$LIVE" != "0" ]; then
+            echo "remote-t3 already live/queued (${LIVE}); nothing to do."
+            exit 0
+          fi
+          gh workflow run remote-t3.yml -R "${{ github.repository }}" --ref main
           echo "No live remote-t3 run; dispatched a fresh one."
