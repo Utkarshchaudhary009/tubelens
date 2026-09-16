@@ -25,7 +25,7 @@ import {
 } from "@/lib/envelope";
 import { errorResponse } from "@/lib/errors";
 import { isUpstreamTimeout, textOf } from "@/lib/mappers";
-import { isPlausibleVideoId } from "@/lib/validate";
+import { isPlausibleVideoId, readBoundedJson } from "@/lib/validate";
 
 // ---------------------------------------------------------------------------
 // RSS: GET /api/v1/channels/:id/rss
@@ -633,10 +633,13 @@ export async function handleBatch(
 ): Promise<NextResponse> {
   const requestId = getRequestId(req);
 
-  let raw: unknown;
-  try {
-    raw = await req.json();
-  } catch {
+  // Bounded pre-parse: oversized bodies are 413 before JSON.parse ever runs;
+  // anything else malformed keeps the legacy invalid_batch shape below.
+  const body = await readBoundedJson(req);
+  if (!body.ok) {
+    if (body.error.code === "body_too_large") {
+      return errorResponse(requestId, { ...body.error });
+    }
     return errorResponse(requestId, {
       code: "invalid_batch",
       message: "Invalid batch body.",
@@ -644,6 +647,7 @@ export async function handleBatch(
       status: 400,
     });
   }
+  const raw: unknown = body.value;
   const parsed = batchBodySchema.safeParse(raw);
   if (!parsed.success) {
     const tooMany = parsed.error.issues.some(

@@ -22,6 +22,7 @@ import { CACHE_CONTROL, successResponse } from "@/lib/envelope";
 import { errorResponse } from "@/lib/errors";
 import { withRequestContext } from "@/lib/pipeline";
 import { normalizeTier } from "@/lib/product";
+import { readBoundedJson } from "@/lib/validate";
 
 export const runtime = "nodejs";
 
@@ -51,10 +52,13 @@ export async function PATCH(
   const { userId } = await ctx.params;
   return withRequestContext(
     async (r, c) => {
-      let rawBody: unknown;
-      try {
-        rawBody = await r.json();
-      } catch {
+      // Bounded pre-parse: oversized bodies are 413 before JSON.parse ever
+      // runs; anything else malformed keeps the legacy invalid_body shape.
+      const body = await readBoundedJson(r);
+      if (!body.ok) {
+        if (body.error.code === "body_too_large") {
+          return errorResponse(c.requestId, { ...body.error });
+        }
         return errorResponse(c.requestId, {
           code: "invalid_body",
           message: "Request body must be valid JSON.",
@@ -62,7 +66,7 @@ export async function PATCH(
           status: 400,
         });
       }
-      return handleTierPatch(c.requestId, c.auth, userId, rawBody);
+      return handleTierPatch(c.requestId, c.auth, userId, body.value);
     },
     { auth: clerkAuthProvider },
     "admin.users.tier",

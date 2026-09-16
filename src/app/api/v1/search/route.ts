@@ -18,6 +18,7 @@ import {
 } from "@/lib/mappers";
 import {
   DEFAULT_LIMIT,
+  parseBoundedCursor,
   parseLang,
   parseLimit,
   parseRegion,
@@ -88,8 +89,13 @@ export async function handleSearch(
 
   // Cursor requests skip q/type validation entirely — only limit/region/lang
   // apply. Unknown/expired cursors yield [] + next: null, never an error.
+  // An overlong cursor is rejected BEFORE any cache/upstream work.
   const cursor = params.get("cursor");
   if (cursor) {
+    const bounded = parseBoundedCursor(cursor);
+    if (!bounded.ok) {
+      return errorResponse(requestId, { ...bounded.error });
+    }
     const limit = parseLimit(params.get("limit"));
     if (limit === null) {
       return errorResponse(requestId, {

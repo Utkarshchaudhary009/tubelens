@@ -15,6 +15,7 @@ import { type CommentDTO, classifyFeedError, mapComment } from "@/lib/mappers";
 import {
   DEFAULT_LIMIT,
   isPlausibleVideoId,
+  parseBoundedCursor,
   parseLang,
   parseLimit,
   parseRegion,
@@ -124,9 +125,14 @@ export async function handleComments(
   const scope = `comments:${id}`;
 
   // Cursor requests skip re-fetching page 1 — only limit/region/lang apply.
-  // Unknown/expired cursors yield [] + next: null, never an error.
+  // Unknown/expired cursors yield [] + next: null, never an error. An
+  // overlong cursor is rejected BEFORE any cache/upstream work.
   const cursor = params.get("cursor");
   if (cursor) {
+    const bounded = parseBoundedCursor(cursor);
+    if (!bounded.ok) {
+      return errorResponse(requestId, { ...bounded.error });
+    }
     return serveContinuation(
       requestId,
       region,

@@ -23,6 +23,8 @@ import {
 } from "@/lib/music";
 import {
   DEFAULT_LIMIT,
+  parseBoundedCursor,
+  parseBoundedQuery,
   parseLang,
   parseLimit,
   parseRegion,
@@ -82,8 +84,13 @@ export async function handleMusicSearch(
 
   // Cursor requests skip q/type validation entirely — only limit/region/lang
   // apply. Unknown/expired cursors yield [] + next: null, never an error.
+  // An overlong cursor is rejected BEFORE any cache/upstream work.
   const cursor = params.get("cursor");
   if (cursor) {
+    const bounded = parseBoundedCursor(cursor);
+    if (!bounded.ok) {
+      return errorResponse(requestId, { ...bounded.error });
+    }
     const limit = parseLimit(params.get("limit"));
     if (limit === null) {
       return errorResponse(requestId, {
@@ -101,6 +108,13 @@ export async function handleMusicSearch(
   const parsed = parseMusicSearchParams(params);
   if (!parsed.ok) {
     return errorResponse(requestId, { ...parsed.error });
+  }
+  // Music-native params live in lib/music.ts (out of Phase 08 scope), so the
+  // shared q-cap is wired here — before cache-key construction, like the
+  // /search and /suggestions parsers enforce internally.
+  const qBounded = parseBoundedQuery(parsed.value.q);
+  if (!qBounded.ok) {
+    return errorResponse(requestId, { ...qBounded.error });
   }
   const { q, type, limit } = parsed.value;
   const regionValue = parseRegion(params.get("region"));

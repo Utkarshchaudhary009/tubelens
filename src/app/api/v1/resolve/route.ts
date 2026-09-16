@@ -2,7 +2,7 @@ import type { NextRequest } from "next/server";
 import { CACHE_CONTROL, getRequestId, successResponse } from "@/lib/envelope";
 import { errorResponse } from "@/lib/errors";
 import { classifyUrl, UnresolvableError } from "@/lib/resolve";
-import { parseLang, parseRegion } from "@/lib/validate";
+import { parseBoundedUrl, parseLang, parseRegion } from "@/lib/validate";
 
 export const runtime = "nodejs";
 
@@ -23,6 +23,13 @@ export async function GET(req: NextRequest) {
       hint: "Add ?url= with a YouTube link, e.g. /api/v1/resolve?url=https://youtu.be/dQw4w9WgXcQ.",
       status: 400,
     });
+  }
+
+  // Overlong urls are rejected BEFORE classification (never cached, and the
+  // classifier never sees an unbounded string).
+  const bounded = parseBoundedUrl(url);
+  if (!bounded.ok) {
+    return errorResponse(requestId, { ...bounded.error });
   }
 
   try {
