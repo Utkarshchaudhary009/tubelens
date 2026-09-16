@@ -14,6 +14,71 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Phase 11: static secret scan ($0 grep — no external action, no token).
+  # Mirrors SECRET_SCAN_PATTERNS in src/lib/redact.ts over shippable files
+  # (unit-test fixtures carry intentionally fake secrets; the bun suite's
+  # repo-wide scan covers those paths). Patterns use regex syntax rather
+  # than example literals so this file never matches itself.
+  secret-scan:
+    # Least privilege: tokenless clone + grep need no token at all, so this
+    # job takes none of the workflow-level pull-requests:write grant.
+    permissions: {}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout (tokenless)
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          git clone "https://github.com/${GITHUB_REPOSITORY}.git" .
+          git fetch origin "$GITHUB_SHA" --depth 1
+          git checkout "$GITHUB_SHA"
+
+      - name: Static secret scan
+        run: |
+          set -u
+          scan() {
+            desc="$1"; pattern="$2"
+            # NUL-delimited throughout so filenames with spaces survive;
+            # xargs -r runs nothing on an empty list (grep would otherwise
+            # read stdin and hang); `--` guards patterns starting with `-`.
+            hits="$(git ls-files -z | grep -zv '__tests__' | grep -zv '\.test\.' | xargs -0r grep -nE -- "$pattern" 2>/dev/null || true)"
+            if [ -z "$hits" ]; then
+              echo "secret-scan OK: $desc"
+              return 0
+            fi
+            # Drop documentation/placeholder lines (mirrors isPlaceholderLine).
+            hits="$(printf '%s\n' "$hits" | grep -viE '<|USER|PASSWORD|HOST|example|YOUR_|changeme|placeholder|\.\.\.|\$\{\{|secrets\.|process\.env' || true)"
+            # The unicode ellipsis cannot sit in the bracket above in some
+            # locales, so filter it explicitly as well.
+            hits="$(printf '%s\n' "$hits" | grep -v '…' || true)"
+            if [ -n "$hits" ]; then
+              echo "secret-scan FAIL: $desc"
+              printf '%s\n' "$hits" | cut -c1-160
+              return 1
+            fi
+            echo "secret-scan OK: $desc"
+          }
+          scan 'credential database URL' 'postgres(ql)?://[^[:space:]'"'"'"]*:[^[:space:]'"'"'"]*@'
+          scan 'stripe-shaped key' 'sk_(live|test)_[A-Za-z0-9]{6,}'
+          scan 'machine key' '(^|[^A-Za-z0-9_-])ak_[A-Za-z0-9_-]{8,}'
+          scan 'secret assignment' '(DATABASE_URL|DATABASE_DIRECT_URL|CLERK_SECRET_KEY|TUNNEL_UPDATE_TOKEN|BLOB_READ_WRITE_TOKEN|TUBELENS_AUDIO_SECRET|SUPADATA_API_KEY|DATADOG_API_KEY|DD_API_KEY)[[:space:]]*[:=][[:space:]]*['"'"'"]?[^[:space:]'"'"'";,]+'
+
+      - name: Fixture detection self-check
+        run: |
+          set -u
+          # Assemble a secret-shaped canary at runtime (no literal in this
+          # file) and prove the stripe-shaped pattern catches it — a blind
+          # scanner must fail the job instead of silently passing.
+          CANARY="$(printf '%s_%s_%s' 'sk' 'live' 'CanaryDetector123456789')"
+          if printf '%s\n' "$CANARY" | grep -qE 'sk_(live|test)_[A-Za-z0-9]{6,}'; then
+            echo "secret-scan OK: fixture detection works"
+          else
+            echo "secret-scan FAIL: scanner blind to stripe-shaped fixture"
+            exit 1
+          fi
+
   unit-test:
     runs-on: ubuntu-latest
     timeout-minutes: 10

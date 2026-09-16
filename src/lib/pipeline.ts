@@ -38,6 +38,7 @@ import {
   type RateLimitDecision,
   type RateLimitProvider,
 } from "./rate-limit";
+import { redactObject, scrubError } from "./redact";
 import {
   buildRequestContext,
   type RequestContext,
@@ -168,8 +169,8 @@ export function withRequestContext(
         "bypassRateLimit is reserved for the liveness probe.",
         "Remove bypassRateLimit from this route; only /api/v1/health may bypass the limiter.",
       );
-      safe(() => observability.captureError(err, { requestId }));
-      span.recordError(err);
+      safe(() => observability.captureError(scrubError(err), { requestId }));
+      span.recordError(scrubError(err));
       span.end();
       return errorResponse(requestId, {
         code: "internal",
@@ -186,8 +187,8 @@ export function withRequestContext(
       getConfig(providers.env ?? process.env);
     } catch (err) {
       if (err instanceof ConfigError) {
-        safe(() => observability.captureError(err, { requestId }));
-        span.recordError(err);
+        safe(() => observability.captureError(scrubError(err), { requestId }));
+        span.recordError(scrubError(err));
         span.end();
         return errorResponse(requestId, {
           code: err.code,
@@ -208,8 +209,8 @@ export function withRequestContext(
     try {
       auth = await authProvider.resolve(req);
     } catch (err) {
-      safe(() => observability.captureError(err, { requestId }));
-      span.recordError(err);
+      safe(() => observability.captureError(scrubError(err), { requestId }));
+      span.recordError(scrubError(err));
       span.end();
       return errorResponse(requestId, {
         code: "dependency_unavailable",
@@ -229,8 +230,8 @@ export function withRequestContext(
       const entitlements = product.entitlementsFor(tier);
       ctx = buildRequestContext(req, { auth, tier, entitlements, route });
     } catch (err) {
-      safe(() => observability.captureError(err, { requestId }));
-      span.recordError(err);
+      safe(() => observability.captureError(scrubError(err), { requestId }));
+      span.recordError(scrubError(err));
       span.end();
       return errorResponse(requestId, {
         code: "service_unavailable",
@@ -288,9 +289,11 @@ export function withRequestContext(
         // A broken limiter must never silently fail open into unprotected
         // serving nor crash the route: report and fail safely with 503.
         safe(() =>
-          observability.captureError(err, { requestId: ctx.requestId }),
+          observability.captureError(scrubError(err), {
+            requestId: ctx.requestId,
+          }),
         );
-        span.recordError(err);
+        span.recordError(scrubError(err));
         span.end();
         return errorResponse(ctx.requestId, {
           code: "service_unavailable",
@@ -322,8 +325,12 @@ export function withRequestContext(
     try {
       res = await handler(req, ctx);
     } catch (err) {
-      safe(() => observability.captureError(err, { requestId: ctx.requestId }));
-      span.recordError(err);
+      safe(() =>
+        observability.captureError(scrubError(err), {
+          requestId: ctx.requestId,
+        }),
+      );
+      span.recordError(scrubError(err));
       span.end();
       const res = errorResponse(ctx.requestId, {
         code: "internal",
@@ -360,11 +367,15 @@ export function withRequestContext(
     }, 0);
 
     safe(() =>
-      observability.log("info", "request served", {
-        requestId: ctx.requestId,
-        route: route ?? "unknown",
-        status: res.status,
-      }),
+      observability.log(
+        "info",
+        "request served",
+        redactObject({
+          requestId: ctx.requestId,
+          route: route ?? "unknown",
+          status: res.status,
+        }),
+      ),
     );
     span.end();
     return res;

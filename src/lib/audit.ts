@@ -10,6 +10,7 @@
 
 import type { UserRole } from "./admin-guard";
 import type { Tier } from "./product";
+import { scrubString } from "./redact";
 
 export type AuditAction =
   | "user.tier.changed"
@@ -114,12 +115,36 @@ const MAX_AUDIT_EVENTS = 1000;
 
 const events: AuditEvent[] = [];
 
+/** Runtime bound matching the zod `reason` schema (≤280 chars). */
+const MAX_REASON_CHARS = 280;
+
+/** Runtime bound matching the key-name schema (≤64 chars). */
+const MAX_NAME_CHARS = 64;
+
+/**
+ * Runtime defense beyond the TS/zod types: scrub secret-shaped values out of
+ * operator free text (an operator can paste a token into a reason) and
+ * truncate to the schema bound so a direct caller cannot smuggle unbounded
+ * input into the log. Returns undefined for undefined (field stays absent).
+ */
+function cleanFreeText(
+  value: string | undefined,
+  maxChars: number,
+): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const scrubbed = scrubString(value);
+  return scrubbed.length > maxChars ? scrubbed.slice(0, maxChars) : scrubbed;
+}
+
 /**
  * Append one sanitized audit row and emit a structured log line. Builds the
  * stored row field-by-field (never spreads caller input) so secrets smuggled
  * into extra keys can never reach the log.
  */
 export function recordAuditEvent(input: AuditInput): AuditEvent {
+  const reason = cleanFreeText(input.reason, MAX_REASON_CHARS);
   const base = {
     id: crypto.randomUUID(),
     action: input.action,
@@ -128,7 +153,7 @@ export function recordAuditEvent(input: AuditInput): AuditEvent {
     targetUserId: input.targetUserId,
     ts: input.ts ?? new Date().toISOString(),
     requestId: input.requestId,
-    ...(input.reason !== undefined ? { reason: input.reason } : {}),
+    ...(reason !== undefined ? { reason } : {}),
   };
   const event: AuditEvent =
     input.action === "user.tier.changed" ||
@@ -144,7 +169,7 @@ export function recordAuditEvent(input: AuditInput): AuditEvent {
             ...base,
             action: input.action,
             keyId: input.keyId,
-            name: input.name,
+            name: cleanFreeText(input.name, MAX_NAME_CHARS) ?? "",
             scopes: [...input.scopes],
             tierAtIssuance: input.tierAtIssuance,
           }
@@ -154,7 +179,12 @@ export function recordAuditEvent(input: AuditInput): AuditEvent {
               action: input.action,
               keyId: input.keyId,
               ...(input.revocationReason !== undefined
-                ? { revocationReason: input.revocationReason }
+                ? {
+                    revocationReason: cleanFreeText(
+                      input.revocationReason,
+                      MAX_REASON_CHARS,
+                    ),
+                  }
                 : {}),
             }
           : {
