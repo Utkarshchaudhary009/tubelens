@@ -183,13 +183,16 @@ function clerkRetryAfter(err: unknown): number | undefined {
 export function clerkErrorResponse(
   requestId: string,
   err: unknown,
+  origin?: string | null,
 ): ReturnType<typeof errorResponse> {
+  const cors = { origin: origin ?? null };
   if (isClerkTimeout(err)) {
     return errorResponse(requestId, {
       code: "upstream_timeout",
       message: "Clerk request timed out.",
       hint: "Outcome unknown — re-fetch the user before retrying.",
       status: 504,
+      ...cors,
     });
   }
   const status = clerkStatus(err);
@@ -199,6 +202,7 @@ export function clerkErrorResponse(
       message: "Target user not found.",
       hint: "Check the userId; it must be an existing Clerk user_xxx id.",
       status: 404,
+      ...cors,
     });
   }
   if (status === 429) {
@@ -208,6 +212,7 @@ export function clerkErrorResponse(
       hint: "Slow down and retry after the time in Retry-After; the change may not have applied — re-fetch the user before retrying.",
       status: 429,
       retryAfter: clerkRetryAfter(err) ?? 60,
+      ...cors,
     });
   }
   if (status === 401 || status === 403) {
@@ -216,6 +221,7 @@ export function clerkErrorResponse(
       message: "User directory unavailable.",
       hint: "Retry shortly; operators must restore the backend credential. The change may not have applied — re-fetch the user before retrying.",
       status: 503,
+      ...cors,
     });
   }
   if (status !== undefined && status >= 400 && status < 500) {
@@ -224,6 +230,7 @@ export function clerkErrorResponse(
       message: "User directory rejected the request.",
       hint: "Check the userId and metadata values, then retry; the change may not have applied — re-fetch the user before retrying.",
       status,
+      ...cors,
     });
   }
   return errorResponse(requestId, {
@@ -231,6 +238,7 @@ export function clerkErrorResponse(
     message: "User directory unavailable.",
     hint: "Retry shortly; the change may not have applied — re-fetch the user before retrying.",
     status: 503,
+    ...cors,
   });
 }
 
@@ -247,18 +255,20 @@ export async function requireAuthoritativeAdmin(
   clerk: ClerkAdminClient,
   callerUserId: string,
   opts?: ClerkCallOptions,
+  origin?: string | null,
 ): Promise<ReturnType<typeof errorResponse> | undefined> {
   let record: ClerkUserRecord;
   try {
     record = await clerk.getUser(callerUserId, opts);
   } catch (err) {
-    return clerkErrorResponse(requestId, err);
+    return clerkErrorResponse(requestId, err, origin);
   }
   if (normalizeRole(record.publicMetadata?.role) !== "admin") {
     return forbiddenResponse(
       requestId,
       "Admin access is no longer valid.",
       "Your admin role changed or the session is stale; sign in again as an admin and retry.",
+      origin,
     );
   }
   return undefined;

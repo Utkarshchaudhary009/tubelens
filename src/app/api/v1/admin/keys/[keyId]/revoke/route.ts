@@ -45,17 +45,28 @@ export async function POST(
       const body = await readBoundedJson(r, { emptyValue: {} });
       if (!body.ok) {
         if (body.error.code === "body_too_large") {
-          return errorResponse(c.requestId, { ...body.error });
+          return errorResponse(c.requestId, {
+            ...body.error,
+            origin: r.headers.get("origin"),
+          });
         }
         return errorResponse(c.requestId, {
           code: "invalid_body",
           message: "Request body must be valid JSON.",
           hint: 'Send a JSON body like { "revocationReason": "rotated" } with Content-Type: application/json, or no body at all.',
           status: 400,
+          origin: r.headers.get("origin"),
         });
       }
       const rawBody: unknown = body.value;
-      return handleAdminKeysRevoke(c.requestId, c.auth, keyId, rawBody);
+      return handleAdminKeysRevoke(
+        c.requestId,
+        c.auth,
+        keyId,
+        rawBody,
+        {},
+        r.headers.get("origin"),
+      );
     },
     { auth: clerkAuthProvider },
     "admin.keys.revoke",
@@ -70,12 +81,13 @@ export async function handleAdminKeysRevoke(
   keyId: string,
   rawBody: unknown,
   deps: RevokeKeyDeps = {},
+  origin?: string | null,
 ): Promise<NextResponse> {
   const caller = requireAdmin(auth);
   if (!caller.ok) {
     return caller.code === "unauthenticated"
-      ? unauthenticatedResponse(requestId)
-      : forbiddenResponse(requestId);
+      ? unauthenticatedResponse(requestId, origin)
+      : forbiddenResponse(requestId, undefined, undefined, origin);
   }
   if (!KEY_ID_PATTERN.test(keyId)) {
     return errorResponse(requestId, {
@@ -83,12 +95,17 @@ export async function handleAdminKeysRevoke(
       message: "Invalid key id.",
       hint: "Use the keyId returned at issuance; it must be a non-empty token of letters, digits, underscore, hyphen, or colon.",
       status: 400,
+      origin: origin ?? null,
     });
   }
   const parsed = revokeKeyBodySchema.safeParse(rawBody);
   if (!parsed.success) {
     const mapped = mapApiKeyBodyError(parsed.error.issues);
-    return errorResponse(requestId, { ...mapped, status: 400 });
+    return errorResponse(requestId, {
+      ...mapped,
+      status: 400,
+      origin: origin ?? null,
+    });
   }
   const revocationReason = parsed.data.revocationReason || undefined;
 
@@ -101,6 +118,7 @@ export async function handleAdminKeysRevoke(
     apiKeys,
     caller.userId,
     { signal: AbortSignal.timeout(8000) },
+    origin,
   );
   if (!callerCheck.ok) {
     return callerCheck.response;
@@ -129,9 +147,10 @@ export async function handleAdminKeysRevoke(
         message: "API key not found.",
         hint: "Check the keyId; it must be an existing key issued for a Clerk subject.",
         status: 404,
+        origin: origin ?? null,
       });
     }
-    return clerkErrorResponse(requestId, err);
+    return clerkErrorResponse(requestId, err, origin);
   }
   markKeyRevoked(keyId, revocationReason);
   recordAuditEvent({
@@ -156,6 +175,7 @@ export async function handleAdminKeysRevoke(
       message: "API key ownership record disagrees with the key authority.",
       hint: "The authority revoke was applied, but the key's subject does not match the issuance record; list the subject's keys to reconcile and report the X-Request-Id.",
       status: 409,
+      origin: origin ?? null,
     });
   }
   return successResponse(
@@ -164,6 +184,6 @@ export async function handleAdminKeysRevoke(
       revoked: true,
       ...(revocationReason !== undefined ? { revocationReason } : {}),
     },
-    { requestId, cacheControl: CACHE_CONTROL.noStore },
+    { requestId, cacheControl: CACHE_CONTROL.noStore, origin: origin ?? null },
   );
 }

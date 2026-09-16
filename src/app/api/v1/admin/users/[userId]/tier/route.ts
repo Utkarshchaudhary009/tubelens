@@ -57,16 +57,27 @@ export async function PATCH(
       const body = await readBoundedJson(r);
       if (!body.ok) {
         if (body.error.code === "body_too_large") {
-          return errorResponse(c.requestId, { ...body.error });
+          return errorResponse(c.requestId, {
+            ...body.error,
+            origin: r.headers.get("origin"),
+          });
         }
         return errorResponse(c.requestId, {
           code: "invalid_body",
           message: "Request body must be valid JSON.",
           hint: 'Send a JSON body like { "tier": "pro" } with Content-Type: application/json.',
           status: 400,
+          origin: r.headers.get("origin"),
         });
       }
-      return handleTierPatch(c.requestId, c.auth, userId, body.value);
+      return handleTierPatch(
+        c.requestId,
+        c.auth,
+        userId,
+        body.value,
+        {},
+        r.headers.get("origin"),
+      );
     },
     { auth: clerkAuthProvider },
     "admin.users.tier",
@@ -81,12 +92,13 @@ export async function handleTierPatch(
   targetUserId: string,
   rawBody: unknown,
   deps: TierPatchDeps = {},
+  origin?: string | null,
 ): Promise<NextResponse> {
   const caller = requireAdmin(auth);
   if (!caller.ok) {
     return caller.code === "unauthenticated"
-      ? unauthenticatedResponse(requestId)
-      : forbiddenResponse(requestId);
+      ? unauthenticatedResponse(requestId, origin)
+      : forbiddenResponse(requestId, undefined, undefined, origin);
   }
   if (!USER_ID_PATTERN.test(targetUserId)) {
     return errorResponse(requestId, {
@@ -94,12 +106,17 @@ export async function handleTierPatch(
       message: "Invalid user id.",
       hint: "Use a Clerk user id like user_abc123; it must match /^user_[A-Za-z0-9]+$/.",
       status: 400,
+      origin: origin ?? null,
     });
   }
   const parsed = tierBodySchema.safeParse(rawBody);
   if (!parsed.success) {
     const mapped = mapAdminBodyError("tier", parsed.error.issues);
-    return errorResponse(requestId, { ...mapped, status: 400 });
+    return errorResponse(requestId, {
+      ...mapped,
+      status: 400,
+      origin: origin ?? null,
+    });
   }
   const { tier: newTier, reason } = parsed.data;
 
@@ -114,6 +131,7 @@ export async function handleTierPatch(
     clerk,
     caller.userId,
     { signal: AbortSignal.timeout(8000) },
+    origin,
   );
   if (callerCheck) {
     return callerCheck;
@@ -129,7 +147,7 @@ export async function handleTierPatch(
     });
     oldTier = normalizeTier(record.publicMetadata?.tier);
   } catch (err) {
-    return clerkErrorResponse(requestId, err);
+    return clerkErrorResponse(requestId, err, origin);
   }
   try {
     await clerk.updateUserMetadata(
@@ -139,7 +157,7 @@ export async function handleTierPatch(
     );
   } catch (err) {
     if (!isClerkTimeout(err)) {
-      return clerkErrorResponse(requestId, err);
+      return clerkErrorResponse(requestId, err, origin);
     }
     // The SDK accepts no AbortSignal, so a timed-out write may still have
     // landed: one bounded re-fetch decides between "reconciled" (the value is
@@ -151,7 +169,7 @@ export async function handleTierPatch(
       signal: AbortSignal.timeout(8000),
     });
     if (latest?.publicMetadata?.tier !== newTier) {
-      return clerkErrorResponse(requestId, err);
+      return clerkErrorResponse(requestId, err, origin);
     }
     recordAuditEvent({
       action: "user.tier.change_reconciled",
@@ -173,6 +191,7 @@ export async function handleTierPatch(
         requestId,
         cacheControl: CACHE_CONTROL.noStore,
         status: 504,
+        origin: origin ?? null,
         warnings: [
           {
             code: "reconciled_after_timeout",
@@ -200,6 +219,6 @@ export async function handleTierPatch(
       tier: newTier,
       sessionTokenMayRefreshWithinSeconds: 60,
     },
-    { requestId, cacheControl: CACHE_CONTROL.noStore },
+    { requestId, cacheControl: CACHE_CONTROL.noStore, origin: origin ?? null },
   );
 }

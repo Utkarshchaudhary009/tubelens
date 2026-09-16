@@ -336,6 +336,7 @@ export function requireScope(
 export function toAuthorizationResponse(
   requestId: string,
   decision: AuthorizeDecision,
+  origin?: string | null,
 ): ReturnType<typeof errorResponse> | undefined {
   if (decision.ok) {
     return undefined;
@@ -345,5 +346,6 @@ export function toAuthorizationResponse(
     message: decision.message,
     hint: decision.hint,
     status: decision.status,
+    origin: origin ?? null,
   });
 }

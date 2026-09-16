@@ -1,4 +1,5 @@
 import { type NextRequest, NextResponse } from "next/server";
+import { applyCorsHeaders, applySecurityHeaders } from "./http-headers";
 
 // Shared success envelope + response headers.
 // Every /api/v1 response follows plans/DX_PRINCIPLES.md:
@@ -24,6 +25,10 @@ export function baseHeaders(requestId: string): Headers {
   headers.set("X-RateLimit-Limit", "100");
   headers.set("X-RateLimit-Remaining", "99");
   headers.set("X-RateLimit-Reset", String(Math.floor(Date.now() / 1000) + 60));
+  // Phase 09: every response carries the security baseline (incl. 4xx/5xx —
+  // errorResponse builds on baseHeaders too, as do the raw openapi/RSS/audio
+  // paths). Existing Cache-Control/Content-Type/rate-limit behavior unchanged.
+  applySecurityHeaders(headers);
   return headers;
 }
 
@@ -93,6 +98,12 @@ export interface SuccessOptions {
   warnings?: Array<Warning | string>;
   cacheControl?: string;
   status?: number;
+  /**
+   * Request Origin for the CORS grant (Phase 09). When an allowlisted origin
+   * is passed, the response carries Access-Control-Allow-Origin + Vary;
+   * otherwise only Vary (origin present) or nothing (no origin). Never `*`.
+   */
+  origin?: string | null;
 }
 
 export function successResponse(
@@ -120,6 +131,10 @@ export function successResponse(
   if (opts.cacheControl) {
     headers.set("Cache-Control", opts.cacheControl);
   }
+  // Phase 09: allowlisted request origins get the CORS grant on real
+  // responses (never `*`, no credentials); raw paths rely on the proxy
+  // pass-through stamp instead, so handlers need not thread this through.
+  applyCorsHeaders(headers, opts.origin ?? null);
   return new NextResponse(JSON.stringify(body), {
     status: opts.status ?? 200,
     headers,

@@ -1,6 +1,14 @@
 import { clerkMiddleware } from "@clerk/nextjs/server";
-import { NextResponse } from "next/server";
+import { type NextRequest, NextResponse } from "next/server";
 import { hasClerkSecret } from "./lib/clerk-auth";
+import { getRequestId } from "./lib/envelope";
+import {
+  applyCorsHeaders,
+  applySecurityHeaders,
+  handlePreflight,
+  isApiPath,
+  shouldPreflightRequest,
+} from "./lib/http-headers";
 
 // Phase 02 session attachment (Next 16: `proxy.ts`, not `middleware.ts` —
 // shipping both files is a build error; with `src/` layout this file lives
@@ -27,18 +35,52 @@ const runClerk = clerkMiddleware();
 // failure falls through to `NextResponse.next()`. The request then resolves
 // anonymous: protected routes deny via `requireAuth()` (typed 401) while
 // public routes keep serving — never a framework 500, never a bypass.
+// Phase 09: the proxy is the single choke point that sees every request,
+// so it owns two HTTP-hardening jobs for /api/v1 (real routes and unknown
+// paths alike, bare /api/v1/ included):
+//   1. Preflight short-circuit — browser OPTIONS never reaches a route (real
+//      GET-only/POST-only routes would 405 or render HTML); it is answered
+//      centrally with a 204 + CORS grant, no auth required.
+//   2. Pass-through stamping — every real GET/POST/PATCH response gets the
+//      security baseline (idempotent with the envelope) plus the CORS grant
+//      for allowlisted origins (never `*`, no credentials), so the ~40
+//      handlers need no per-route CORS code and future routes inherit it.
+// Non-API paths pass through untouched.
+function stampApiResponse(res: Response, req: NextRequest): Response {
+  applySecurityHeaders(res.headers);
+  applyCorsHeaders(res.headers, req.headers.get("origin"));
+  return res;
+}
+
 export default function proxy(...args: Parameters<typeof runClerk>) {
+  const req = args[0] as NextRequest;
+  if (shouldPreflightRequest(req)) {
+    return handlePreflight(req, getRequestId(req));
+  }
+  const pathname = req.nextUrl.pathname;
+  // Clerk may resolve to undefined (continue) or a plain Response — only
+  // stamp real Response objects on API paths. A falsy result materializes a
+  // pass-through first: raw paths (openapi.json, RSS, audio bytes, the
+  // catch-all) bypass the pipeline backfill, so without this they would
+  // leave the proxy with no security/CORS stamp when Clerk continues.
+  type MiddlewareOut = Awaited<ReturnType<typeof runClerk>>;
+  const stamp = (res: MiddlewareOut): MiddlewareOut => {
+    const pass: Response = res instanceof Response ? res : NextResponse.next();
+    return (
+      isApiPath(pathname) ? stampApiResponse(pass, req) : pass
+    ) as MiddlewareOut;
+  };
   if (!hasClerkSecret()) {
-    return NextResponse.next();
+    return stamp(NextResponse.next());
   }
   try {
     const out = runClerk(...args);
     if (out instanceof Promise) {
-      return out.catch(() => NextResponse.next());
+      return out.then(stamp, () => stamp(NextResponse.next()));
     }
-    return out;
+    return stamp(out);
   } catch {
-    return NextResponse.next();
+    return stamp(NextResponse.next());
   }
 }
 

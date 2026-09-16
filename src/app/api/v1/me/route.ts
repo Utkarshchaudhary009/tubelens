@@ -24,20 +24,24 @@ export const runtime = "nodejs";
 //   RequestContext (Clerk provider below), never from caller input.
 export async function GET(req: NextRequest): Promise<NextResponse> {
   return withRequestContext(
-    async (_r, ctx) => handleMe(ctx.requestId, ctx.auth, ctx.tier),
+    async (r, ctx) =>
+      handleMe(ctx.requestId, ctx.auth, ctx.tier, r.headers.get("origin")),
     { auth: clerkAuthProvider },
     "me",
   )(req);
 }
 
 // Pure handler (no HTTP/pipeline): tests inject fake AuthContexts here and
-// never need live Clerk keys; production reaches it via GET above.
+// never need live Clerk keys; production reaches it via GET above. The
+// trailing origin keeps purity (a plain string, never the Request) while
+// letting direct-invoked denials carry the CORS grant.
 export function handleMe(
   requestId: string,
   auth: AuthContext,
   tier: Tier,
+  origin?: string | null,
 ): NextResponse {
-  const denied = requireAuth({ auth, requestId });
+  const denied = requireAuth({ auth, requestId, origin: origin ?? null });
   if (denied) {
     return denied;
   }
@@ -45,10 +49,10 @@ export function handleMe(
   // read /me, even if it carries a subject userId (cf. Phase 05 api-keys).
   const userId = auth.type === "user" ? auth.userId : undefined;
   if (!userId) {
-    return unauthenticatedResponse(requestId);
+    return unauthenticatedResponse(requestId, origin);
   }
   return successResponse(
     { userId, tier },
-    { requestId, cacheControl: CACHE_CONTROL.noStore },
+    { requestId, cacheControl: CACHE_CONTROL.noStore, origin: origin ?? null },
   );
 }

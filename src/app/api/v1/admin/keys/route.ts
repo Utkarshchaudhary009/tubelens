@@ -45,16 +45,26 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       const body = await readBoundedJson(r);
       if (!body.ok) {
         if (body.error.code === "body_too_large") {
-          return errorResponse(c.requestId, { ...body.error });
+          return errorResponse(c.requestId, {
+            ...body.error,
+            origin: r.headers.get("origin"),
+          });
         }
         return errorResponse(c.requestId, {
           code: "invalid_body",
           message: "Request body must be valid JSON.",
           hint: 'Send a JSON body like { "subject": "user_abc123", "name": "cron" } with Content-Type: application/json.',
           status: 400,
+          origin: r.headers.get("origin"),
         });
       }
-      return handleAdminKeysCreate(c.requestId, c.auth, body.value);
+      return handleAdminKeysCreate(
+        c.requestId,
+        c.auth,
+        body.value,
+        {},
+        r.headers.get("origin"),
+      );
     },
     { auth: clerkAuthProvider },
     "admin.keys.create",
@@ -70,6 +80,8 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
         c.requestId,
         c.auth,
         r.nextUrl.searchParams.get("subject"),
+        {},
+        r.headers.get("origin"),
       ),
     { auth: clerkAuthProvider },
     "admin.keys.list",
@@ -84,17 +96,22 @@ export async function handleAdminKeysCreate(
   auth: AuthContext,
   rawBody: unknown,
   deps: AdminKeysDeps = {},
+  origin?: string | null,
 ): Promise<NextResponse> {
   const caller = requireAdmin(auth);
   if (!caller.ok) {
     return caller.code === "unauthenticated"
-      ? unauthenticatedResponse(requestId)
-      : forbiddenResponse(requestId);
+      ? unauthenticatedResponse(requestId, origin)
+      : forbiddenResponse(requestId, undefined, undefined, origin);
   }
   const parsed = createKeyBodySchema.safeParse(rawBody);
   if (!parsed.success) {
     const mapped = mapApiKeyBodyError(parsed.error.issues);
-    return errorResponse(requestId, { ...mapped, status: 400 });
+    return errorResponse(requestId, {
+      ...mapped,
+      status: 400,
+      origin: origin ?? null,
+    });
   }
   const {
     subject,
@@ -112,6 +129,7 @@ export async function handleAdminKeysCreate(
       requestId,
       "Keys cannot carry tier or role claims.",
       "Omit tier and role from claims; the key binds the subject's authoritative tier at issuance.",
+      origin,
     );
   }
 
@@ -126,6 +144,7 @@ export async function handleAdminKeysCreate(
     apiKeys,
     caller.userId,
     { signal: AbortSignal.timeout(8000) },
+    origin,
   );
   if (!callerCheck.ok) {
     return callerCheck.response;
@@ -139,7 +158,7 @@ export async function handleAdminKeysCreate(
     });
     tierAtIssuance = normalizeTier(record.publicMetadata?.tier);
   } catch (err) {
-    return clerkErrorResponse(requestId, err);
+    return clerkErrorResponse(requestId, err, origin);
   }
   // Self-grant rule: a caller cannot mint a key bound above their own
   // authoritative tier.
@@ -148,6 +167,7 @@ export async function handleAdminKeysCreate(
       requestId,
       "Cannot issue a key above your own tier.",
       "The subject's authoritative tier exceeds yours; ask a higher-tier admin to issue this key.",
+      origin,
     );
   }
   let created: Awaited<ReturnType<ApiKeysClient["createKey"]>>;
@@ -166,7 +186,7 @@ export async function handleAdminKeysCreate(
       { signal: AbortSignal.timeout(8000) },
     );
   } catch (err) {
-    return clerkErrorResponse(requestId, err);
+    return clerkErrorResponse(requestId, err, origin);
   }
   if (!created.secret) {
     // Orphan cleanup: the authority minted a key but withheld its secret,
@@ -193,6 +213,7 @@ export async function handleAdminKeysCreate(
         ? "Issuance outcome is unknown — the orphan key may still exist. List the subject's keys to reconcile before retrying; report the X-Request-Id if the failure persists."
         : "The unusable key was revoked — list the subject's keys to confirm, then retry; report the X-Request-Id if the failure persists.",
       status: 503,
+      origin: origin ?? null,
     });
   }
   // Phase 07 subject verification: the authority must bind the created key
@@ -219,6 +240,7 @@ export async function handleAdminKeysCreate(
         message: "Key authority bound the key to another subject.",
         hint: "Issuance outcome is unknown — the divergent key may still exist. List the subject's keys to reconcile before retrying; report the X-Request-Id if the failure persists.",
         status: 503,
+        origin: origin ?? null,
       });
     }
     return errorResponse(requestId, {
@@ -226,6 +248,7 @@ export async function handleAdminKeysCreate(
       message: "Key authority bound the key to another subject.",
       hint: "The divergent key was revoked — list the subject's keys to confirm, then retry; report the X-Request-Id if the failure persists.",
       status: 409,
+      origin: origin ?? null,
     });
   }
   const issuedAt = new Date().toISOString();
@@ -279,7 +302,7 @@ export async function handleAdminKeysCreate(
           : null,
       createdBy: caller.userId,
     },
-    { requestId, cacheControl: CACHE_CONTROL.noStore },
+    { requestId, cacheControl: CACHE_CONTROL.noStore, origin: origin ?? null },
   );
 }
 
@@ -288,12 +311,13 @@ export async function handleAdminKeysList(
   auth: AuthContext,
   subjectParam: string | null,
   deps: AdminKeysDeps = {},
+  origin?: string | null,
 ): Promise<NextResponse> {
   const caller = requireAdmin(auth);
   if (!caller.ok) {
     return caller.code === "unauthenticated"
-      ? unauthenticatedResponse(requestId)
-      : forbiddenResponse(requestId);
+      ? unauthenticatedResponse(requestId, origin)
+      : forbiddenResponse(requestId, undefined, undefined, origin);
   }
   if (!subjectParam || !USER_ID_PATTERN.test(subjectParam)) {
     return errorResponse(requestId, {
@@ -301,6 +325,7 @@ export async function handleAdminKeysList(
       message: "Invalid subject.",
       hint: "Pass ?subject=user_abc123; it must match /^user_[A-Za-z0-9]+$/.",
       status: 400,
+      origin: origin ?? null,
     });
   }
   const apiKeys = deps.apiKeys ?? getApiKeysClient();
@@ -309,6 +334,7 @@ export async function handleAdminKeysList(
     apiKeys,
     caller.userId,
     { signal: AbortSignal.timeout(8000) },
+    origin,
   );
   if (!callerCheck.ok) {
     return callerCheck.response;
@@ -320,7 +346,7 @@ export async function handleAdminKeysList(
       { signal: AbortSignal.timeout(8000) },
     );
   } catch (err) {
-    return clerkErrorResponse(requestId, err);
+    return clerkErrorResponse(requestId, err, origin);
   }
   // Metadata only — fields are picked explicitly so a `secret` can never
   // leak through, even if the authority ever returns one on list. The local
@@ -359,6 +385,7 @@ export async function handleAdminKeysList(
     {
       requestId,
       cacheControl: CACHE_CONTROL.noStore,
+      origin: origin ?? null,
       ...(listed.truncated || dropped > 0
         ? {
             warnings: [
