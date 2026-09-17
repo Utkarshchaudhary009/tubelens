@@ -558,7 +558,7 @@ principal model.
 
 ## Phase 13 — Weighted-credit operation catalog
 
-**Status:** `[ ]` not started.
+**Status:** `[x]` done — shipped via PR #31 (merged 2026-09-17): versioned `src/lib/quota.ts` catalog (`2026-09-17.free.v1`, 44 route labels: cheap 1 / medium 2 / transcript+audio 3 / combined 4, batch ceiling 20) wired into the pipeline rate-limit cost + usage stamping with fail-closed unknown-operation 500, batch preflight `batch_cost_exceeded`, pinned prior-version snapshot for historical rows, with 1030 unit tests + e2e PASS on live upstream (weighting proof: 10×health admitted vs 7×transcript rejected).
 
 **Build:** Implement the weighted-credit model. **Credit: Utkarsh's weighted-credit model idea** — TubeLens should meter API consumption with a common credit system where cheap and expensive operations consume different numbers of credits. Begin with policy defaults such as metadata/search `1`, comments `2`, transcript `3`, composed `4–5`, and batch = sum of protected child costs with a hard ceiling. Keep costs versioned so historical usage is never reinterpreted under today's price.
 
