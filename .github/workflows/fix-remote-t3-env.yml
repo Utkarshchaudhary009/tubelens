@@ -39,9 +39,8 @@ jobs:
           p = Path('.github/workflows/remote-t3.yml')
           text = p.read_text()
 
-          # Build GitHub Actions expressions without writing `${{ ... }}`
-          # literally inside the run script, so Actions cannot interpolate the
-          # secret value into this generated workflow before git sees it.
+          # Construct action expressions in pieces so the runner does not
+          # interpolate the secret into this shell script.
           pat_ref = "$" + "{{ secrets.PAT }}"
           vercel_ref = "$" + "{{ secrets.VERCEL_TOKEN }}"
           vercel_org_ref = "$" + "{{ secrets.VERCEL_ORG_ID }}"
