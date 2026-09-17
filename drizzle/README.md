@@ -1,7 +1,9 @@
 # drizzle/ — Neon Postgres schema + migrations (Phase 00)
 
-- `schema.ts` — intentionally table-free placeholder. Later phases add
-  tables here without reworking connection, client, or env plumbing.
+- `schema.ts` — Phase 14 adds the first real table, `usage_ledger`
+  (durable weighted-credit rows: principal/tier/operation/cost/policy
+  version/window/outcome/request id). Later phases add tables here without
+  reworking connection, client, or env plumbing.
   Postgres is not a cache: keep large derived payload caches out of here
   (CDN + in-memory default per `plans/PLAN.md` Phase 00).
 - `migrations/` — canonical `drizzle-kit generate` output for the empty

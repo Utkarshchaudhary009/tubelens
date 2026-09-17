@@ -1,7 +1,7 @@
 // Phase 10 (Utils and polish) shared handlers.
 // Interop, performance, and self-description helpers: channel RSS feeds,
 // seed -> mix id lookup, a pure thumbnail URL resolver, peer instance status,
-// single-round-trip batch reads, and stub quota counters. JSON routes ride
+// single-round-trip batch reads, and the monthly quota allowance balance. JSON routes ride
 // the shared envelope (X-Request-Id + X-RateLimit-* + typed error hints);
 // the RSS feed is served RAW as application/rss+xml (like the audio-bytes
 // and openapi precedents — feed readers cannot parse the JSON envelope).
@@ -9,6 +9,7 @@
 
 import { type NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
+import { type AuthContext, anonymousAuthContext } from "@/lib/auth";
 import { cached } from "@/lib/cache";
 import {
   classifyChannelError,
@@ -25,7 +26,14 @@ import {
 } from "@/lib/envelope";
 import { errorResponse } from "@/lib/errors";
 import { isUpstreamTimeout, textOf } from "@/lib/mappers";
+import type { Tier } from "@/lib/product";
 import { BATCH_MAX_COST, costForBatch, QuotaPolicyError } from "@/lib/quota";
+import {
+  getBalance,
+  getQuotaStore,
+  type QuotaStore,
+  quotaPrincipal,
+} from "@/lib/quota-accounting";
 import { isLoopbackHost } from "@/lib/safe-fetch";
 import { isPlausibleVideoId, readBoundedJson } from "@/lib/validate";
 
@@ -786,71 +794,98 @@ export async function handleBatch(
 }
 
 // ---------------------------------------------------------------------------
-// Quota: GET /api/v1/quota (in-memory stub counters, no durable store)
+// Quota: GET /api/v1/quota (monthly allowance balance, Phase 14)
 // ---------------------------------------------------------------------------
 
-/** Stub window: 100 requests per 60s per instance (mirrors baseHeaders). */
-export const QUOTA_LIMIT = 100;
-export const QUOTA_WINDOW_MS = 60 * 1000;
-
-let quotaWindowStart = 0;
-let quotaUsed = 0;
-
-/** Test helper — resets the in-memory stub counters. */
-export function resetQuotaForTests(): void {
-  quotaWindowStart = 0;
-  quotaUsed = 0;
+export interface QuotaStatusOptions {
+  /**
+   * Balance owner. Defaults to "anonymous": direct calls carry no
+   * RequestContext — per-identity balances arrive via `handleQuotaContext`
+   * below (the route's pipeline context). Never a plaintext secret.
+   */
+  identity?: string;
+  tier?: Tier;
+  store?: QuotaStore;
+  nowMs?: number;
 }
 
-export interface QuotaSnapshot {
-  limit: number;
-  remaining: number;
-  /** Unix-seconds reset of the current window (mirrors X-RateLimit-Reset). */
-  reset: number;
-  used: number;
+/**
+ * Pipeline-context balance read: derives the caller's quota principal and
+ * tier from the RequestContext pieces (same `quotaPrincipal` choke point
+ * the quota stage charges through, so the reported balance is the charged
+ * bucket). Pure apart from the store read — tests inject fake auth/tier.
+ */
+export interface QuotaContextInput {
+  requestId: string;
+  auth: AuthContext;
+  tier: Tier;
+  rateLimitIdentity: string;
+  origin?: string | null;
+  store?: QuotaStore;
+  nowMs?: number;
 }
 
-/** Rolling 60s stub window; rolls over automatically, never persists. */
-export function getQuotaSnapshot(now: number = Date.now()): QuotaSnapshot {
-  if (quotaWindowStart === 0 || now - quotaWindowStart >= QUOTA_WINDOW_MS) {
-    quotaWindowStart = now;
-    quotaUsed = 0;
+export async function handleQuotaContext(
+  input: QuotaContextInput,
+): Promise<NextResponse> {
+  try {
+    const store = input.store ?? (await getQuotaStore());
+    const balance = await getBalance(
+      store,
+      quotaPrincipal({
+        auth: input.auth,
+        rateLimitIdentity: input.rateLimitIdentity,
+      }),
+      input.tier,
+      input.nowMs,
+    );
+    // Private: balances are identity-scoped, never CDN-shared.
+    // X-RateLimit-* deliberately keep the rate-limit stub values via
+    // successResponse (Phase 15 separation: monthly credit allowance and
+    // request-rate windows are different units sharing no header).
+    return successResponse(
+      {
+        allowance: balance.allowance,
+        used: balance.used,
+        remaining: balance.remaining,
+        reset: balance.reset,
+        windowId: balance.windowId,
+        tier: balance.tier,
+        policyVersion: balance.policyVersion,
+      },
+      {
+        requestId: input.requestId,
+        cacheControl: CACHE_CONTROL.noStore,
+        origin: input.origin ?? null,
+      },
+    );
+  } catch {
+    return errorResponse(input.requestId, {
+      code: "service_unavailable",
+      message: "Quota status unavailable.",
+      hint: "Retry shortly; the balance could not be read without allowance accounting.",
+      status: 503,
+      origin: input.origin ?? null,
+    });
   }
-  quotaUsed += 1;
-  return {
-    limit: QUOTA_LIMIT,
-    remaining: Math.max(0, QUOTA_LIMIT - quotaUsed),
-    reset: Math.floor(quotaWindowStart / 1000) + 60,
-    used: quotaUsed,
-  };
 }
 
-export async function handleQuota(req: NextRequest): Promise<NextResponse> {
-  const requestId = getRequestId(req);
-  const snap = getQuotaSnapshot();
-  // Private: counters are per-instance and caller-visible only.
-  const res = successResponse(
-    {
-      limit: snap.limit,
-      remaining: snap.remaining,
-      reset: snap.reset,
-      windows: [
-        {
-          window: "60s",
-          limit: snap.limit,
-          used: snap.used,
-          remaining: snap.remaining,
-          reset: snap.reset,
-          note: "Stub: in-memory per-instance counters with no durable store; values reset on deploy and differ across instances.",
-        },
-      ],
-    },
-    { requestId, cacheControl: CACHE_CONTROL.noStore },
-  );
-  // Body/header parity: baseHeaders() stamps static stub values, so override
-  // with this window's snapshot — the /quota body and X-RateLimit-* agree.
-  res.headers.set("X-RateLimit-Limit", String(snap.limit));
-  res.headers.set("X-RateLimit-Remaining", String(snap.remaining));
-  res.headers.set("X-RateLimit-Reset", String(snap.reset));
-  return res;
+/**
+ * Read-only monthly balance for the caller's identity/window — never
+ * consumes. A balance check is not itself a charge (the `quota.get`
+ * catalog cost applies only where the pipeline enforces it).
+ */
+export async function handleQuota(
+  req: NextRequest,
+  opts: QuotaStatusOptions = {},
+): Promise<NextResponse> {
+  return handleQuotaContext({
+    requestId: getRequestId(req),
+    auth: anonymousAuthContext,
+    tier: opts.tier ?? "free",
+    rateLimitIdentity: opts.identity ?? "anonymous",
+    origin: req.headers.get("origin"),
+    store: opts.store,
+    nowMs: opts.nowMs,
+  });
 }

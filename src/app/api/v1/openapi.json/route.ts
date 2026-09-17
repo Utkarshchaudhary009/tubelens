@@ -65,7 +65,7 @@ export function buildOpenApiDocument() {
       // package.json (0.1.0 until the v1 API is declared stable).
       version: "0.1.0",
       description:
-        "API-first YouTube data API. Phase 10 ships utils and polish (channel RSS feeds for readers and webhooks, seed-to-mix id lookup with item reads via playlists, a pure thumbnail URL resolver, peer instance status for failover-aware clients, single-round-trip batch reads with per-item error isolation, and stub quota counters — plus this full spec), Phase 9 ships flag-gated audio-first endpoints (signed-URL + Range-gateway audio proxy, autoplay radio continuation with >= 25 deduped tracks, and timed/plain lyrics), plus Phase 8 community-enriched data (SponsorBlock skip segments, ReturnYouTubeDislike stats, DeArrow crowd-sourced titles/thumbnails, and one combined call composing detail with all three layers, each degrading independently), plus Phase 7 explore verticals (Shorts discovery, cross-channel live discovery with viewer counts/scheduled times, and the gaming hub), plus Phase 6 music-native search (typed song vs album vs artist), charts snapshots, and artist profiles with top releases, plus Phase 5 playlist reads (metadata plus first items page, paginated items, and a channel's curated playlists), Phase 4 channel profiles, uploads, Shorts shelves, and live/upcoming/past streams, Phase 3 discovery (search autocomplete suggestions, hashtag feeds), Phase 2 watch essentials (related rail, comments, captions, transcript) and Phase 1 health, search, video details, URL resolving, and this spec.",
+        "API-first YouTube data API. Phase 10 ships utils and polish (channel RSS feeds for readers and webhooks, seed-to-mix id lookup with item reads via playlists, a pure thumbnail URL resolver, peer instance status for failover-aware clients, single-round-trip batch reads with per-item error isolation, and the monthly quota allowance balance — plus this full spec), Phase 9 ships flag-gated audio-first endpoints (signed-URL + Range-gateway audio proxy, autoplay radio continuation with >= 25 deduped tracks, and timed/plain lyrics), plus Phase 8 community-enriched data (SponsorBlock skip segments, ReturnYouTubeDislike stats, DeArrow crowd-sourced titles/thumbnails, and one combined call composing detail with all three layers, each degrading independently), plus Phase 7 explore verticals (Shorts discovery, cross-channel live discovery with viewer counts/scheduled times, and the gaming hub), plus Phase 6 music-native search (typed song vs album vs artist), charts snapshots, and artist profiles with top releases, plus Phase 5 playlist reads (metadata plus first items page, paginated items, and a channel's curated playlists), Phase 4 channel profiles, uploads, Shorts shelves, and live/upcoming/past streams, Phase 3 discovery (search autocomplete suggestions, hashtag feeds), Phase 2 watch essentials (related rail, comments, captions, transcript) and Phase 1 health, search, video details, URL resolving, and this spec.",
     },
     servers: [{ url: "https://tubelens-neon.vercel.app/api/v1" }],
     paths: {
@@ -1537,13 +1537,13 @@ export function buildOpenApiDocument() {
       "/quota": {
         get: {
           operationId: "getQuota",
-          summary: "Current quota usage and rate-limit windows",
+          summary: "Current monthly quota allowance and usage",
           description:
-            "In-memory stub counters (no durable store): {limit, remaining, reset} mirroring the X-RateLimit-* stub headers, plus per-window notes. Private, no-store.",
+            "Monthly weighted-credit balance for the caller's identity/window: {allowance, used, remaining, reset, windowId, tier, policyVersion}. Read-only — a balance check never consumes. Private, no-store.",
           responses: {
             200: {
               description:
-                "data is { limit, remaining, reset, windows }. Counters reset on deploy and differ across instances.",
+                "data is { allowance, used, remaining, reset, windowId, tier, policyVersion }. In-memory counters by default (reset on deploy); durable Postgres ledger when opted in.",
               content: {
                 "application/json": { schema: { $ref: envelopeRef } },
               },

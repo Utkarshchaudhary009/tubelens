@@ -568,7 +568,7 @@ principal model.
 
 ## Phase 14 — Quota accounting and monthly allowance
 
-**Status:** `[ ]` not started.
+**Status:** `[~]` in progress — branch `part-b/phase-14-quota-accounting`: monthly UTC-window allowance (Free 10,000), pipeline quota stage, `GET /quota` balance, `usage_ledger` table + migration (migrate not yet applied).
 
 **Build:** Implement monthly/daily usage windows according to [`PLANS_AND_USAGE.md`](./PLANS_AND_USAGE.md). Track consumed weighted credits, allowance, remaining amount, reset time, account/user/project/key identity, tier, policy version, and accepted/rejected/partial outcome as appropriate. Keep durable accounting in Postgres only when the product requires it; Redis is the fast enforcement layer, not the historical source of truth.
 
