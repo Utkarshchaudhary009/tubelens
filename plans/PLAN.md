@@ -548,7 +548,7 @@ principal model.
 
 ## Phase 12 — Distributed Redis rate-limit engine
 
-**Status:** `[ ]` not started.
+**Status:** `[~]` in progress — PR open: Upstash sliding-window engine (burst 60/10s + sustained 100/60s, atomic Lua, fail-closed) with shared-limit tests.
 
 **Build:** Use Upstash Redis for distributed enforcement across Vercel/serverless instances. Centralize policy in `src/lib/rate-limit`. Routes declare endpoint class/cost rather than implementing their own counters. Support dimensions such as anonymous IP, authenticated user, project/org, and protected endpoint class. Start with burst + sustained controls using a sliding-window or token-bucket model where appropriate.
 
