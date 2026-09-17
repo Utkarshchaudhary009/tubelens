@@ -76,7 +76,10 @@ export async function GET(req: NextRequest) {
 }
 
 // Publisher write: bearer-gated overwrite of one slot's pointer. `name` is
-// required (JSON body field or ?name= query param). PUT is an alias.
+// required (JSON body field or ?name= query param). PUT is an alias. Both
+// share handleTunnelWrite, which refreshes the in-memory tunnel cache on
+// save (refresh-on-save: transcript requests serve the fresh URL with zero
+// Blob reads until TTL).
 export async function POST(req: NextRequest) {
   return handleTunnelWrite(req, deps());
 }

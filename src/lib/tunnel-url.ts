@@ -2,6 +2,11 @@ import type { NextRequest } from "next/server";
 import { z } from "zod";
 import { CACHE_CONTROL, getRequestId, successResponse } from "./envelope";
 import { errorResponse } from "./errors";
+import {
+  clearTunnelCache,
+  setCachedTunnelUrl,
+  TUNNEL_URL_RE,
+} from "./tunnel-cache";
 import { readBoundedJson } from "./validate";
 
 // Throwaway tunnel pointers stored in Vercel Blob as `tunnel-url-<name>.json`
@@ -24,9 +29,8 @@ export function tunnelBlobPath(slot: TunnelSlot): string {
   return `tunnel-url-${slot}.json`;
 }
 
-/** Only free Cloudflare quick-tunnel URLs are accepted — never arbitrary hosts. */
-const TUNNEL_URL_RE =
-  /^https:\/\/[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.trycloudflare\.com(?::\d{1,5})?(?:\/.*)?$/;
+// TUNNEL_URL_RE lives in ./tunnel-cache so the cache/env layer enforces the
+// same pin the publisher validates (single definition, no drift).
 
 /** Full T3 pairing URLs: a quick-tunnel host plus the `/pair#token=`
  * fragment (the fragment is the auto-pair credential — the bare tunnel root
@@ -235,6 +239,11 @@ export async function handleTunnelWrite(req: NextRequest, deps: TunnelDeps) {
       runId: parsed.data.runId ?? "",
       updatedAt: new Date().toISOString(),
     });
+    // Refresh-on-save: publish the fresh URL to memory (POST and PUT share
+    // this path) so transcript requests serve it with zero Blob reads until
+    // TTL — steady state never waits on expiry/propagation.
+    clearTunnelCache(slot.slot);
+    setCachedTunnelUrl(slot.slot, saved.url);
     return successResponse(saved, {
       requestId,
       cacheControl: CACHE_CONTROL.noStore,

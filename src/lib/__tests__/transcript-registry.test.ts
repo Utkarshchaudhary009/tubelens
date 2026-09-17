@@ -18,9 +18,11 @@ import {
   type TranscriptProviderDef,
   type TranscriptRunnerDeps,
 } from "../transcript-providers";
+import { clearTunnelCache } from "../tunnel-cache";
 
 beforeEach(() => {
   clearCache();
+  clearTunnelCache();
 });
 
 function req(url: string, requestId = "transcript-registry"): NextRequest {
@@ -180,13 +182,33 @@ const SUPADATA_FIXTURE = {
   availableLangs: ["en"],
 };
 
+// tts-test serves seconds floats (start/duration), not ms.
+const TTS_FIXTURE = {
+  videoId: "dQw4w9WgXcQ",
+  transcript: [
+    { text: "Hello world", start: 1.5, duration: 2.5, lang: "en" },
+    { text: "Second line", start: 4.0, duration: 1.0, lang: "en" },
+  ],
+};
+
+const TTS_ENV = { TTS_TRANSCRIPT_URL: "https://abc-123.trycloudflare.com" };
+
+function ttsTestDef(): TranscriptProviderDef {
+  const def = TRANSCRIPT_PROVIDERS.find((d) => d.name === "tts-test");
+  if (!def) {
+    throw new Error("tts-test provider missing from TRANSCRIPT_PROVIDERS");
+  }
+  return def;
+}
+
 // ---------------------------------------------------------------------------
 // Contract: every def carries the full dict surface.
 // ---------------------------------------------------------------------------
 
 describe("registry contract", () => {
-  test("order is innertube -> yttools -> youtube-transcript-ai -> kome -> supadata", () => {
+  test("order is tts-test -> innertube -> yttools -> youtube-transcript-ai -> kome -> supadata", () => {
     expect(TRANSCRIPT_PROVIDERS.map((d) => d.name)).toEqual([
+      "tts-test",
       "innertube",
       "yttools",
       "youtube-transcript-ai",
@@ -221,13 +243,18 @@ describe("registry contract", () => {
     }
   });
 
-  test("only supadata is key-gated; all entries enabled by default", () => {
+  test("only supadata is key-gated; tts-test is base-url-gated; all enabled", () => {
     for (const def of TRANSCRIPT_PROVIDERS) {
       expect(def.enabled).toBe(true);
       if (def.name === "supadata") {
         expect(def.apiKeyEnv).toBe("SUPADATA_API_KEY");
       } else {
         expect(def.apiKeyEnv).toBeUndefined();
+      }
+      if (def.name === "tts-test") {
+        expect(def.baseUrlEnv).toBe("TTS_TRANSCRIPT_URL");
+      } else {
+        expect(def.baseUrlEnv).toBeUndefined();
       }
     }
   });
@@ -588,6 +615,235 @@ describe("provider fixtures", () => {
       | Record<string, string>
       | undefined;
     expect(sent?.["x-api-key"]).toBe("secret-key");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// tts-test experiment (optional cost-zero provider, disabled by default).
+// ---------------------------------------------------------------------------
+
+describe("tts-test experiment", () => {
+  test("def shape: json GET, transcript path, seconds units, 3s cap, 1.5s floor", () => {
+    expect(ttsTestDef()).toMatchObject({
+      name: "tts-test",
+      kind: "json",
+      method: "GET",
+      lang: "best-effort",
+      timeoutMs: 3000,
+      baseUrlEnv: "TTS_TRANSCRIPT_URL",
+      units: "s",
+      minRemainingMs: 1500,
+      fallThrough404: true,
+      enabled: true,
+    });
+    expect(ttsTestDef().parse).toMatchObject({
+      segmentsPath: "transcript",
+      textField: "text",
+      offsetField: "start",
+      durationField: "duration",
+    });
+  });
+
+  test("seconds units + lang passthrough (?lang= on the URL)", async () => {
+    const { fetchFn, calls } = makeFetch((url) => {
+      expect(url).toBe(
+        "https://abc-123.trycloudflare.com/transcript/dQw4w9WgXcQ?lang=fr",
+      );
+      return { ok: true, status: 200, jsonBody: TTS_FIXTURE };
+    });
+    const out = await runOfflineWaterfall("dQw4w9WgXcQ", "fr", {
+      fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
+      fetchFn,
+      providers: [ttsTestDef()],
+      env: TTS_ENV,
+    });
+    expect(out.provider).toBe("tts-test");
+    // Seconds floats scaled x1000 before the shared ms normalizer.
+    expect(out.segments).toEqual([
+      { startSeconds: 1.5, durationSeconds: 2.5, text: "Hello world" },
+      { startSeconds: 4, durationSeconds: 1, text: "Second line" },
+    ]);
+    expect(calls).toHaveLength(1);
+  });
+
+  test("unset env skips silently (no fetch, transcript-scoped error)", async () => {
+    const { fetchFn, calls } = makeFetch(() => ({
+      ok: true,
+      status: 200,
+      jsonBody: TTS_FIXTURE,
+    }));
+    const err = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
+      fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
+      fetchFn,
+      providers: [ttsTestDef()],
+      env: {},
+    }).then(
+      () => {
+        throw new Error("must reject");
+      },
+      (e: unknown) => e,
+    );
+    expect(classifyTranscriptError(err)).toMatchObject({
+      code: "transcript_unavailable",
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  test("non-https base skips silently", async () => {
+    const { fetchFn, calls } = makeFetch(() => ({
+      ok: true,
+      status: 200,
+      jsonBody: TTS_FIXTURE,
+    }));
+    const err = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
+      fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
+      fetchFn,
+      providers: [ttsTestDef()],
+      env: { TTS_TRANSCRIPT_URL: "http://abc-123.trycloudflare.com" },
+    }).then(
+      () => {
+        throw new Error("must reject");
+      },
+      (e: unknown) => e,
+    );
+    expect(classifyTranscriptError(err)).toMatchObject({
+      code: "transcript_unavailable",
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  test("remaining <1500ms skips to protect the tail; with budget it serves", async () => {
+    const skipped = makeFetch(() => ({
+      ok: true,
+      status: 200,
+      jsonBody: TTS_FIXTURE,
+    }));
+    // started=0, then 7000ms elapse: remaining 1000 < 1500 -> skip.
+    const times = [0, 7000];
+    let tick = 0;
+    const err = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
+      fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
+      fetchFn: skipped.fetchFn,
+      providers: [ttsTestDef()],
+      env: TTS_ENV,
+      budgetMs: 8000,
+      now: () => times[tick++] ?? 0,
+    }).then(
+      () => {
+        throw new Error("must reject");
+      },
+      (e: unknown) => e,
+    );
+    expect(classifyTranscriptError(err)).toMatchObject({
+      code: "transcript_unavailable",
+    });
+    expect(skipped.calls).toHaveLength(0);
+
+    const served = makeFetch(() => ({
+      ok: true,
+      status: 200,
+      jsonBody: TTS_FIXTURE,
+    }));
+    const out = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
+      fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
+      fetchFn: served.fetchFn,
+      providers: [ttsTestDef()],
+      env: TTS_ENV,
+    });
+    expect(out.provider).toBe("tts-test");
+    expect(served.calls).toHaveLength(1);
+  });
+
+  test("empty transcript throws transcript_unavailable (never cached)", async () => {
+    const { fetchFn } = makeFetch(() => ({
+      ok: true,
+      status: 200,
+      jsonBody: { videoId: "dQw4w9WgXcQ", transcript: [] },
+    }));
+    const err = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
+      fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
+      fetchFn,
+      providers: [ttsTestDef()],
+      env: TTS_ENV,
+    }).then(
+      () => {
+        throw new Error("must reject");
+      },
+      (e: unknown) => e,
+    );
+    expect(classifyTranscriptError(err)).toMatchObject({
+      code: "transcript_unavailable",
+      status: 404,
+    });
+  });
+
+  test("429 keeps rate_limited + Retry-After passthrough", async () => {
+    const { fetchFn } = makeFetch(() => ({
+      ok: false,
+      status: 429,
+      jsonBody: {},
+      retryAfter: "30",
+    }));
+    const err = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
+      fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
+      fetchFn,
+      providers: [ttsTestDef()],
+      env: TTS_ENV,
+    }).then(
+      () => {
+        throw new Error("must reject");
+      },
+      (e: unknown) => e,
+    );
+    expect(classifyTranscriptError(err)).toMatchObject({
+      code: "rate_limited",
+      status: 429,
+      retryAfter: 30,
+    });
+  });
+
+  test("head 404 with video-scoped body never short-circuits: tail serves", async () => {
+    const { fetchFn } = makeFetch((url) => {
+      if (url.includes("trycloudflare.com")) {
+        return {
+          ok: false,
+          status: 404,
+          jsonBody: {},
+          textBody: "This video is unavailable",
+        };
+      }
+      if (url.includes("yttools.co")) {
+        return { ok: true, status: 200, jsonBody: YTTOOLS_FIXTURE };
+      }
+      return { ok: false, status: 422, jsonBody: {} };
+    });
+    const out = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
+      fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
+      fetchFn,
+      env: TTS_ENV,
+    });
+    // tts-test 404 softens to fall-through (no video_not_found, stale stays
+    // eligible); yttools serves the tail.
+    expect(out.provider).toBe("yttools");
+    expect(out.segments.length).toBeGreaterThan(0);
+  });
+
+  test("head 429 falls through immediately: tail serves, Retry-After intact", async () => {
+    const { fetchFn } = makeFetch((url) => {
+      if (url.includes("trycloudflare.com")) {
+        return { ok: false, status: 429, jsonBody: {}, retryAfter: "30" };
+      }
+      if (url.includes("yttools.co")) {
+        return { ok: true, status: 200, jsonBody: YTTOOLS_FIXTURE };
+      }
+      return { ok: false, status: 422, jsonBody: {} };
+    });
+    const out = await runOfflineWaterfall("dQw4w9WgXcQ", "en", {
+      fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
+      fetchFn,
+      env: TTS_ENV,
+    });
+    expect(out.provider).toBe("yttools");
   });
 });
 
@@ -1032,6 +1288,28 @@ describe("review fixes", () => {
     );
     expect(res.status).toBe(429);
     expect(res.headers.get("Retry-After")).toBe("120");
+    expect((await res.json()).error.code).toBe("rate_limited");
+  });
+
+  test("route: head-429 falls through, total 429 keeps Retry-After", async () => {
+    const id = "Ff000000430";
+    const { fetchFn } = makeFetch(() => ({
+      ok: false,
+      status: 429,
+      jsonBody: {},
+      retryAfter: "45",
+    }));
+    const res = await handleTranscript(
+      req(`http://x/api/v1/videos/${id}/transcript`),
+      id,
+      {
+        fetchNative: nativeThrow(GET_TRANSCRIPT_400.message),
+        fetchFn,
+        env: { TTS_TRANSCRIPT_URL: "https://abc-123.trycloudflare.com" },
+      },
+    );
+    expect(res.status).toBe(429);
+    expect(res.headers.get("Retry-After")).toBe("45");
     expect((await res.json()).error.code).toBe("rate_limited");
   });
 
