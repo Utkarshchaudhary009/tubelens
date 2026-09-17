@@ -15,7 +15,7 @@
     "@clerk/nextjs": "^7.9.2",
     "@neondatabase/serverless": "^1.1.0",
     "@upstash/redis": "^1.38.4",
-    "@vercel/blob": "^1.1.0",
+    "@vercel/blob": "^2.8.0",
     "drizzle-orm": "^0.45.2",
     "next": "16.3.4",
     "react": "19.2.8",
