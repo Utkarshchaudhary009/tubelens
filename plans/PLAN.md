@@ -568,7 +568,7 @@ principal model.
 
 ## Phase 14 — Quota accounting and monthly allowance
 
-**Status:** `[~]` in progress — branch `part-b/phase-14-quota-accounting`: monthly UTC-window allowance (Free 10,000), pipeline quota stage, `GET /quota` balance, `usage_ledger` table + migration (migrate not yet applied).
+**Status:** `[x]` done — shipped via PR #32 (merged 2026-09-17): monthly UTC-window allowance (Free 10,000), pipeline quota stage, real `GET /quota` balance, `usage_ledger` table + migrations (0000 + 0001 covering index), with 1068 unit tests + e2e PASS on live upstream. Note: atomic reserve/release deferred to Phase 15 (Redis Lua); durable-migrate apply still needs owner Neon credentials.
 
 **Build:**
 - Goal: monthly weighted-credit accounting per principal, 10k free credits (`product.ts` `monthlyCredits`, cost from `quota.ts`).
