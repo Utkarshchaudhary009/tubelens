@@ -25,7 +25,10 @@ const blobStore: TunnelStore = {
   async write(slot: TunnelSlot, rec: TunnelRecord) {
     const { put } = await import("@vercel/blob");
     await put(tunnelBlobPath(slot), JSON.stringify(rec), {
-      access: "public",
+      // The connected Vercel Blob store is configured as private. Keep the
+      // pointer private and read it server-side with the Blob SDK instead of
+      // requesting public access (which fails against private stores).
+      access: "private",
       contentType: "application/json",
       addRandomSuffix: false,
       allowOverwrite: true,
