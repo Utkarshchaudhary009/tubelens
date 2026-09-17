@@ -95,7 +95,7 @@ jobs:
           # `name` is REQUIRED (no default slot). This server is the
           # transcript/speak helper -> `transcript` slot (`t3` belongs to the
           # remote-t3 pairing URL; sharing it would last-writer-wins clash).
-          curl -sf -X POST "https://tubelens.vercel.app/api/v1/tunnel-url" \
+          curl -sf -X POST "https://tubelens-neon.vercel.app/api/v1/tunnel-url" \
             -H "Authorization: Bearer $TUNNEL_UPDATE_TOKEN" \
             -H "Content-Type: application/json" \
             -d "{\"name\": \"transcript\", \"url\": \"$TUNNEL_URL\", \"runId\": \"${{ github.run_id }}\"}"

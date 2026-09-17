@@ -67,7 +67,7 @@ export function buildOpenApiDocument() {
       description:
         "API-first YouTube data API. Phase 10 ships utils and polish (channel RSS feeds for readers and webhooks, seed-to-mix id lookup with item reads via playlists, a pure thumbnail URL resolver, peer instance status for failover-aware clients, single-round-trip batch reads with per-item error isolation, and stub quota counters — plus this full spec), Phase 9 ships flag-gated audio-first endpoints (signed-URL + Range-gateway audio proxy, autoplay radio continuation with >= 25 deduped tracks, and timed/plain lyrics), plus Phase 8 community-enriched data (SponsorBlock skip segments, ReturnYouTubeDislike stats, DeArrow crowd-sourced titles/thumbnails, and one combined call composing detail with all three layers, each degrading independently), plus Phase 7 explore verticals (Shorts discovery, cross-channel live discovery with viewer counts/scheduled times, and the gaming hub), plus Phase 6 music-native search (typed song vs album vs artist), charts snapshots, and artist profiles with top releases, plus Phase 5 playlist reads (metadata plus first items page, paginated items, and a channel's curated playlists), Phase 4 channel profiles, uploads, Shorts shelves, and live/upcoming/past streams, Phase 3 discovery (search autocomplete suggestions, hashtag feeds), Phase 2 watch essentials (related rail, comments, captions, transcript) and Phase 1 health, search, video details, URL resolving, and this spec.",
     },
-    servers: [{ url: "https://tubelens.vercel.app/api/v1" }],
+    servers: [{ url: "https://tubelens-neon.vercel.app/api/v1" }],
     paths: {
       "/health": {
         get: {

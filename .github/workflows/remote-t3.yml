@@ -218,7 +218,7 @@ jobs:
           echo "pairing=$PAIRING_PUBLIC" >> "$GITHUB_OUTPUT"
           echo "=================================================="
           echo "Pair this session from any browser:"
-          echo "  https://tubelens.vercel.app/dev/t3"
+          echo "  https://tubelens-neon.vercel.app/dev/t3"
           echo "Direct pairing URL (carries the token in #fragment):"
           echo "  $PAIRING_PUBLIC"
           echo "Bare tunnel root (manual token entry — avoid):"
@@ -231,7 +231,7 @@ jobs:
             echo "TUNNEL_UPDATE_TOKEN secret not set; skipping API publish (t3-url.txt artifact remains the fallback)."
             exit 0
           fi
-          curl -sf -X POST "https://tubelens.vercel.app/api/v1/tunnel-url" \
+          curl -sf -X POST "https://tubelens-neon.vercel.app/api/v1/tunnel-url" \
             -H "Authorization: Bearer $TUNNEL_UPDATE_TOKEN" \
             -H "Content-Type: application/json" \
             -d "{\"name\": \"t3\", \"url\": \"$PAIRING_PUBLIC\", \"runId\": \"${{ github.run_id }}\"}"
@@ -288,7 +288,7 @@ jobs:
               echo "[$i/69] re-mint: TUNNEL_UPDATE_TOKEN not set; skipping API publish."
               continue
             fi
-            if curl -sf -X POST "https://tubelens.vercel.app/api/v1/tunnel-url" \
+            if curl -sf -X POST "https://tubelens-neon.vercel.app/api/v1/tunnel-url" \
               -H "Authorization: Bearer $TUNNEL_UPDATE_TOKEN" \
               -H "Content-Type: application/json" \
               -d "{\"name\": \"t3\", \"url\": \"$NEW_PUBLIC\", \"runId\": \"${{ github.run_id }}\"}"; then
