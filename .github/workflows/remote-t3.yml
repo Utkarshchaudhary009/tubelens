@@ -191,13 +191,15 @@ jobs:
           fi
           # Host-swap the LOCAL pairing URL onto the tunnel host, preserving
           # the #token= fragment exactly (that fragment is the credential).
-          LOCAL_PAIRING=$(grep -oE 'http://(127\.0\.0\.1|0\.0\.0\.0|localhost):3773/pair#token=[A-Za-z0-9]+' /tmp/t3.log | head -n 1 || true)
+          # NOTE: t3 serve may print a container/VPN IP (e.g. 10.x.x.x) rather
+          # than loopback, so match any http://<host>:3773 host here.
+          LOCAL_PAIRING=$(grep -oE 'http://[^[:space:]/]*:3773/pair#token=[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{16}' /tmp/t3.log | head -n 1 || true)
           if [ -z "$LOCAL_PAIRING" ]; then
             echo "FAILED to find the Pairing URL line in t3 log:"
             cat /tmp/t3.log
             exit 1
           fi
-          PAIRING_PUBLIC="$(printf '%s' "$LOCAL_PAIRING" | sed -E "s|http://(127\.0\.0\.1|0\.0\.0\.0|localhost):3773|${TUNNEL_HOST}|")"
+          PAIRING_PUBLIC="$(printf '%s' "$LOCAL_PAIRING" | sed -E "s|http://[^[:space:]/]*:3773|${TUNNEL_HOST}|")"
           case "$PAIRING_PUBLIC" in
             https://*.trycloudflare.com/pair\#token=?*)
               ;;
@@ -267,12 +269,12 @@ jobs:
           echo "T3 session live; re-minting pairing URL every ~4 min for ~276 min."
           for i in $(seq 1 69); do
             sleep 240
-            NEW_LOCAL="$(timeout 60 npx -y t3@latest pair 2>/dev/null | grep -oE 'http://(127\.0\.0\.1|0\.0\.0\.0|localhost):3773/pair#token=[A-Za-z0-9]+' | head -n 1 || true)"
+            NEW_LOCAL="$(timeout 60 npx -y t3@latest pair 2>/dev/null | grep -oE 'http://[^[:space:]/]*:3773/pair#token=[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{16}' | head -n 1 || true)"
             if [ -z "$NEW_LOCAL" ]; then
               echo "[$i/69] re-mint: no pairing URL from t3 pair; keeping previous pairing."
               continue
             fi
-            NEW_PUBLIC="$(printf '%s' "$NEW_LOCAL" | sed -E "s|http://(127\.0\.0\.1|0\.0\.0\.0|localhost):3773|${TUNNEL_HOST}|")"
+            NEW_PUBLIC="$(printf '%s' "$NEW_LOCAL" | sed -E "s|http://[^[:space:]/]*:3773|${TUNNEL_HOST}|")"
             case "$NEW_PUBLIC" in
               https://*.trycloudflare.com/pair\#token=?*)
                 ;;
