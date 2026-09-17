@@ -24,6 +24,10 @@
 #   PAT — repo PAT with Actions read/write (see unit-test.yml convention)
 #     for the duplicate-guard self-cancel and the end-of-run self-chain
 #     (`gh workflow run`; the GITHUB_TOKEN cannot trigger another workflow).
+#   VERCEL_TOKEN / VERCEL_ORG_ID / VERCEL_PROJECT_ID — optional Vercel CLI
+#     wiring for the pre-publish `vercel inspect` diagnostic. Fail-open:
+#     when any is absent the diagnostic is skipped and the existing
+#     PAT/Blob publish flow works unchanged.
 #
 # Resume: the final step always saves `git diff` -> work.patch + run metadata
 # -> state.json into cache key t3-work-<run_number> AND the t3-state
@@ -171,10 +175,18 @@ jobs:
           sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
           cloudflared --version
 
+      - name: Install Vercel CLI
+        run: |
+          npm i -g vercel@latest
+          vercel --version
+
       - name: Start Cloudflare quick tunnel + publish pairing URL
         id: tunnel
         env:
           TUNNEL_UPDATE_TOKEN: ${{ secrets.TUNNEL_UPDATE_TOKEN }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
         run: |
           nohup cloudflared tunnel --url http://localhost:3773 --no-autoupdate > /tmp/cloudflared.log 2>&1 &
           echo "Waiting for tunnel URL..."
@@ -227,6 +239,15 @@ jobs:
           # Best-effort reachability probe through the public URL (log only,
           # never fail the job — t3 answers pairing flows, not health APIs).
           curl -s -o /dev/null -w "tunnel probe http_code=%{http_code}\n" --max-time 10 "$TUNNEL_HOST/" || true
+          # Optional Vercel CLI diagnostic (fail-open): verifies Vercel
+          # creds before the Blob POST. Absent secrets skip it and the
+          # existing PAT/Blob flow works unchanged.
+          if [ -z "$VERCEL_TOKEN" ] || [ -z "$VERCEL_ORG_ID" ] || [ -z "$VERCEL_PROJECT_ID" ]; then
+            echo "Vercel secrets not fully set; skipping vercel diagnostic (PAT/Blob flow unchanged)."
+          else
+            vercel inspect https://tubelens-neon.vercel.app --token "$VERCEL_TOKEN" 2>&1 | head -n 20 \
+              || echo "vercel inspect failed; continuing to Blob POST (fail-open)."
+          fi
           if [ -z "$TUNNEL_UPDATE_TOKEN" ]; then
             echo "TUNNEL_UPDATE_TOKEN secret not set; skipping API publish (t3-url.txt artifact remains the fallback)."
             exit 0
