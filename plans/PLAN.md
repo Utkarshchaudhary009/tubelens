@@ -548,7 +548,7 @@ principal model.
 
 ## Phase 12 — Distributed Redis rate-limit engine
 
-**Status:** `[~]` in progress — PR open: Upstash sliding-window engine (burst 60/10s + sustained 100/60s, atomic Lua, fail-closed) with shared-limit tests.
+**Status:** `[x]` done — shipped via PR #30 (merged 2026-09-17): Upstash sliding-window engine (burst 60/10s + sustained 100/60s, one atomic Lua EVAL per check, fail-closed 503) behind the existing provider seam, unconfigured path byte-identical, with 28 unit tests + e2e PASS on live upstream (real Redis OSS via mock Upstash REST). Note: no live Upstash run (no UPSTASH_* creds in CI; live test self-skips); sustained 100/60s is a Part-A-compat placeholder until Phase 13 makes it plan-configurable.
 
 **Build:** Use Upstash Redis for distributed enforcement across Vercel/serverless instances. Centralize policy in `src/lib/rate-limit`. Routes declare endpoint class/cost rather than implementing their own counters. Support dimensions such as anonymous IP, authenticated user, project/org, and protected endpoint class. Start with burst + sustained controls using a sliding-window or token-bucket model where appropriate.
 
