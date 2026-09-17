@@ -38,6 +38,18 @@ import {
   resolveOperationCost,
 } from "./quota";
 import {
+  allowanceForTier,
+  checkAllowance,
+  getQuotaStore,
+  idempotencyKey,
+  type QuotaCheck,
+  type QuotaDecision,
+  type QuotaStore,
+  quotaPrincipal,
+  quotaWindowFor,
+  recordConsumption,
+} from "./quota-accounting";
+import {
   defaultRateLimitDecision,
   getRateLimitProvider,
   type RateLimitDecision,
@@ -61,6 +73,8 @@ export interface PipelineProviders {
   auth?: AuthProvider;
   product?: ProductPolicyProvider;
   rateLimit?: RateLimitProvider;
+  /** Monthly allowance store (Phase 14); defaults to the shared store. */
+  quotaStore?: QuotaStore;
   usage?: UsageRecorder;
   observability?: ObservabilityProvider;
   /** Env override for config validation (tests); defaults to process.env. */
@@ -94,6 +108,16 @@ const ACCOUNTING_TIMEOUT_MS = 500;
  * `bypassRateLimit: true` on any other route fails closed.
  */
 const LIVENESS_BYPASS_PATH = "/api/v1/health";
+
+/**
+ * Route labels exempt from quota peek AND consume. Balance reads must be
+ * FREE: an exhausted caller must still be able to read their balance (a
+ * 429 on the balance endpoint would hide the reset they need), and
+ * polling must not tax the monthly allowance. The usage event still
+ * records the attempt (observability, not charging — the single-writer
+ * rule means only store writes feed balances).
+ */
+const QUOTA_FREE_ROUTES: ReadonlySet<string> = new Set(["quota"]);
 
 function pick<T>(override: T | undefined, current: T): T {
   return override ?? current;
@@ -133,11 +157,17 @@ export async function createRequestContext(
  *     baseline allows every principal),
  *  4. runs the rate-limit check (deny → 429 with decision headers;
  *     liveness bypass honored only on /api/v1/health, else a typed 500),
- *  5. invokes the handler (throw → typed 500, never a stack leak),
- *  6. stamps X-Request-Id / X-RateLimit-* from the limiter decision,
+ *  5. peeks the monthly quota allowance (deny → 429 `quota_exceeded`
+ *     with `Retry-After`; rejections consume nothing; liveness bypass
+ *     and the free `quota` balance-read label skip the stage),
+ *  6. invokes the handler (throw → typed 500, never a stack leak, never
+ *     charged),
+ *  7. records the admitted attempt's consumption (attempt-based: error
+ *     responses still charge; store failure → typed 503),
+ *  8. stamps X-Request-Id / X-RateLimit-* from the limiter decision,
  *     preserving the Part A wire contract (defaults match the old stubs),
- *  7. records a usage event via the (no-op) recorder (accounting stage),
- *  8. emits trace/log hooks via best-effort observability (never throws).
+ *  9. records a usage event via the (no-op) recorder (accounting stage),
+ *  10. emits trace/log hooks via best-effort observability (never throws).
  */
 export function withRequestContext(
   handler: RouteHandler,
@@ -285,10 +315,16 @@ export function withRequestContext(
     // default; a DEFINED but unknown label is programmer error (like the
     // bypassRateLimit misuse above) and fails closed with a typed 500 —
     // never free, and never misreported as a 503 dependency outage.
+    // Phase 14 reuses the same resolved record for the quota stage below.
+    let operation: string | undefined;
     let operationCost = 1;
+    let operationPolicyVersion = QUOTA_POLICY_VERSION;
     if (route !== undefined) {
       try {
-        operationCost = resolveOperationCost(route).cost;
+        const resolved = resolveOperationCost(route);
+        operation = resolved.operation;
+        operationCost = resolved.cost;
+        operationPolicyVersion = resolved.policyVersion;
       } catch (err) {
         safe(() =>
           observability.captureError(scrubError(err), {
@@ -352,6 +388,96 @@ export function withRequestContext(
       return res;
     }
 
+    // Quota stage (Phase 14): monthly weighted-credit allowance per
+    // PLANS_AND_USAGE.md §7 ("how much allowance consumed this period?").
+    // Peek-then-consume: the pre-handler peek (read-only) rejects exhausted
+    // callers with 429 BEFORE any upstream work, and consumption is recorded
+    // only after the handler produces a response below. Attempt-based
+    // charging — an admitted attempt is charged even when upstream fails;
+    // quota rejections never consume, and a handler throw (our crash, no
+    // response) never reaches the consume step. Liveness bypass skips the
+    // stage (a probe must never 429), as do the QUOTA_FREE_ROUTES labels
+    // (balance reads are free); unlabeled calls keep the legacy behavior
+    // (no priced operation to charge). A broken quota store fails
+    // closed with a typed 503 — never silently served without accounting.
+    // `nowMs` is captured once per request and threaded through the peek,
+    // the consume, retry-after, and usage rows so a month-boundary straddle
+    // mid-request cannot split consume vs record across windows.
+    const usage = pick(providers.usage, getUsageRecorder());
+    const nowMs = Date.now();
+    const principal = quotaPrincipal(ctx);
+    let quotaStore: QuotaStore | undefined;
+    let quotaCheck: QuotaCheck | undefined;
+    let quotaDecision: QuotaDecision | undefined;
+    if (
+      !options.bypassRateLimit &&
+      route !== undefined &&
+      operation !== undefined &&
+      !QUOTA_FREE_ROUTES.has(route)
+    ) {
+      try {
+        quotaStore = providers.quotaStore ?? (await getQuotaStore());
+        quotaCheck = await checkAllowance(quotaStore, {
+          identity: principal,
+          tier: ctx.tier,
+          cost: operationCost,
+          nowMs,
+        });
+      } catch (err) {
+        safe(() =>
+          observability.captureError(scrubError(err), {
+            requestId: ctx.requestId,
+          }),
+        );
+        span.recordError(scrubError(err));
+        span.end();
+        return errorResponse(ctx.requestId, {
+          code: "service_unavailable",
+          message: "Quota accounting unavailable.",
+          hint: "Retry shortly; the request was not served without allowance accounting.",
+          status: 503,
+          origin,
+        });
+      }
+      if (!quotaCheck.allowed) {
+        // Rejected WITHOUT consuming: the ledger learns via a `rejected`
+        // usage event (best-effort, same bound as the accounting stage);
+        // the store total is untouched.
+        const outcome = quotaCheck;
+        safe(() =>
+          usage.record({
+            requestId: ctx.requestId,
+            route,
+            operation,
+            cost: operationCost,
+            policyVersion: operationPolicyVersion,
+            outcome: "rejected",
+            principal,
+            tier: ctx.tier,
+            windowId: outcome.windowId,
+            resetMs: outcome.resetMs,
+            allowance: outcome.allowance,
+          }),
+        );
+        span.end();
+        const retryAfter = Math.max(
+          1,
+          Math.ceil((outcome.resetMs - nowMs) / 1000),
+        );
+        const resetDay = new Date(outcome.resetMs).toISOString().slice(0, 10);
+        const res = errorResponse(ctx.requestId, {
+          code: "quota_exceeded",
+          message: "Monthly quota exhausted.",
+          hint: `Monthly credit allowance exhausted; new credits on ${resetDay} — reduce usage or wait for reset.`,
+          status: 429,
+          retryAfter,
+          origin,
+        });
+        stampRateLimitHeaders(res, ctx, decision, origin);
+        return res;
+      }
+    }
+
     let res: NextResponse;
     try {
       res = await handler(req, ctx);
@@ -371,7 +497,77 @@ export function withRequestContext(
         origin,
       });
       stampRateLimitHeaders(res, ctx, decision, origin);
+      // No consumption on throw: the peek above never writes, and this path
+      // returns before the consume step — our crash is never the caller's
+      // charge.
       return res;
+    }
+
+    // Consume step: the handler produced a response (success OR error
+    // status), so the admitted attempt is charged now. The billing key is
+    // minted FRESH per admitted attempt (never ctx.requestId — that id
+    // echoes caller-supplied X-Request-Id, so keying charges on it would
+    // let one replayed id suppress charges for distinct executions). The
+    // tracing request id still rides along for correlation. A failing
+    // store fails closed with 503 rather than serving unaccounted work.
+    if (
+      quotaStore !== undefined &&
+      quotaCheck !== undefined &&
+      route !== undefined &&
+      operation !== undefined
+    ) {
+      try {
+        const { used } = await recordConsumption(quotaStore, {
+          identity: principal,
+          tier: ctx.tier,
+          windowId: quotaCheck.windowId,
+          cost: operationCost,
+          operation,
+          policyVersion: operationPolicyVersion,
+          requestId: ctx.requestId,
+          billingKey: idempotencyKey(),
+        });
+        quotaDecision = {
+          allowed: true,
+          used,
+          remaining: Math.max(0, quotaCheck.allowance - used),
+          allowance: quotaCheck.allowance,
+          windowId: quotaCheck.windowId,
+          resetMs: quotaCheck.resetMs,
+          operation,
+          policyVersion: operationPolicyVersion,
+          tier: ctx.tier,
+        };
+      } catch (err) {
+        safe(() =>
+          observability.captureError(scrubError(err), {
+            requestId: ctx.requestId,
+          }),
+        );
+        // The handler already produced a response, but it can never be
+        // served: without a recorded charge it would be unaccounted work,
+        // so fail-closed accounting drops it for this typed 503 instead.
+        safe(() =>
+          observability.log(
+            "warn",
+            "quota consume failed; handler response dropped",
+            {
+              requestId: ctx.requestId,
+              route: route ?? "unknown",
+              status: res.status,
+            },
+          ),
+        );
+        span.recordError(scrubError(err));
+        span.end();
+        return errorResponse(ctx.requestId, {
+          code: "service_unavailable",
+          message: "Quota accounting unavailable.",
+          hint: "Retry shortly; the request was not served without allowance accounting.",
+          status: 503,
+          origin,
+        });
+      }
     }
 
     stampRateLimitHeaders(res, ctx, decision, origin);
@@ -386,7 +582,6 @@ export function withRequestContext(
     // the function is frozen after the response. Migrate this dispatch to
     // waitUntil (Ph.13–14 durable usage) once the runtime handle is
     // threaded through the pipeline — no behavior change until then.
-    const usage = pick(providers.usage, getUsageRecorder());
     setTimeout(() => {
       safe(() => {
         const controller = new AbortController();
@@ -398,6 +593,8 @@ export function withRequestContext(
             res.ok,
             controller.signal,
             observability,
+            quotaDecision,
+            nowMs,
           ),
           accountingTimeout(controller),
         ]);
@@ -454,12 +651,22 @@ function usageRecord(
   ok: boolean,
   signal: AbortSignal,
   observability: ObservabilityProvider,
+  quota?: QuotaDecision | undefined,
+  nowMs: number = Date.now(),
 ): Promise<void> | void {
   // Phase 13: credit rows stamp the resolved catalog record, and the QUOTA
   // policy version is authoritative for them (not the entitlements
   // snapshot). An unlabeled call keeps the legacy unknown/1 stub.
+  // Phase 14: every row also carries tier + monthly window + allowance so
+  // the ledger can explain balances without re-deriving policy. The window
+  // derives from the request's single `nowMs` (never a fresh clock), and
+  // the principal is the quota principal — identical to the store key.
   const outcome = ok ? "accepted" : "rejected";
-  const principal = ctx.auth.userId ?? ctx.auth.keyId;
+  const principal = quotaPrincipal(ctx);
+  const window = quota
+    ? { windowId: quota.windowId, resetMs: quota.resetMs }
+    : quotaWindowFor(nowMs);
+  const allowance = quota?.allowance ?? allowanceForTier(ctx.tier);
   if (route === undefined) {
     return usage.record(
       {
@@ -470,6 +677,10 @@ function usageRecord(
         policyVersion: QUOTA_POLICY_VERSION,
         outcome,
         principal,
+        tier: ctx.tier,
+        windowId: window.windowId,
+        resetMs: window.resetMs,
+        allowance,
       },
       { signal },
     );
@@ -509,6 +720,10 @@ function usageRecord(
       policyVersion,
       outcome,
       principal,
+      tier: ctx.tier,
+      windowId: window.windowId,
+      resetMs: window.resetMs,
+      allowance,
     },
     { signal },
   );

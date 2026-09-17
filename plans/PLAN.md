@@ -568,7 +568,7 @@ principal model.
 
 ## Phase 14 — Quota accounting and monthly allowance
 
-**Status:** `[ ]` not started.
+**Status:** `[~]` in progress — branch `part-b/phase-14-quota-accounting`: monthly UTC-window allowance (Free 10,000), pipeline quota stage, `GET /quota` balance, `usage_ledger` table + migration (migrate not yet applied).
 
 **Build:**
 - Goal: monthly weighted-credit accounting per principal, 10k free credits (`product.ts` `monthlyCredits`, cost from `quota.ts`).
