@@ -252,12 +252,21 @@ jobs:
             echo "TUNNEL_UPDATE_TOKEN secret not set; skipping API publish (t3-url.txt artifact remains the fallback)."
             exit 0
           fi
-          curl -sf -X POST "https://tubelens-neon.vercel.app/api/v1/tunnel-url" \
+          # Publish via the API (visible logging: -sf would hide the 401 body,
+          # so capture the HTTP code + error code/message and always log one
+          # BLOB_PUBLISH line; token stays out of the logs — never echo it).
+          RESP="$(mktemp)"
+          HTTP_CODE="$(curl -s -o "$RESP" -w "%{http_code}" --max-time 30 -X POST "https://tubelens-neon.vercel.app/api/v1/tunnel-url" \
             -H "Authorization: Bearer $TUNNEL_UPDATE_TOKEN" \
             -H "Content-Type: application/json" \
-            -d "{\"name\": \"t3\", \"url\": \"$PAIRING_PUBLIC\", \"runId\": \"${{ github.run_id }}\"}"
-          echo ""
-          echo "Published pairing URL to the t3 slot of the production API"
+            -d "{\"name\": \"t3\", \"url\": \"$PAIRING_PUBLIC\", \"runId\": \"${{ github.run_id }}\"}")" || true
+          ERROR="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); e=d.get('error') or {}; print((e.get('code','')+':'+e.get('message','')) if e else 'none')" "$RESP" 2>/dev/null || echo unparseable)"
+          echo "BLOB_PUBLISH http_code=$HTTP_CODE error=$ERROR"
+          rm -f "$RESP"
+          case "$HTTP_CODE" in
+            2*) echo "Published pairing URL to the t3 slot of the production API" ;;
+            *) echo "Publish failed; see BLOB_PUBLISH line above."; exit 1 ;;
+          esac
           # Seed the last-remint timestamp (refreshed by the keep-alive loop
           # on every successful re-publish; the save step records it in
           # state.json so a stale loop is visible in the t3-state artifact).
@@ -309,19 +318,29 @@ jobs:
               echo "[$i/69] re-mint: TUNNEL_UPDATE_TOKEN not set; skipping API publish."
               continue
             fi
-            if curl -sf -X POST "https://tubelens-neon.vercel.app/api/v1/tunnel-url" \
+            # Visible logging (same as the initial publish: -sf would hide the
+            # 401 body, so capture HTTP code + error code/message; token is
+            # never echoed). Fail-open: any single cycle failure keeps the
+            # previous pairing.
+            RESP="$(mktemp)"
+            HTTP_CODE="$(curl -s -o "$RESP" -w "%{http_code}" --max-time 30 -X POST "https://tubelens-neon.vercel.app/api/v1/tunnel-url" \
               -H "Authorization: Bearer $TUNNEL_UPDATE_TOKEN" \
               -H "Content-Type: application/json" \
-              -d "{\"name\": \"t3\", \"url\": \"$NEW_PUBLIC\", \"runId\": \"${{ github.run_id }}\"}"; then
-              echo ""
-              echo "[$i/69] re-mint: published a fresh pairing URL to the t3 slot."
-              # Last successful re-mint, picked up into state.json by the save
-              # step so a stale loop is visible in the t3-state artifact.
-              date -u +"%Y-%m-%dT%H:%M:%SZ" > "$GITHUB_WORKSPACE/last-remint.txt"
-            else
-              echo ""
-              echo "[$i/69] re-mint: publish failed; keeping previous pairing."
-            fi
+              -d "{\"name\": \"t3\", \"url\": \"$NEW_PUBLIC\", \"runId\": \"${{ github.run_id }}\"}")" || true
+            ERROR="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); e=d.get('error') or {}; print((e.get('code','')+':'+e.get('message','')) if e else 'none')" "$RESP" 2>/dev/null || echo unparseable)"
+            echo "[$i/69] BLOB_PUBLISH http_code=$HTTP_CODE error=$ERROR"
+            rm -f "$RESP"
+            case "$HTTP_CODE" in
+              2*)
+                echo "[$i/69] re-mint: published a fresh pairing URL to the t3 slot."
+                # Last successful re-mint, picked up into state.json by the save
+                # step so a stale loop is visible in the t3-state artifact.
+                date -u +"%Y-%m-%dT%H:%M:%SZ" > "$GITHUB_WORKSPACE/last-remint.txt"
+                ;;
+              *)
+                echo "[$i/69] re-mint: publish failed; keeping previous pairing."
+                ;;
+            esac
           done
           echo "Keep-alive window done; proceeding to save+chain."
 
