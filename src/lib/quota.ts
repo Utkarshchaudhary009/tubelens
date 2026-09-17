@@ -103,7 +103,11 @@ const CATALOG: Record<string, QuotaOperation> = {
   "admin.keys.revoke": { operation: "admin.keys.revoke", cost: 1 },
   "admin.keys.create": { operation: "admin.keys.create", cost: 1 },
   "admin.keys.list": { operation: "admin.keys.list", cost: 1 },
-  // Medium reads (2): paged listings + single-source third-party lookups.
+  // Medium reads (2): paged listings (channel tabs, playlist items,
+  // related/continuation pages) plus single third-party upstream lookups —
+  // related walks a continuation page, sponsors/dislikes/dearrow each hit one
+  // external source (SponsorBlock/ReturnYouTubeDislike/DeArrow): costlier
+  // than local metadata, cheaper than transcript assembly.
   "videos.related": { operation: "videos.related", cost: 2 },
   "videos.comments": { operation: "comments.list", cost: 2 },
   "videos.sponsors": { operation: "sponsors.get", cost: 2 },
@@ -114,10 +118,12 @@ const CATALOG: Record<string, QuotaOperation> = {
   "channels.streams": { operation: "channels.streams", cost: 2 },
   "channels.playlists": { operation: "channels.playlists", cost: 2 },
   "playlists.items": { operation: "playlists.items", cost: 2 },
-  // Expensive reads (3): transcript + binary audio fetch.
+  // Expensive reads (3): transcript assembles timed text across upstream
+  // fetches; audio proxies binary stream bytes — both heavy upstream work.
   "videos.transcript": { operation: "transcript.get", cost: 3 },
   "videos.audio": { operation: "audio.get", cost: 3 },
-  // Composed read (4): multi-upstream fan-in served as one response.
+  // Composed read (4): multi-upstream fan-in served as one response, priced
+  // inside the PLAN's 4–5 composed range.
   "videos.combined": { operation: "combined.get", cost: 4 },
   // Batch declares its ceiling as its worst-case cost; the actual per-call
   // charge is the summed child cost computed by costForBatch().
@@ -349,7 +355,9 @@ export interface ResolvedBatchCost extends ResolvedOperationCost {
  * Price one batch call: sum of resolved child costs. Over the
  * BATCH_MAX_COST ceiling (or a child-count/shape violation) throws a typed
  * QuotaPolicyError — callers must reject BEFORE executing any child, so a
- * rejected batch performs no child work.
+ * rejected batch performs no child work. Phase 13 scope: deterministic
+ * costing + ceiling enforcement only; durable credit deduction is Phase 14
+ * (full batch economics Phase 16) — see PLANS_AND_USAGE.md §6/§9.
  */
 export function costForBatch(childPathnames: string[]): ResolvedBatchCost {
   if (childPathnames.length === 0) {

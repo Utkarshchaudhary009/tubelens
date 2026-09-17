@@ -691,6 +691,10 @@ export async function handleBatch(
   // I/O has run yet (validateBatchItem only builds URLs), so an over-cap
   // batch is rejected before any child work executes. Batches with no
   // runnable items skip pricing and keep their per-item static errors.
+  // Scope: Phase 13 defines deterministic costs + this ceiling only — no
+  // weighted deduction happens here (the batch route bypasses the pipeline).
+  // Actual credit deduction/accounting lands in Phase 14, full batch
+  // economics in Phase 16 (see PLANS_AND_USAGE.md §6/§9).
   const runnablePathnames = tasks.flatMap((task) =>
     task.kind === "run" ? [task.pathname] : [],
   );

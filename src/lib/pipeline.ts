@@ -32,7 +32,11 @@ import {
   getProductPolicyProvider,
   type ProductPolicyProvider,
 } from "./product";
-import { QUOTA_POLICY_VERSION, resolveOperationCost } from "./quota";
+import {
+  QUOTA_POLICY_VERSION,
+  QuotaPolicyError,
+  resolveOperationCost,
+} from "./quota";
 import {
   defaultRateLimitDecision,
   getRateLimitProvider,
@@ -276,19 +280,41 @@ export function withRequestContext(
     // Rate-limit stage (Phase 01: allow-all default). Liveness bypasses
     // only this check; context, ids, and headers still apply.
     const rateLimit = pick(providers.rateLimit, getRateLimitProvider());
+    // Phase 13: the limiter is weighted by the catalog cost, resolved BEFORE
+    // the limiter try-block. An unlabeled call keeps the legacy cost-1
+    // default; a DEFINED but unknown label is programmer error (like the
+    // bypassRateLimit misuse above) and fails closed with a typed 500 —
+    // never free, and never misreported as a 503 dependency outage.
+    let operationCost = 1;
+    if (route !== undefined) {
+      try {
+        operationCost = resolveOperationCost(route).cost;
+      } catch (err) {
+        safe(() =>
+          observability.captureError(scrubError(err), {
+            requestId: ctx.requestId,
+          }),
+        );
+        span.recordError(scrubError(err));
+        span.end();
+        return errorResponse(ctx.requestId, {
+          code: "internal",
+          message: "Service route misconfigured.",
+          hint: "Report the X-Request-Id; route has no priced operation.",
+          status: 500,
+          origin,
+        });
+      }
+    }
     let decision: RateLimitDecision;
     if (options.bypassRateLimit) {
       decision = defaultRateLimitDecision();
     } else {
       try {
-        // Phase 13: the limiter is weighted by the catalog cost. An
-        // unlabeled call keeps the legacy cost-1 default; a DEFINED but
-        // unknown label throws inside this try and fails closed to the 503
-        // below — an unpriced operation must never become free.
         decision = await rateLimit.check({
           identity: ctx.rateLimitIdentity,
           endpointClass: route ?? "default",
-          cost: route === undefined ? 1 : resolveOperationCost(route).cost,
+          cost: operationCost,
         });
       } catch (err) {
         // A broken limiter must never silently fail open into unprotected
@@ -365,7 +391,14 @@ export function withRequestContext(
       safe(() => {
         const controller = new AbortController();
         return Promise.race([
-          usageRecord(usage, ctx, route, res.ok, controller.signal),
+          usageRecord(
+            usage,
+            ctx,
+            route,
+            res.ok,
+            controller.signal,
+            observability,
+          ),
           accountingTimeout(controller),
         ]);
       });
@@ -420,11 +453,11 @@ function usageRecord(
   route: string | undefined,
   ok: boolean,
   signal: AbortSignal,
+  observability: ObservabilityProvider,
 ): Promise<void> | void {
   // Phase 13: credit rows stamp the resolved catalog record, and the QUOTA
   // policy version is authoritative for them (not the entitlements
-  // snapshot). An unlabeled call keeps the legacy unknown/1 stub; a DEFINED
-  // but unknown label records NOTHING — fail closed, never a fabricated row.
+  // snapshot). An unlabeled call keeps the legacy unknown/1 stub.
   const outcome = ok ? "accepted" : "rejected";
   const principal = ctx.auth.userId ?? ctx.auth.keyId;
   if (route === undefined) {
@@ -450,6 +483,19 @@ function usageRecord(
     cost = resolved.cost;
     policyVersion = resolved.policyVersion;
   } catch {
+    // Unpriced labels must not mint credit rows — record nothing, but emit
+    // so a miswired route is observable instead of silent.
+    safe(() =>
+      observability.captureError(
+        scrubError(
+          new QuotaPolicyError(
+            "unknown_operation",
+            "Route has no priced operation.",
+          ),
+        ),
+        { requestId: ctx.requestId },
+      ),
+    );
     return;
   }
   return usage.record(

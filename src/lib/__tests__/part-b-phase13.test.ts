@@ -285,6 +285,38 @@ describe("phase 13 batch ceiling preflight (handleBatch)", () => {
     expect(res.status).toBe(200);
     expect(seen).toHaveLength(3);
   });
+
+  test("all-static-error batch skips pricing, keeps per-item errors", async () => {
+    process.env.TUBELENS_PUBLIC_URL = "http://x";
+    let executions = 0;
+    const deps: BatchDeps = {
+      execute: async () => {
+        executions += 1;
+        return { status: 200, body: { ok: true } };
+      },
+    };
+    const res = await handleBatch(
+      jsonReq("http://x/api/v1/batch", {
+        requests: [
+          { method: "POST", path: "/api/v1/health" },
+          { method: "GET", path: "/api/v1/batch" },
+          { method: "GET", path: "/api/v1/nope" },
+        ],
+      }),
+      deps,
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const codes = (
+      body.data.results as Array<{ body: { error: { code: string } } }>
+    ).map((r) => r.body.error.code);
+    expect(codes).toEqual([
+      "batch_method_not_allowed",
+      "batch_nested",
+      "batch_path_not_allowed",
+    ]);
+    expect(executions).toBe(0);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -395,9 +427,10 @@ describe("phase 13 pipeline integration", () => {
     });
   });
 
-  test("unknown route fails closed: 503, no limiter contact, no usage row", async () => {
+  test("unknown route fails closed: typed 500, no limiter contact, no usage row", async () => {
     const seen: RateLimitCheck[] = [];
     const events: UsageEvent[] = [];
+    const errors: unknown[] = [];
     const run = withRequestContext(
       async (_r, ctx) =>
         successResponse({ ok: true }, { requestId: ctx.requestId }),
@@ -418,13 +451,47 @@ describe("phase 13 pipeline integration", () => {
             events.push(event);
           },
         },
+        observability: {
+          startSpan: () => ({
+            recordError: () => {},
+            end: () => {},
+          }),
+          log: () => {},
+          increment: () => {},
+          captureError: (err: unknown) => {
+            errors.push(err);
+          },
+        },
       },
       "nope.unknown",
     );
     const res = await run(req("http://x/api/v1/nope"));
-    expect(res.status).toBe(503);
+    expect(res.status).toBe(500);
+    const body = await res.json();
+    expect(body.error.code).toBe("internal");
+    expect(body.error.hint).toContain("no priced operation");
     expect(seen).toHaveLength(0);
+    expect(errors).toHaveLength(1);
     await new Promise((r) => setTimeout(r, 25));
     expect(events).toHaveLength(0);
+  });
+
+  test("every label wired through withRequestContext is priced", () => {
+    // Manually verified against src/app/api/v1/**/route.ts (grep for the
+    // route-label argument to withRequestContext): a future route wired
+    // with an unpriced label must trip this list, not silently 500.
+    const wiredLabels = [
+      "health",
+      "me",
+      "admin.keys.create",
+      "admin.keys.list",
+      "admin.keys.revoke",
+      "admin.users.role",
+      "admin.users.tier",
+    ];
+    expect(wiredLabels).toHaveLength(7);
+    for (const label of wiredLabels) {
+      expect(isKnownOperation(label)).toBe(true);
+    }
   });
 });
