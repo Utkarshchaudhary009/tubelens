@@ -38,7 +38,12 @@ async function getPairingRecord(): Promise<TunnelSlotPayload["data"]> {
   }
   try {
     return await readTunnelRecord("t3");
-  } catch {
+  } catch (err) {
+    // Fail-open holding page, but leave the real Blob cause in Vercel logs
+    // so a broken store doesn't look like "no session published yet".
+    console.error("[tunnel-url] dev/t3 store read failed", {
+      error: err instanceof Error ? `${err.name}: ${err.message}` : String(err),
+    });
     return null;
   }
 }

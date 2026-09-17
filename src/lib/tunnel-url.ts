@@ -121,7 +121,16 @@ export async function handleTunnelGet(req: NextRequest, deps: TunnelDeps) {
       requestId,
       cacheControl: CACHE_CONTROL.noStore,
     });
-  } catch {
+  } catch (err) {
+    // Log the underlying Blob failure server-side: the 502 below is
+    // intentionally opaque to clients, but Vercel logs need the real cause
+    // (e.g. BlobStoreNotFoundError = store not connected, BlobAccessError =
+    // bad/rotated BLOB_READ_WRITE_TOKEN). Name + message only, no secrets.
+    console.error("[tunnel-url] store read failed", {
+      requestId,
+      slot: slot.slot,
+      error: err instanceof Error ? `${err.name}: ${err.message}` : String(err),
+    });
     return errorResponse(requestId, {
       code: "upstream_degraded",
       message: "Could not read the stored tunnel URL.",
@@ -230,7 +239,14 @@ export async function handleTunnelWrite(req: NextRequest, deps: TunnelDeps) {
       requestId,
       cacheControl: CACHE_CONTROL.noStore,
     });
-  } catch {
+  } catch (err) {
+    // Same surfacing as the read path: clients get the opaque 502, Vercel
+    // logs get the real Blob cause (store missing vs token vs outage).
+    console.error("[tunnel-url] store write failed", {
+      requestId,
+      slot: slot.slot,
+      error: err instanceof Error ? `${err.name}: ${err.message}` : String(err),
+    });
     return errorResponse(requestId, {
       code: "upstream_degraded",
       message: "Could not store the tunnel URL.",
