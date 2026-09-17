@@ -570,7 +570,15 @@ principal model.
 
 **Status:** `[~]` in progress — branch `part-b/phase-14-quota-accounting`: monthly UTC-window allowance (Free 10,000), pipeline quota stage, `GET /quota` balance, `usage_ledger` table + migration (migrate not yet applied).
 
-**Build:** Implement monthly/daily usage windows according to [`PLANS_AND_USAGE.md`](./PLANS_AND_USAGE.md). Track consumed weighted credits, allowance, remaining amount, reset time, account/user/project/key identity, tier, policy version, and accepted/rejected/partial outcome as appropriate. Keep durable accounting in Postgres only when the product requires it; Redis is the fast enforcement layer, not the historical source of truth.
+**Build:**
+- Goal: monthly weighted-credit accounting per principal, 10k free credits (`product.ts` `monthlyCredits`, cost from `quota.ts`).
+- Decision rule: Redis = fast enforcement (check/reject now), Postgres = durable truth (ledger forever).
+- Redis: key `quota:v1:{principal}:{YYYY-MM}`, INCRBY cost + EXPIRE at month reset, 1 cmd/request. Lua check-and-charge. Fail-safe 503 on Redis down (never fail-open).
+- Postgres: `usage_ledger` table (principal, operation, cost, policyVersion, window YYYY-MM, outcome accepted/rejected, requestId, timestamp) + `quota_windows` summary. Drizzle migration. Background write via waitUntil, 500ms bound.
+- Pipeline order (`pipeline.ts`): resolve cost via `quota.ts` → Redis pre-check → serve → record accepted/rejected to both Redis (sync) + Postgres (async). Cache hits still charge. Batch = summed preflight cost. Unknown op = fail-closed.
+- `/quota` route: upgrade stub to real remaining/reset/allowance per `PLANS_AND_USAGE.md` §5, §8.
+- Tests/exit: 10k-balance exact, reject at zero with `quota_exceeded` 429 + `Retry-After`, month-rollover, restart durability (rebuild Redis from Postgres), Redis-down 503.
+- Files: drizzle migration, new `src/lib/quota-accounting.ts`, `pipeline.ts` wiring, `usage.ts` replace noop, `quota` route.
 
 **Test:** Start a test account with 10,000 monthly credits. Consume known costs and verify exact remaining balance. Drive usage to zero and verify the next charge is rejected. Move the clock across a reset boundary and verify a new window. Restart the application and verify durable usage remains correct when Postgres accounting is enabled.
 
@@ -580,17 +588,18 @@ principal model.
 
 **Status:** `[ ]` not started.
 
-**Build:** Enforce the architecture distinction:
+**Build:** Hardening-only separation of three subsystems (no new infra):
 
-- **Rate limit:** can this principal make a request now? → Redis.
-- **Quota/credits:** how much allowance has been consumed? → durable accounting when required, with Redis for fast checks.
-- **Cache:** can an upstream fetch be avoided? → Part A CDN/in-memory by default.
+- **Goal:** rate-limit = can-request-now (Redis sliding-window burst 60/10s + sustained 100/60s); quota = monthly allowance consumed (Redis fast-check + Postgres ledger from Phase 14); cache = avoid upstream (L0 in-memory + CDN Part A, transcripts never live-only).
+- **Invariants:** cache-hit still faces rate-limit + quota charge; cache-miss must charge usage; `clearCache()` must never delete `usage_ledger`/`quota_windows`; removing Postgres must not break Part A transcript serving.
+- **Pipeline order:** `auth → rate-limit` (cost via `quota.ts`) `→ service` (cache lookup inside, but charge regardless) `→ accounting` (Redis INCRBY + async PG ledger via `waitUntil`).
+- **Cache rules:** `quota`/`batch`/`audio` = `private, no-store`; serve-stale-on-error sets `meta.cached: true` + `warnings[]`. Transcripts stay out of Postgres unless a later explicit storage/cost/privacy decision enables it.
 
-Keep transcript caching out of Postgres unless a later explicit storage/cost/privacy decision enables it.
+**Test:** Contract tests for the 4 invariants above, no new infra.
 
-**Test:** Cache-hit request must still face rate-limit/quota rules. A cache miss must not bypass usage charging. Clearing the cache must not delete durable usage. Removing Postgres from a cache-only environment must not break Part A transcript functionality.
+**Exit:** No subsystem is used as another's source of truth.
 
-**Exit:** No subsystem is accidentally used as another subsystem's source of truth.
+> **Note:** blocked on Phase 14 (needs quota-accounting + `usage_ledger` first); Phase 15 is hardening-only.
 
 ## Phase 16 — Batch protection and partial-abuse resistance
 

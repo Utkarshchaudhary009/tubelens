@@ -15,6 +15,12 @@ import {
 
 export const runtime = "nodejs";
 
+// Mutable tunnel pointers are tiny JSON objects that are overwritten in
+// place. Keep the Blob CDN cache hot for 7 hours so repeated reads mostly hit
+// the CDN instead of Blob origin. Vercel invalidates overwritten blob content
+// through its cache, with documented propagation of up to ~60 seconds.
+const TUNNEL_BLOB_CACHE_MAX_AGE = 7 * 60 * 60;
+
 // Vercel Blob pointers for throwaway tunnel URLs (one blob per `name` slot:
 // `tunnel-url-t3.json`, `tunnel-url-transcript.json`). Reads go through the
 // shared lib helper (same read the /dev/t3 page uses directly — no HTTP
@@ -26,12 +32,12 @@ const blobStore: TunnelStore = {
     const { put } = await import("@vercel/blob");
     await put(tunnelBlobPath(slot), JSON.stringify(rec), {
       // The connected Vercel Blob store is configured as private. Keep the
-      // pointer private and read it server-side with the Blob SDK instead of
-      // requesting public access (which fails against private stores).
+      // pointer private and read it server-side with the Blob SDK.
       access: "private",
       contentType: "application/json",
       addRandomSuffix: false,
       allowOverwrite: true,
+      cacheControlMaxAge: TUNNEL_BLOB_CACHE_MAX_AGE,
     });
     return rec;
   },
@@ -44,7 +50,9 @@ function deps(): TunnelDeps {
 // Public read: { data: { url, runId, updatedAt } } or { data: null } when no
 // run has published that slot yet. `?name=` is required (no default slot):
 // bare GET is a 400 missing_name — validated BEFORE the blob-unconfigured
-// early-out so an invalid slot never returns 200 null. Private, no-store.
+// early-out so an invalid slot never returns 200 null. The API response itself
+// remains no-store because it contains the current pairing credential; the
+// underlying private Blob fetch is separately CDN-cached for cost control.
 export async function GET(req: NextRequest) {
   const requestId = getRequestId(req);
   const slot = resolveSlot(req.nextUrl.searchParams.get("name"));
