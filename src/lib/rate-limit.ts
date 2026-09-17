@@ -116,14 +116,20 @@ export interface RedisRateLimitProviderOptions {
 // ---------------------------------------------------------------------------
 
 /**
- * Atomic check-then-add for both windows. KEYS = [burstKey, sustainedKey].
+ * Atomic check-then-add for both windows. KEYS = [burstKey, sustainedKey] —
+ * the ONLY keys touched (no dynamic/unlisted keys, no DB-wide commands),
+ * so the script declares `allow-key-locking` and Upstash locks just these
+ * two keys instead of the global lock.
  * ARGV = [nowMs, burstWindowMs, burstLimit, sustainedWindowMs,
  * sustainedLimit, cost, memberNonce, burstTtlSec, sustainedTtlSec].
- * Returns [allowed, burstCount, burstOldest, sustainedCount,
- * sustainedOldest]: counts are post-add on allow, current on deny; oldest
- * is the oldest surviving score (or nowMs when the window is empty).
+ * Returns [allowed, burstCount, burstScore, sustainedCount,
+ * sustainedScore]: counts are post-add on allow, current on deny. On deny
+ * each score is the freeing member's score — the (count + cost - limit)-th
+ * oldest, i.e. the slot whose expiry actually frees enough room for this
+ * cost (plain oldest when cost is 1); on allow the oldest (unused).
  */
-export const RATE_LIMIT_LUA_SCRIPT = `local burst_key = KEYS[1]
+export const RATE_LIMIT_LUA_SCRIPT = `#!lua flags=allow-key-locking
+local burst_key = KEYS[1]
 local sustained_key = KEYS[2]
 local now = tonumber(ARGV[1])
 local burst_window = tonumber(ARGV[2])
@@ -134,6 +140,19 @@ local cost = tonumber(ARGV[6])
 local nonce = ARGV[7]
 local burst_ttl = tonumber(ARGV[8])
 local sustained_ttl = tonumber(ARGV[9])
+local function freeing_score(key, need, fallback)
+  if need < 1 then
+    return fallback
+  end
+  local slot = redis.call('ZRANGE', key, need - 1, need - 1, 'WITHSCORES')
+  if #slot == 2 then
+    local score = tonumber(slot[2])
+    if score then
+      return score
+    end
+  end
+  return fallback
+end
 redis.call('ZREMRANGEBYSCORE', burst_key, 0, now - burst_window)
 redis.call('ZREMRANGEBYSCORE', sustained_key, 0, now - sustained_window)
 local burst_count = redis.call('ZCARD', burst_key)
@@ -144,8 +163,18 @@ local burst_head = redis.call('ZRANGE', burst_key, 0, 0, 'WITHSCORES')
 if #burst_head == 2 then burst_oldest = tonumber(burst_head[2]) end
 local sustained_head = redis.call('ZRANGE', sustained_key, 0, 0, 'WITHSCORES')
 if #sustained_head == 2 then sustained_oldest = tonumber(sustained_head[2]) end
-if burst_count + cost > burst_limit or sustained_count + cost > sustained_limit then
-  return {0, burst_count, burst_oldest, sustained_count, sustained_oldest}
+local burst_denied = burst_count + cost > burst_limit
+local sustained_denied = sustained_count + cost > sustained_limit
+if burst_denied or sustained_denied then
+  local burst_score = burst_oldest
+  local sustained_score = sustained_oldest
+  if burst_denied then
+    burst_score = freeing_score(burst_key, burst_count + cost - burst_limit, now)
+  end
+  if sustained_denied then
+    sustained_score = freeing_score(sustained_key, sustained_count + cost - sustained_limit, now)
+  end
+  return {0, burst_count, burst_score, sustained_count, sustained_score}
 end
 for i = 1, cost do
   redis.call('ZADD', burst_key, now, nonce .. ':b:' .. i)
@@ -311,15 +340,17 @@ async function withDeadline<T>(
 /**
  * Strict script-reply parsing (fail closed): any unknown/malformed shape
  * throws the static backend error — never coerced to 0/allow. Reply must
- * be exactly [allowed, burstCount, burstOldest, sustainedCount,
- * sustainedOldest] with allowed ∈ {0,1} and finite non-negative numbers.
+ * be exactly [allowed, burstCount, burstScore, sustainedCount,
+ * sustainedScore] with allowed ∈ {0,1} and finite non-negative numbers.
+ * On deny each score is the freeing member's score (the (count + cost -
+ * limit)-th oldest); on allow the oldest (unused by the engine).
  */
 interface ScriptOutcome {
   allowed: boolean;
   burstCount: number;
-  burstOldest: number;
+  burstScore: number;
   sustainedCount: number;
-  sustainedOldest: number;
+  sustainedScore: number;
 }
 
 function strictCount(value: unknown): number {
@@ -353,9 +384,9 @@ function parseScriptReply(reply: unknown): ScriptOutcome {
   return {
     allowed: allowedRaw === 1,
     burstCount: strictCount(burstCountRaw),
-    burstOldest: strictScore(burstOldestRaw),
+    burstScore: strictScore(burstOldestRaw),
     sustainedCount: strictCount(sustainedCountRaw),
-    sustainedOldest: strictScore(sustainedOldestRaw),
+    sustainedScore: strictScore(sustainedOldestRaw),
   };
 }
 
@@ -451,10 +482,10 @@ export function createRedisRateLimitProvider(
       // Deny: the binding constraint is the window that stays exhausted
       // longest (a request must wait for BOTH windows to have room).
       const burstReset = Math.floor(
-        (outcome.burstOldest + burst.windowMs) / 1000,
+        (outcome.burstScore + burst.windowMs) / 1000,
       );
       const sustainedReset = Math.floor(
-        (outcome.sustainedOldest + sustained.windowMs) / 1000,
+        (outcome.sustainedScore + sustained.windowMs) / 1000,
       );
       const burstFull = outcome.burstCount + weight > burst.limit;
       const sustainedFull = outcome.sustainedCount + weight > sustained.limit;
@@ -527,6 +558,26 @@ interface RedisSingleton {
 let redisSingleton: RedisSingleton | null = null;
 
 /**
+ * Fail-closed poison provider: returned when the Redis backend cannot even
+ * be constructed. Its check throws the static message (pipeline → 503),
+ * so construction failure can never degrade into allow-all serving.
+ */
+interface PoisonRateLimitProvider extends RateLimitProvider {
+  readonly poisoned: true;
+}
+
+/** True only for the poison provider (lets tests tell it apart). */
+export function isPoisonProvider(
+  provider: RateLimitProvider,
+): provider is PoisonRateLimitProvider {
+  return (
+    typeof provider === "object" &&
+    provider !== null &&
+    (provider as { poisoned?: unknown }).poisoned === true
+  );
+}
+
+/**
  * Build the Redis-backed provider for one credential pair. Construction
  * itself cannot fail open: any throw becomes a poison provider whose
  * check throws the static message, which the pipeline maps to 503.
@@ -537,11 +588,13 @@ function redisProviderOrPoison(url: string, token: string): RateLimitProvider {
       upstashRateLimitBackend(new Redis({ url, token })),
     );
   } catch {
-    return {
+    const poison: PoisonRateLimitProvider = {
+      poisoned: true,
       check(): Promise<RateLimitDecision> {
         throw new Error(BACKEND_UNAVAILABLE);
       },
     };
+    return poison;
   }
 }
 

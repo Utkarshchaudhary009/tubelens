@@ -20,6 +20,7 @@ import {
   allowAllRateLimitProvider,
   createRedisRateLimitProvider,
   getRateLimitProvider,
+  isPoisonProvider,
   RATE_LIMIT_BURST_LIMIT,
   RATE_LIMIT_BURST_WINDOW_MS,
   RATE_LIMIT_LUA_SCRIPT,
@@ -140,18 +141,33 @@ class InMemoryRateLimitBackend implements RateLimitRedisBackend {
       }
       return min === Number.POSITIVE_INFINITY ? nowMs : min;
     };
+    // Freeing member: the (count + cost - limit)-th oldest — the slot
+    // whose expiry actually frees enough room (mirrors the Lua helper).
+    const freeing = (
+      list: Array<{ score: number; member: string }>,
+      need: number,
+    ): number => {
+      if (need < 1) {
+        return nowMs;
+      }
+      const sorted = [...list].sort((a, b) => a.score - b.score);
+      return sorted.length >= need ? sorted[need - 1].score : nowMs;
+    };
     const burstOldest = oldest(burstList);
     const sustainedOldest = oldest(sustainedList);
-    if (
-      burstList.length + cost > burstLimit ||
-      sustainedList.length + cost > sustainedLimit
-    ) {
+    const burstDenied = burstList.length + cost > burstLimit;
+    const sustainedDenied = sustainedList.length + cost > sustainedLimit;
+    if (burstDenied || sustainedDenied) {
       return [
         0,
         burstList.length,
-        burstOldest,
+        burstDenied
+          ? freeing(burstList, burstList.length + cost - burstLimit)
+          : burstOldest,
         sustainedList.length,
-        sustainedOldest,
+        sustainedDenied
+          ? freeing(sustainedList, sustainedList.length + cost - sustainedLimit)
+          : sustainedOldest,
       ];
     }
     for (let i = 1; i <= cost; i += 1) {
@@ -427,6 +443,38 @@ describe("cost weighting (Phase 12, reserved for Phase 13 credits)", () => {
     expect(backend.evalCalls).toBe(1);
   });
 
+  test("weighted deny reset tracks the freeing member; cost-1 stays oldest-based", async () => {
+    const backend = new InMemoryRateLimitBackend();
+    const time = clock();
+    const provider = createRedisRateLimitProvider(backend, {
+      burst: { limit: 5, windowMs: 10_000 },
+      sustained: { limit: 1000, windowMs: 60_000 },
+      now: time.now,
+    });
+    const check = { identity: "user:weighted" };
+    // Seed 5 staggered slots: t0, t0+1s, …, t0+4s; now ends at t0+5s.
+    for (let i = 0; i < 5; i += 1) {
+      expect((await provider.check(check)).allowed).toBe(true);
+      time.advance(1000);
+    }
+    const t0 = 1_700_000_000_000;
+    // cost=3 with 5 used of 5 needs 3 slots free: the 3rd-oldest member
+    // (t0+2s) is the freeing slot — NOT the oldest (t0).
+    const denied = await provider.check({ ...check, cost: 3 });
+    expect(denied.allowed).toBe(false);
+    expect(denied.reset).toBe(Math.floor((t0 + 2000 + 10_000) / 1000));
+    expect(denied.retryAfter).toBe(
+      Math.floor((t0 + 2000 + 10_000) / 1000) - Math.floor((t0 + 5000) / 1000),
+    );
+    // cost:1 (the pipeline's path) still keys off the oldest member.
+    const deniedOne = await provider.check(check);
+    expect(deniedOne.allowed).toBe(false);
+    expect(deniedOne.reset).toBe(Math.floor((t0 + 10_000) / 1000));
+    expect(deniedOne.retryAfter).toBe(
+      Math.floor((t0 + 10_000) / 1000) - Math.floor((t0 + 5000) / 1000),
+    );
+  });
+
   test("malformed script replies fail closed with the static message", async () => {
     const time = clock();
     const nowMs = time.now();
@@ -639,6 +687,9 @@ describe("provider selection and failure policy (Phase 12)", () => {
     const first = getRateLimitProvider();
     const second = getRateLimitProvider();
     expect(first).not.toBe(allowAllRateLimitProvider);
+    // Discriminates against the poison fallback (no network in tests, so
+    // check() itself is never invoked against the dummy URL).
+    expect(isPoisonProvider(first)).toBe(false);
     expect(second).toBe(first);
     resetRateLimitProvider();
     clearRedisEnv();
