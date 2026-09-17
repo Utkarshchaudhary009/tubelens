@@ -1,0 +1,105 @@
+name: fix-remote-t3-env
+
+on:
+  push:
+    paths:
+      - .github/workflows/fix-remote-t3-env.yml
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  fix:
+    # The first commit creates this one-shot helper. Its own fix commit uses
+    # the marker below so this workflow does not run a second time.
+    if: ${{ !contains(github.event.head_commit.message, '[remote-t3-fix-applied]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout with PAT
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ secrets.PAT }}
+
+      - name: Patch remote-t3 credential environment
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+          GITHUB_TOKEN: ${{ secrets.PAT }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN" || { echo "PAT secret is not set"; exit 1; }
+          test -f .github/workflows/remote-t3.yml || { echo "remote-t3 workflow not found"; exit 1; }
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('.github/workflows/remote-t3.yml')
+          text = p.read_text()
+
+          old_checkout = '''      - uses: actions/checkout@v4\n'''
+          new_checkout = '''      - uses: actions/checkout@v4\n        with:\n          fetch-depth: 0\n          persist-credentials: true\n          token: ${{ secrets.PAT }}\n'''
+          if old_checkout not in text:
+              raise SystemExit('expected checkout block not found')
+          if 'token: ${{ secrets.PAT }}' not in text:
+              text = text.replace(old_checkout, new_checkout, 1)
+
+          old_job = '''    runs-on: ubuntu-latest\n    timeout-minutes: 300\n    steps:\n'''
+          new_job = '''    runs-on: ubuntu-latest\n    timeout-minutes: 300\n    env:\n      GH_TOKEN: ${{ secrets.PAT }}\n      GITHUB_TOKEN: ${{ secrets.PAT }}\n      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}\n      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}\n      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}\n    steps:\n'''
+          if old_job not in text:
+              raise SystemExit('expected job header not found')
+          if '      GITHUB_TOKEN: ${{ secrets.PAT }}\n' not in text:
+              text = text.replace(old_job, new_job, 1)
+
+          old_comment = '''      # every later step. No provider/API credentials are configured here.\n'''
+          new_comment = '''      # every later step. GitHub/Vercel credentials are inherited from the job env.\n'''
+          if old_comment in text:
+              text = text.replace(old_comment, new_comment, 1)
+
+          p.write_text(text)
+          PY
+
+          grep -n -A9 -B2 'timeout-minutes: 300' .github/workflows/remote-t3.yml
+          grep -n -A5 'actions/checkout@v4' .github/workflows/remote-t3.yml
+
+      - name: Commit and push the fix, disable current runner, then start a fresh one
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add .github/workflows/remote-t3.yml .github/workflows/fix-remote-t3-env.yml
+          git rm .github/workflows/fix-remote-t3-env.yml
+          git commit -m "ci: wire GitHub and Vercel envs into remote-t3 [remote-t3-fix-applied]"
+          git push origin HEAD:main
+
+          echo "Updated workflow pushed. Stopping any existing remote-t3 runs before dispatching the replacement."
+          gh workflow disable remote-t3.yml
+
+          RUN_IDS="$(gh run list --workflow remote-t3.yml --limit 20 --json databaseId,status --jq '.[] | select(.status == "in_progress" or .status == "queued") | .databaseId' || true)"
+          if [ -n "$RUN_IDS" ]; then
+            while IFS= read -r run_id; do
+              [ -n "$run_id" ] || continue
+              echo "Cancelling remote-t3 run $run_id"
+              gh run cancel "$run_id" || true
+            done <<< "$RUN_IDS"
+          else
+            echo "No active or queued remote-t3 run found."
+          fi
+
+          for _ in $(seq 1 30); do
+            ACTIVE="$(gh run list --workflow remote-t3.yml --limit 20 --json databaseId,status --jq '.[] | select(.status == "in_progress" or .status == "queued") | .databaseId' || true)"
+            if [ -z "$ACTIVE" ]; then
+              break
+            fi
+            echo "Waiting for remote-t3 cancellation to settle: $ACTIVE"
+            sleep 2
+          done
+
+          gh workflow enable remote-t3.yml
+          gh workflow run remote-t3.yml --ref main
+          echo "Started a fresh remote-t3 run from main."
