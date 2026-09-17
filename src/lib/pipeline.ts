@@ -493,7 +493,9 @@ function usageRecord(
             "Route has no priced operation.",
           ),
         ),
-        { requestId: ctx.requestId },
+        // Route labels are internal constants, not secrets — safe to log;
+        // the message itself stays static/scrubbed.
+        { requestId: ctx.requestId, route },
       ),
     );
     return;
