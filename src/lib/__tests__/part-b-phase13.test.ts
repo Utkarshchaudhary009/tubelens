@@ -127,6 +127,27 @@ describe("phase 13 unknown operations fail closed", () => {
     }
   });
 
+  test("inherited Object.prototype names fail closed as unknown", () => {
+    // "constructor"/"toString" are truthy on every plain object — the
+    // catalog must treat them as unknown, never as priced records.
+    for (const bad of ["constructor", "toString", "__proto__"]) {
+      expect(isKnownOperation(bad)).toBe(false);
+      expect(() => resolveOperationCost(bad)).toThrow(QuotaPolicyError);
+      try {
+        resolveOperationCost(bad);
+        expect.unreachable();
+      } catch (err) {
+        expect((err as QuotaPolicyError).code).toBe("unknown_operation");
+      }
+      expect(() =>
+        resolveOperationCostAt(QUOTA_POLICY_PREVIOUS_VERSION, bad),
+      ).toThrow(QuotaPolicyError);
+      expect(() => resolveOperationCostAt(QUOTA_POLICY_VERSION, bad)).toThrow(
+        QuotaPolicyError,
+      );
+    }
+  });
+
   test("isKnownOperation rejects non-strings", () => {
     expect(isKnownOperation(undefined)).toBe(false);
     expect(isKnownOperation(null)).toBe(false);
@@ -169,8 +190,14 @@ describe("phase 13 batch economics", () => {
   });
 
   test("nested batch and unknown paths fail closed", () => {
-    for (const bad of ["/api/v1/batch", "/api/v1/nope", "/api/v1/videos"]) {
+    for (const bad of [
+      "/api/v1/batch",
+      "/api/v1/nope",
+      "/api/v1/videos",
+      "/api/v1/constructor",
+    ]) {
       expect(() => resolveBatchChildRoute(bad)).toThrow(QuotaPolicyError);
+      expect(() => costForBatch([bad])).toThrow(QuotaPolicyError);
     }
   });
 
@@ -480,6 +507,7 @@ describe("phase 13 pipeline integration", () => {
     // Manually verified against src/app/api/v1/**/route.ts (grep for the
     // route-label argument to withRequestContext): a future route wired
     // with an unpriced label must trip this list, not silently 500.
+    // Extend this list whenever a new withRequestContext route label ships.
     const wiredLabels = [
       "health",
       "me",

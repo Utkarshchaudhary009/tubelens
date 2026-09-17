@@ -160,6 +160,15 @@ export function isKnownOperation(route: unknown): route is string {
  * QuotaPolicyError — never a 0/free record.
  */
 export function resolveOperationCost(route: string): ResolvedOperationCost {
+  // Own-property guard (not just truthiness): an inherited name like
+  // "constructor" resolves to Object.prototype members, which are truthy —
+  // without this such labels would slip past fail-closed as garbage records.
+  if (!Object.hasOwn(CATALOG, route)) {
+    throw new QuotaPolicyError(
+      "unknown_operation",
+      `Unknown operation "${route}".`,
+    );
+  }
   const entry = CATALOG[route];
   if (!entry) {
     throw new QuotaPolicyError(
@@ -189,6 +198,14 @@ export function resolveOperationCostAt(
     return resolveOperationCost(route);
   }
   if (version === QUOTA_POLICY_PREVIOUS_VERSION) {
+    // Same own-property guard as the live catalog — inherited names are
+    // unknown here too.
+    if (!Object.hasOwn(PREVIOUS_CATALOG, route)) {
+      throw new QuotaPolicyError(
+        "unknown_operation",
+        `Unknown operation "${route}" at policy ${version}.`,
+      );
+    }
     const entry = PREVIOUS_CATALOG[route];
     if (!entry) {
       throw new QuotaPolicyError(
