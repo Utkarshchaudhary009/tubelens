@@ -25,6 +25,7 @@ import {
 } from "@/lib/envelope";
 import { errorResponse } from "@/lib/errors";
 import { isUpstreamTimeout, textOf } from "@/lib/mappers";
+import { BATCH_MAX_COST, costForBatch, QuotaPolicyError } from "@/lib/quota";
 import { isLoopbackHost } from "@/lib/safe-fetch";
 import { isPlausibleVideoId, readBoundedJson } from "@/lib/validate";
 
@@ -685,6 +686,43 @@ export async function handleBatch(
   const tasks = parsed.data.requests.map((item) =>
     validateBatchItem(item, origin),
   );
+
+  // Phase 13 batch economics: total-cost ceiling preflight. Pure — no child
+  // I/O has run yet (validateBatchItem only builds URLs), so an over-cap
+  // batch is rejected before any child work executes. Batches with no
+  // runnable items skip pricing and keep their per-item static errors.
+  // Scope: Phase 13 defines deterministic costs + this ceiling only — no
+  // weighted deduction happens here (the batch route bypasses the pipeline).
+  // Actual credit deduction/accounting lands in Phase 14, full batch
+  // economics in Phase 16 (see PLANS_AND_USAGE.md §6/§9).
+  const runnablePathnames = tasks.flatMap((task) =>
+    task.kind === "run" ? [task.pathname] : [],
+  );
+  if (runnablePathnames.length > 0) {
+    try {
+      costForBatch(runnablePathnames);
+    } catch (err) {
+      if (
+        err instanceof QuotaPolicyError &&
+        err.code === "batch_cost_exceeded"
+      ) {
+        return errorResponse(requestId, {
+          code: "batch_cost_exceeded",
+          message: "Batch total cost exceeds the ceiling.",
+          hint: `Split the batch so the summed child cost stays within ${BATCH_MAX_COST} credits; expensive operations (transcript, combined) cost more — see /api/v1/openapi.json.`,
+          status: 400,
+        });
+      }
+      // An unpriceable runnable child (unreachable past the allowlist, but
+      // fail closed anyway): no child has executed, so reject the batch.
+      return errorResponse(requestId, {
+        code: "batch_path_not_allowed",
+        message: "Batch contains an unrecognized path.",
+        hint: "Use a same-origin v1 path, e.g. /api/v1/health or /api/v1/search?q=lofi.",
+        status: 400,
+      });
+    }
+  }
 
   // Shared deadline: every runnable item races the same gate, so the whole
   // fan-out settles within overallMs no matter how many items hang. Each

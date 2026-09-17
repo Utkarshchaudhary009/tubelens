@@ -398,7 +398,7 @@ describe("pipeline error + telemetry redaction (Phase 11)", () => {
         );
       },
       {},
-      "test-route",
+      "videos.get",
     );
     const res = await run(req("http://x/api/v1/videos/abc"));
     expect(res.status).toBe(500);
