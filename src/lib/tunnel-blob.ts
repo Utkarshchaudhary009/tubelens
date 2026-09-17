@@ -15,8 +15,12 @@ import {
 
 /**
  * Reads one slot's stored tunnel record, or null when no run has published
- * it yet. Uses the private Blob SDK path and bypasses Blob/CDN cache so a
- * freshly published tunnel pointer is visible immediately to /dev/t3.
+ * it yet. Uses the private Blob SDK's normal cached read path.
+ *
+ * The blob is overwritten in-place with a 7-hour CDN cache policy. Vercel
+ * documents that overwrites can take up to 60 seconds to propagate through
+ * the cache; cache HITs avoid Simple Operations and Fast Origin Transfer.
+ *
  * Throws on Blob/upstream failures (callers map to typed 502s).
  */
 export async function readTunnelRecord(
@@ -24,12 +28,11 @@ export async function readTunnelRecord(
 ): Promise<TunnelRecord | null> {
   const pathname = tunnelBlobPath(slot);
   const { get } = await import("@vercel/blob");
-  // `get` authenticates with the configured BLOB_READ_WRITE_TOKEN for the
-  // private store. `useCache: false` guarantees the latest pointer after a
-  // runner republishes the same pathname.
+  // Leave caching enabled. In @vercel/blob 2.6+, useCache defaults to true;
+  // explicit true documents that this hot path should use the Blob CDN cache.
   const result = await get(pathname, {
     access: "private",
-    useCache: false,
+    useCache: true,
   });
   if (!result || result.statusCode !== 200) {
     return null;
