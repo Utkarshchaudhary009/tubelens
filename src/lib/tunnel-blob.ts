@@ -31,11 +31,8 @@ export async function readTunnelRecord(
     access: "private",
     useCache: false,
   });
-  if (!result || result.statusCode === 404) {
+  if (!result || result.statusCode !== 200) {
     return null;
-  }
-  if (result.statusCode !== 200) {
-    throw new Error(`tunnel blob fetch failed: ${result.statusCode}`);
   }
   return parseStoredTunnel(await new Response(result.stream).json());
 }
