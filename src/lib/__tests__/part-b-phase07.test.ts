@@ -747,7 +747,7 @@ describe("pipeline authorization stage (Phase 07)", () => {
           },
         },
       },
-      "probe",
+      "search",
     );
     const res = await handler(
       new NextRequest("http://x/api/v1/search?q=cats", {

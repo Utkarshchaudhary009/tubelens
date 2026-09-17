@@ -32,6 +32,7 @@ import {
   getProductPolicyProvider,
   type ProductPolicyProvider,
 } from "./product";
+import { QUOTA_POLICY_VERSION, resolveOperationCost } from "./quota";
 import {
   defaultRateLimitDecision,
   getRateLimitProvider,
@@ -280,10 +281,14 @@ export function withRequestContext(
       decision = defaultRateLimitDecision();
     } else {
       try {
+        // Phase 13: the limiter is weighted by the catalog cost. An
+        // unlabeled call keeps the legacy cost-1 default; a DEFINED but
+        // unknown label throws inside this try and fails closed to the 503
+        // below — an unpriced operation must never become free.
         decision = await rateLimit.check({
           identity: ctx.rateLimitIdentity,
           endpointClass: route ?? "default",
-          cost: 1,
+          cost: route === undefined ? 1 : resolveOperationCost(route).cost,
         });
       } catch (err) {
         // A broken limiter must never silently fail open into unprotected
@@ -416,15 +421,46 @@ function usageRecord(
   ok: boolean,
   signal: AbortSignal,
 ): Promise<void> | void {
+  // Phase 13: credit rows stamp the resolved catalog record, and the QUOTA
+  // policy version is authoritative for them (not the entitlements
+  // snapshot). An unlabeled call keeps the legacy unknown/1 stub; a DEFINED
+  // but unknown label records NOTHING — fail closed, never a fabricated row.
+  const outcome = ok ? "accepted" : "rejected";
+  const principal = ctx.auth.userId ?? ctx.auth.keyId;
+  if (route === undefined) {
+    return usage.record(
+      {
+        requestId: ctx.requestId,
+        route: "unknown",
+        operation: "unknown",
+        cost: 1,
+        policyVersion: QUOTA_POLICY_VERSION,
+        outcome,
+        principal,
+      },
+      { signal },
+    );
+  }
+  let operation: string;
+  let cost: number;
+  let policyVersion: string;
+  try {
+    const resolved = resolveOperationCost(route);
+    operation = resolved.operation;
+    cost = resolved.cost;
+    policyVersion = resolved.policyVersion;
+  } catch {
+    return;
+  }
   return usage.record(
     {
       requestId: ctx.requestId,
-      route: route ?? "unknown",
-      operation: route ?? "unknown",
-      cost: 1,
-      policyVersion: ctx.entitlements.policyVersion,
-      outcome: ok ? "accepted" : "rejected",
-      principal: ctx.auth.userId ?? ctx.auth.keyId,
+      route,
+      operation,
+      cost,
+      policyVersion,
+      outcome,
+      principal,
     },
     { signal },
   );
