@@ -39,29 +39,18 @@
 # PAIRING TOKEN TTL (re-minted in the keep-alive loop): the /pair#token=
 # fragment expires ~5 min after minting (t3 pair default TTL 5m), so the
 # keep-alive step re-mints the pairing URL every ~4 min (`npx t3 pair` —
-# CLI syntax unverified, npm was unreachable when this was written; if
-# `pair` prints no pairing URL that cycle just warns and keeps the previous
+# if `pair` prints no pairing URL that cycle just warns and keeps the previous
 # pairing) and re-POSTs it to the t3 slot. Any single re-mint failure is
 # fail-open: the tunnel stays up on the last good pairing.
-# VERIFYING the CLI (do this on a runner, where npm works — e.g. a tmux
-# shell inside a live remote-t3 session, or a throwaway workflow_dispatch
-# run): `npx -y t3@latest pair --help` — confirm the `pair` subcommand
-# exists, what pairing URL it prints (loopback host? which port flag?), and
-# whether a --ttl flag exists (if it takes e.g. hours, prefer one long-lived
-# mint over the 4-min loop). Then update the loop's grep pattern below.
-# STALENESS SURFACING (no silent expiry): every POST refreshes the slot's
-# server-set `updatedAt`, so /dev/t3 treats a record older than ~6 min as
-# stale and shows a warning page (with a manual click-through link) instead
-# of redirecting into a dead token; the save step records `last_remint_at`
-# (last successful re-publish) in state.json, so a loop that keeps missing
-# is visible in the t3-state artifact and the job logs.
+#
+# STALENESS SURFACING (no silent expiry): every successful POST refreshes the
+# slot's server-set `updatedAt`, so /dev/t3 treats a record older than ~6 min
+# as stale and shows a warning page instead of redirecting into a dead token.
 #
 # MULTI-USER LIMITATION (documented, by design): the `t3` slot is a single
 # global pointer — concurrent publishers are last-writer-wins, runId names
-# the winner. Two operators running remote-t3 at once will steal each
-# other's /dev/t3 redirect. The concurrency group + duplicate guard below
-# keep accidental double-runs to one survivor; intentional sharing still
-# needs out-of-band coordination.
+# the winner. The concurrency group + duplicate guard below keep accidental
+# double-runs to one survivor; intentional sharing still needs coordination.
 #
 # STOPPING the loop: the final step self-chains even on cancel, so cancel
 # alone restarts it — first Disable the workflow (Actions -> ... -> Disable
@@ -71,9 +60,6 @@ name: remote-t3
 on:
   workflow_dispatch:
 
-# One live dev server at a time. Re-dispatches queue instead of killing the
-# running session; a queued duplicate self-cancels in the guard step once it
-# starts (it sees the newer waiter / live holder and yields).
 concurrency:
   group: remote-dev-main
   cancel-in-progress: false
@@ -89,8 +75,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # T3 remote envs want Node ^22.16 || ^23.11 || >=24.10 for `npx t3 serve`
-      # (Node 20 is rejected upstream); the repo itself builds fine on 22.
+      # T3 remote envs want Node ^22.16 || ^23.11 || >=24.10 for `npx t3 serve`.
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -133,9 +118,6 @@ jobs:
             exit 0
           fi
           if [ -n "$OTHERS" ]; then
-            # Oldest run wins: only self-cancel when a SMALLER (older) run id
-            # is live/queued. Any run seeing another used to cancel itself,
-            # so two starters killed each other and nothing survived.
             SURVIVOR="$(printf '%s\n' "$LIST" | grep -v '^$' | sort -n | head -n 1)"
             if [ "$ME" != "$SURVIVOR" ]; then
               echo "Run $SURVIVOR is older; self-cancelling this duplicate (red here is intentional)."
@@ -146,6 +128,19 @@ jobs:
             echo "This run ($ME) is the oldest; proceeding."
           fi
           echo "No duplicate remote-t3 run detected; proceeding."
+
+      # OpenCode is part of the remote development environment. Install it on
+      # every fresh GitHub runner, verify the binary, and expose its bin dir to
+      # every later step. No provider/API credentials are configured here.
+      - name: Install OpenCode CLI
+        run: |
+          set -euo pipefail
+          npm install --global opencode-ai@1.18.31
+          NPM_GLOBAL_BIN="$(npm prefix --global)/bin"
+          echo "$NPM_GLOBAL_BIN" >> "$GITHUB_PATH"
+          export PATH="$NPM_GLOBAL_BIN:$PATH"
+          command -v opencode
+          opencode --version
 
       - name: Start t3 serve (port 3773)
         run: |
@@ -163,8 +158,6 @@ jobs:
           done
           echo "--- t3 log head ---"
           head -n 20 /tmp/t3.log
-          # Capture the Connection string + FULL Pairing URL lines (fragment
-          # included — that is the auto-pair credential; see header note).
           grep -E "Connection string:|Pairing URL:" /tmp/t3.log | tee "$GITHUB_WORKSPACE/t3-url.txt"
           test -s "$GITHUB_WORKSPACE/t3-url.txt" || { echo "No pairing lines in t3 log:"; cat /tmp/t3.log; exit 1; }
 
@@ -201,10 +194,6 @@ jobs:
             cat /tmp/cloudflared.log
             exit 1
           fi
-          # Host-swap the LOCAL pairing URL onto the tunnel host, preserving
-          # the #token= fragment exactly (that fragment is the credential).
-          # NOTE: t3 serve may print a container/VPN IP (e.g. 10.x.x.x) rather
-          # than loopback, so match any http://<host>:3773 host here.
           LOCAL_PAIRING=$(grep -oE 'http://[^[:space:]/]*:3773/pair#token=[A-Za-z0-9]{8,64}' /tmp/t3.log | head -n 1 || true)
           if [ -z "$LOCAL_PAIRING" ]; then
             echo "FAILED to find the Pairing URL line in t3 log:"
@@ -213,14 +202,12 @@ jobs:
           fi
           PAIRING_PUBLIC="$(printf '%s' "$LOCAL_PAIRING" | sed -E "s|http://[^[:space:]/]*:3773|${TUNNEL_HOST}|")"
           case "$PAIRING_PUBLIC" in
-            https://*.trycloudflare.com/pair\#token=?*)
-              ;;
+            https://*.trycloudflare.com/pair\#token=?*) ;;
             *)
               echo "Host-swapped pairing URL looks wrong: $PAIRING_PUBLIC"
               exit 1
               ;;
           esac
-          # Mask the token-carrying URL before it hits any log line below.
           echo "::add-mask::$PAIRING_PUBLIC"
           {
             echo "PUBLIC_TUNNEL=$TUNNEL_HOST"
@@ -236,12 +223,7 @@ jobs:
           echo "Bare tunnel root (manual token entry — avoid):"
           echo "  $TUNNEL_HOST"
           echo "=================================================="
-          # Best-effort reachability probe through the public URL (log only,
-          # never fail the job — t3 answers pairing flows, not health APIs).
           curl -s -o /dev/null -w "tunnel probe http_code=%{http_code}\n" --max-time 10 "$TUNNEL_HOST/" || true
-          # Optional Vercel CLI diagnostic (fail-open): verifies Vercel
-          # creds before the Blob POST. Absent secrets skip it and the
-          # existing PAT/Blob flow works unchanged.
           if [ -z "$VERCEL_TOKEN" ] || [ -z "$VERCEL_ORG_ID" ] || [ -z "$VERCEL_PROJECT_ID" ]; then
             echo "Vercel secrets not fully set; skipping vercel diagnostic (PAT/Blob flow unchanged)."
           else
@@ -252,9 +234,6 @@ jobs:
             echo "TUNNEL_UPDATE_TOKEN secret not set; skipping API publish (t3-url.txt artifact remains the fallback)."
             exit 0
           fi
-          # Publish via the API (visible logging: -sf would hide the 401 body,
-          # so capture the HTTP code + error code/message and always log one
-          # BLOB_PUBLISH line; token stays out of the logs — never echo it).
           RESP="$(mktemp)"
           HTTP_CODE="$(curl -s -o "$RESP" -w "%{http_code}" --max-time 30 -X POST "https://tubelens-neon.vercel.app/api/v1/tunnel-url" \
             -H "Authorization: Bearer $TUNNEL_UPDATE_TOKEN" \
@@ -267,9 +246,6 @@ jobs:
             2*) echo "Published pairing URL to the t3 slot of the production API" ;;
             *) echo "Publish failed; see BLOB_PUBLISH line above."; exit 1 ;;
           esac
-          # Seed the last-remint timestamp (refreshed by the keep-alive loop
-          # on every successful re-publish; the save step records it in
-          # state.json so a stale loop is visible in the t3-state artifact).
           date -u +"%Y-%m-%dT%H:%M:%SZ" > "$GITHUB_WORKSPACE/last-remint.txt"
 
       - name: Upload t3 URL (artifact fallback)
@@ -281,16 +257,6 @@ jobs:
           retention-days: 1
 
       - name: Keep alive ~276 min + re-mint pairing every ~4 min
-        # Fail fast: the tunnel step above no longer uses continue-on-error,
-        # and this belt-and-braces gate keeps a tunnel-less run from burning
-        # budget idling on a dead session.
-        # The stored /pair#token= pairing URL expires ~5 min after minting,
-        # so each ~4 min cycle re-mints it and re-POSTs it to the t3 slot —
-        # /dev/t3 keeps auto-pairing instead of degrading to manual token
-        # entry. Any single cycle failure is fail-open (log + continue).
-        # 69 x 240s = 276 min, leaving budget for save+chain under the
-        # 300 min job timeout. Mask/mint/publish mirror the tunnel step
-        # (sed -E host-swap, ::add-mask:: before echo, bearer POST).
         if: steps.tunnel.outputs.host != ''
         env:
           TUNNEL_UPDATE_TOKEN: ${{ secrets.TUNNEL_UPDATE_TOKEN }}
@@ -306,8 +272,7 @@ jobs:
             fi
             NEW_PUBLIC="$(printf '%s' "$NEW_LOCAL" | sed -E "s|http://[^[:space:]/]*:3773|${TUNNEL_HOST}|")"
             case "$NEW_PUBLIC" in
-              https://*.trycloudflare.com/pair\#token=?*)
-                ;;
+              https://*.trycloudflare.com/pair\#token=?*) ;;
               *)
                 echo "[$i/69] re-mint: host-swapped URL looks wrong; keeping previous pairing."
                 continue
@@ -318,10 +283,6 @@ jobs:
               echo "[$i/69] re-mint: TUNNEL_UPDATE_TOKEN not set; skipping API publish."
               continue
             fi
-            # Visible logging (same as the initial publish: -sf would hide the
-            # 401 body, so capture HTTP code + error code/message; token is
-            # never echoed). Fail-open: any single cycle failure keeps the
-            # previous pairing.
             RESP="$(mktemp)"
             HTTP_CODE="$(curl -s -o "$RESP" -w "%{http_code}" --max-time 30 -X POST "https://tubelens-neon.vercel.app/api/v1/tunnel-url" \
               -H "Authorization: Bearer $TUNNEL_UPDATE_TOKEN" \
@@ -333,8 +294,6 @@ jobs:
             case "$HTTP_CODE" in
               2*)
                 echo "[$i/69] re-mint: published a fresh pairing URL to the t3 slot."
-                # Last successful re-mint, picked up into state.json by the save
-                # step so a stale loop is visible in the t3-state artifact.
                 date -u +"%Y-%m-%dT%H:%M:%SZ" > "$GITHUB_WORKSPACE/last-remint.txt"
                 ;;
               *)
@@ -347,7 +306,6 @@ jobs:
       - name: Save work.patch + state.json
         if: always()
         run: |
-          # Intent-to-add so UNTRACKED files are included in the diff below.
           git add -N . || true
           git diff > "$GITHUB_WORKSPACE/work.patch" || true
           wc -c "$GITHUB_WORKSPACE/work.patch"
@@ -364,13 +322,6 @@ jobs:
             "run_number": int(os.environ.get("GITHUB_RUN_NUMBER", "0")),
             "tunnel_url": os.environ.get("TUNNEL_HOST", ""),
             "pairing_url": os.environ.get("PAIRING_PUBLIC", ""),
-            # Last time the keep-alive loop successfully re-published the
-            # pairing URL ("" when only the initial publish happened or the
-            # loop never succeeded). Compare with the slot's `updatedAt`
-            # (server-set on every POST) to spot a silently stale loop.
-            # NOTE: last-remint.txt is written inside $GITHUB_WORKSPACE but
-            # is NOT in the cache/artifact path lists below on purpose —
-            # state.json already carries the timestamp forward.
             "last_remint_at": last_remint_at,
           }
           with open("state.json", "w") as f:
