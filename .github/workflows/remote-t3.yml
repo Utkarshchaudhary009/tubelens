@@ -193,7 +193,7 @@ jobs:
           # the #token= fragment exactly (that fragment is the credential).
           # NOTE: t3 serve may print a container/VPN IP (e.g. 10.x.x.x) rather
           # than loopback, so match any http://<host>:3773 host here.
-          LOCAL_PAIRING=$(grep -oE 'http://[^[:space:]/]*:3773/pair#token=[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{16}' /tmp/t3.log | head -n 1 || true)
+          LOCAL_PAIRING=$(grep -oE 'http://[^[:space:]/]*:3773/pair#token=[A-Za-z0-9]{8,64}' /tmp/t3.log | head -n 1 || true)
           if [ -z "$LOCAL_PAIRING" ]; then
             echo "FAILED to find the Pairing URL line in t3 log:"
             cat /tmp/t3.log
@@ -269,7 +269,7 @@ jobs:
           echo "T3 session live; re-minting pairing URL every ~4 min for ~276 min."
           for i in $(seq 1 69); do
             sleep 240
-            NEW_LOCAL="$(timeout 60 npx -y t3@latest pair 2>/dev/null | grep -oE 'http://[^[:space:]/]*:3773/pair#token=[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{16}' | head -n 1 || true)"
+            NEW_LOCAL="$(timeout 60 npx -y t3@latest pair 2>/dev/null | grep -oE 'http://[^[:space:]/]*:3773/pair#token=[A-Za-z0-9]{8,64}' | head -n 1 || true)"
             if [ -z "$NEW_LOCAL" ]; then
               echo "[$i/69] re-mint: no pairing URL from t3 pair; keeping previous pairing."
               continue
