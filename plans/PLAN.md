@@ -586,7 +586,7 @@ principal model.
 
 ## Phase 15 — Rate limit vs quota vs cache separation
 
-**Status:** `[~]` in progress (branch `part-b/phase-15-separation`).
+**Status:** `[x]` done — shipped via PR #35 (merged 2026-09-17): pipeline/`cached()` seam contract tests (13 tests: charge-regardless-of-cache, clearCache isolation, PG-absent transcript serving, no-store + stale headers) with zero behavioral change; invariant 1 scoped to `withRequestContext`, route-wide wiring tracked as follow-up #34.
 
 **Build:** Hardening-only separation of three subsystems (no new infra):
 
