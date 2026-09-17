@@ -10,6 +10,14 @@
 // testable. Validation, service, and upstream/cache stay inside the route
 // handler passed to `withRequestContext`.
 //
+// Phase 15 separation (hardening, no new infra): rate-limit answers
+// "can-request-now" (cost resolved from quota.ts BEFORE the check), the
+// quota stage answers "allowance remains" (peek pre-handler, consume
+// post-response — the CHARGE is synchronous in-request, never deferred),
+// and the cache inside the handler answers only "can upstream be avoided".
+// A cache hit still passes rate-limit + quota and still consumes; no stage
+// reads another stage's state as its source of truth.
+//
 // Failure policy: provider, handler, and config failures all produce typed
 // JSON errors (never HTML, never stacks), always carrying X-Request-Id.
 // Observability hooks are best-effort and can never break a response.
@@ -578,10 +586,11 @@ export function withRequestContext(
     // ACCOUNTING_TIMEOUT_MS; a hung recorder observes an abort via its
     // optional signal, and timeouts/failures vanish through safe().
     // (Nodejs runtime, so setTimeout is always available.)
-    // NOTE: a bare setTimeout macrotask may be dropped on serverless when
-    // the function is frozen after the response. Migrate this dispatch to
-    // waitUntil (Ph.13–14 durable usage) once the runtime handle is
-    // threaded through the pipeline — no behavior change until then.
+    // NOTE: the deferred work here is usage TELEMETRY only — the quota
+    // charge above already completed synchronously in-request, so a dropped
+    // macrotask loses at most an observability event, never a charge (Phase
+    // 15 separation). No waitUntil is threaded through by design: that would
+    // need new runtime plumbing for zero accounting gain.
     setTimeout(() => {
       safe(() => {
         const controller = new AbortController();

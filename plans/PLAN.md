@@ -586,14 +586,15 @@ principal model.
 
 ## Phase 15 — Rate limit vs quota vs cache separation
 
-**Status:** `[ ]` not started.
+**Status:** `[~]` in progress (branch `part-b/phase-15-separation`).
 
 **Build:** Hardening-only separation of three subsystems (no new infra):
 
 - **Goal:** rate-limit = can-request-now (Redis sliding-window burst 60/10s + sustained 100/60s); quota = monthly allowance consumed (Redis fast-check + Postgres ledger from Phase 14); cache = avoid upstream (L0 in-memory + CDN Part A, transcripts never live-only).
-- **Invariants:** cache-hit still faces rate-limit + quota charge; cache-miss must charge usage; `clearCache()` must never delete `usage_ledger`/`quota_windows`; removing Postgres must not break Part A transcript serving.
-- **Pipeline order:** `auth → rate-limit` (cost via `quota.ts`) `→ service` (cache lookup inside, but charge regardless) `→ accounting` (Redis INCRBY + async PG ledger via `waitUntil`).
+- **Invariants:** cache-hit served through `withRequestContext` still faces rate-limit + quota charge (data routes not yet wired through the pipeline are tracked follow-up #34); cache-miss must charge usage; `clearCache()` must never delete `usage_ledger` (monthly windows derive from its `window_id` column — no separate `quota_windows` table was shipped in Phase 14, and none is added here by design: a summary table would itself be a second source of truth, violating the exit criterion); removing Postgres must not break Part A transcript serving.
+- **Pipeline order:** `auth → rate-limit` (cost via `quota.ts`) `→ service` (cache lookup inside, but charge regardless) `→ accounting`. Correction to the earlier sketch ("Redis INCRBY + async PG ledger via `waitUntil`"): the quota *charge* is synchronous in-request (peek pre-handler + consume post-response against the `QuotaStore` — in-memory default, Postgres ledger when opted in), so a dropped deferred task can never lose a charge; only the usage-*telemetry* event is best-effort deferred (`setTimeout`, 500ms bound). No `waitUntil`/new infra in this phase.
 - **Cache rules:** `quota`/`batch`/`audio` = `private, no-store`; serve-stale-on-error sets `meta.cached: true` + `warnings[]`. Transcripts stay out of Postgres unless a later explicit storage/cost/privacy decision enables it.
+- **Deferred (deliberate, not drift):** quota reserve/release Lua (distinct from the existing rate-limit Lua) stays deferred — the peek+consume race is acceptable for this hardening phase (over-admission bounded by the burst limiter; billing-key dedup makes double-charge mechanically impossible). Most data routes still call `handleX()` directly instead of `withRequestContext`, so the invariants are pinned at the pipeline/`cached()` seam by contract tests; wiring every route behind the pipeline is tracked follow-up #34 (it changes anonymous-quota behavior — shared bucket — so it needs its own product decision), NOT Phase 16 batch economics.
 
 **Test:** Contract tests for the 4 invariants above, no new infra.
 
