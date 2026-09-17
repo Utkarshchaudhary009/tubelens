@@ -39,18 +39,26 @@ jobs:
           p = Path('.github/workflows/remote-t3.yml')
           text = p.read_text()
 
+          # Build GitHub Actions expressions without writing `${{ ... }}`
+          # literally inside the run script, so Actions cannot interpolate the
+          # secret value into this generated workflow before git sees it.
+          pat_ref = "$" + "{{ secrets.PAT }}"
+          vercel_ref = "$" + "{{ secrets.VERCEL_TOKEN }}"
+          vercel_org_ref = "$" + "{{ secrets.VERCEL_ORG_ID }}"
+          vercel_project_ref = "$" + "{{ secrets.VERCEL_PROJECT_ID }}"
+
           old_checkout = '''      - uses: actions/checkout@v4\n'''
-          new_checkout = '''      - uses: actions/checkout@v4\n        with:\n          fetch-depth: 0\n          persist-credentials: true\n          token: ${{ secrets.PAT }}\n'''
+          new_checkout = f'''      - uses: actions/checkout@v4\n        with:\n          fetch-depth: 0\n          persist-credentials: true\n          token: {pat_ref}\n'''
           if old_checkout not in text:
               raise SystemExit('expected checkout block not found')
-          if 'token: ${{ secrets.PAT }}' not in text:
+          if 'persist-credentials: true' not in text:
               text = text.replace(old_checkout, new_checkout, 1)
 
           old_job = '''    runs-on: ubuntu-latest\n    timeout-minutes: 300\n    steps:\n'''
-          new_job = '''    runs-on: ubuntu-latest\n    timeout-minutes: 300\n    env:\n      GH_TOKEN: ${{ secrets.PAT }}\n      GITHUB_TOKEN: ${{ secrets.PAT }}\n      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}\n      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}\n      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}\n    steps:\n'''
+          new_job = f'''    runs-on: ubuntu-latest\n    timeout-minutes: 300\n    env:\n      GH_TOKEN: {pat_ref}\n      GITHUB_TOKEN: {pat_ref}\n      VERCEL_TOKEN: {vercel_ref}\n      VERCEL_ORG_ID: {vercel_org_ref}\n      VERCEL_PROJECT_ID: {vercel_project_ref}\n    steps:\n'''
           if old_job not in text:
               raise SystemExit('expected job header not found')
-          if '      GITHUB_TOKEN: ${{ secrets.PAT }}\n' not in text:
+          if '      GITHUB_TOKEN:' not in text:
               text = text.replace(old_job, new_job, 1)
 
           old_comment = '''      # every later step. No provider/API credentials are configured here.\n'''
