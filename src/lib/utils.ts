@@ -859,7 +859,19 @@ export async function handleQuotaContext(
         origin: input.origin ?? null,
       },
     );
-  } catch {
+  } catch (err) {
+    // Store/config failures (unreachable ledger, half-configured durable
+    // mode) are a retryable 503 — but programmer errors are NOT quota
+    // outages: surface those as a plain 500 instead of misreporting them.
+    if (err instanceof TypeError || err instanceof RangeError) {
+      return errorResponse(input.requestId, {
+        code: "internal",
+        message: "Internal server error.",
+        hint: "Retry the request; report the request id if the failure persists.",
+        status: 500,
+        origin: input.origin ?? null,
+      });
+    }
     return errorResponse(input.requestId, {
       code: "service_unavailable",
       message: "Quota status unavailable.",

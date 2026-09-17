@@ -64,6 +64,7 @@ export const usageLedger = pgTable(
     index("usage_ledger_principal_window_idx").on(
       table.principal,
       table.windowId,
+      table.outcome,
     ),
     // Idempotency key for consumes (see quota-ledger.ts single-writer
     // rule): one billing key charges at most once, mechanically. The

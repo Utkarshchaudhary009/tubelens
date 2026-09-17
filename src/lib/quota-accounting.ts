@@ -128,8 +128,13 @@ export class InMemoryQuotaStore implements QuotaStore {
    * never the tracing request id (callers may echo one X-Request-Id across
    * distinct attempts — every attempt must still charge). Adds without a
    * billing key always charge: without a key there is nothing to dedupe on.
+   *
+   * Bounded by window: buckets are keyed per identity+window and entries
+   * for prior windows are evicted on every add, so the set cannot grow
+   * across months (the `used` counters stay per-window by construction —
+   * one number per identity+month, read directly by window key).
    */
-  private readonly seen = new Set<string>();
+  private readonly seen = new Map<string, Set<string>>();
 
   get(identity: string, windowId: string): number {
     requireIdentity(identity);
@@ -144,13 +149,26 @@ export class InMemoryQuotaStore implements QuotaStore {
   ): number {
     requireIdentity(identity);
     const key = storeKey(identity, windowId);
+    // Drop dedup state for rolled-over months: a retried consume from a
+    // prior window re-charges (safe — the window's balance is history),
+    // while same-window retries still dedupe below.
+    const suffix = `${KEY_SEPARATOR}${windowId}`;
+    for (const bucket of this.seen.keys()) {
+      if (bucket !== key && !bucket.endsWith(suffix)) {
+        this.seen.delete(bucket);
+      }
+    }
     const billingKey = details?.billingKey;
     if (typeof billingKey === "string" && billingKey !== "") {
-      const seenKey = `${key}${KEY_SEPARATOR}${billingKey}`;
-      if (this.seen.has(seenKey)) {
+      let bucket = this.seen.get(key);
+      if (bucket?.has(billingKey)) {
         return this.used.get(key) ?? 0;
       }
-      this.seen.add(seenKey);
+      if (!bucket) {
+        bucket = new Set<string>();
+        this.seen.set(key, bucket);
+      }
+      bucket.add(billingKey);
     }
     const next = (this.used.get(key) ?? 0) + cost;
     this.used.set(key, next);
@@ -478,20 +496,19 @@ export function setQuotaStore(store: QuotaStore | null): void {
  *
  * Fail-closed honesty: when durable accounting is opted in but the store
  * cannot be built, this REJECTS (the pipeline maps it to a typed 503) —
- * never a silent fallback to memory that would lose accounting. Success
- * caches; failure retries on the next call so recovery needs no restart.
- * No opt-in (flag unset) simply means in-memory and never throws.
+ * never a silent fallback to memory that would lose accounting. Resolution
+ * (durable store, or the in-memory default when not opted in) is cached so
+ * env is read once; only a rejected build retries on the next call, so
+ * recovery needs no restart. No opt-in (flag unset) simply means in-memory
+ * and never throws.
  */
 export async function getQuotaStore(): Promise<QuotaStore> {
   if (override) {
     return override;
   }
   if (!envResolved) {
-    const resolved = await tryResolveDurableStore();
-    if (resolved) {
-      envStore = resolved;
-      envResolved = true;
-    }
+    envStore = await tryResolveDurableStore();
+    envResolved = true;
   }
   return envStore ?? sharedMemory;
 }

@@ -13,7 +13,7 @@ import { GET as quotaRouteGET } from "../../app/api/v1/quota/route";
 import { anonymousAuthContext } from "../auth";
 import { successResponse } from "../envelope";
 import { withRequestContext } from "../pipeline";
-import { QUOTA_POLICY_VERSION } from "../quota";
+import { QUOTA_POLICY_VERSION, QuotaPolicyError } from "../quota";
 import {
   allowanceForTier,
   checkAllowance,
@@ -1036,6 +1036,31 @@ describe("phase 14 free balance reads", () => {
     expect(await exhausted.json().then((b) => b.data.used)).toBe(10_000);
     expect(await store.get("anonymous", windowId)).toBe(10_000);
   });
+
+  test("quota status: store failures are 503, programmer errors are 500", async () => {
+    const input = {
+      requestId: "req_quota_ctx",
+      auth: anonymousAuthContext,
+      tier: "free" as const,
+      rateLimitIdentity: "anonymous",
+    };
+    const failing = {
+      get: () => Promise.reject(new Error("ledger down")),
+      add: () => Promise.reject(new Error("ledger down")),
+    };
+    const down = await handleQuotaContext({ ...input, store: failing });
+    expect(down.status).toBe(503);
+    expect(await down.json().then((b) => b.error.code)).toBe(
+      "service_unavailable",
+    );
+    const buggy = {
+      get: () => Promise.reject(new TypeError("cannot read property")),
+      add: () => Promise.reject(new TypeError("cannot read property")),
+    };
+    const broken = await handleQuotaContext({ ...input, store: buggy });
+    expect(broken.status).toBe(500);
+    expect(await broken.json().then((b) => b.error.code)).toBe("internal");
+  });
 });
 
 describe("phase 14 retry-safe stores", () => {
@@ -1100,5 +1125,53 @@ describe("phase 14 retry-safe stores", () => {
     expect((await recordConsumption(store, input)).used).toBe(2);
     expect((await recordConsumption(store, input)).used).toBe(2);
     expect(await store.get("user:engine", windowId)).toBe(2);
+  });
+
+  test("in-memory billing-key dedup is scoped per window (no cross-month leak)", async () => {
+    const store = new InMemoryQuotaStore();
+    const { windowId: sep } = quotaWindowFor(SEP_NOW);
+    const { windowId: oct } = quotaWindowFor(OCT_NOW);
+    const details = (billingKey: string) => ({
+      operation: "search.query",
+      policyVersion: QUOTA_POLICY_VERSION,
+      tier: "free",
+      requestId: "req_roll",
+      billingKey,
+    });
+    expect(await store.add("user:roll", sep, 3, details("bk_roll_1"))).toBe(3);
+    // Same-window retry dedupes.
+    expect(await store.add("user:roll", sep, 3, details("bk_roll_1"))).toBe(3);
+    // Rolling the month evicts prior-window keys: the same billing key in
+    // September charges again (bounded memory — keys never leak across
+    // windows), while per-window balances are untouched.
+    expect(await store.add("user:roll", oct, 3, details("bk_roll_2"))).toBe(3);
+    expect(await store.add("user:roll", sep, 3, details("bk_roll_1"))).toBe(6);
+    expect(await store.get("user:roll", sep)).toBe(6);
+    expect(await store.get("user:roll", oct)).toBe(3);
+  });
+
+  test("postgres add rejects unknown/negative costs pre-insert (typed, no row)", async () => {
+    const { writer, rows } = stubWriter();
+    const durable = new PostgresQuotaStore(writer);
+    const details = {
+      operation: "search.query",
+      policyVersion: QUOTA_POLICY_VERSION,
+      tier: "free",
+      requestId: "req_bad_cost",
+      billingKey: "bk_bad_cost",
+    };
+    await expect(
+      durable.add("user:bad", "2026-09", -1, details),
+    ).rejects.toBeInstanceOf(QuotaPolicyError);
+    await expect(
+      durable.add("user:bad", "2026-09", -1, details),
+    ).rejects.toMatchObject({ code: "invalid_quota_cost" });
+    await expect(
+      durable.add("user:bad", "2026-09", Number.NaN, details),
+    ).rejects.toMatchObject({ code: "invalid_quota_cost" });
+    await expect(
+      durable.add("user:bad", "2026-09", 1.5, details),
+    ).rejects.toMatchObject({ code: "invalid_quota_cost" });
+    expect(rows).toHaveLength(0);
   });
 });

@@ -544,6 +544,20 @@ export function withRequestContext(
             requestId: ctx.requestId,
           }),
         );
+        // The handler already produced a response, but it can never be
+        // served: without a recorded charge it would be unaccounted work,
+        // so fail-closed accounting drops it for this typed 503 instead.
+        safe(() =>
+          observability.log(
+            "warn",
+            "quota consume failed; handler response dropped",
+            {
+              requestId: ctx.requestId,
+              route: route ?? "unknown",
+              status: res.status,
+            },
+          ),
+        );
         span.recordError(scrubError(err));
         span.end();
         return errorResponse(ctx.requestId, {

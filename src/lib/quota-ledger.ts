@@ -36,8 +36,9 @@
 
 import { and, eq, sum } from "drizzle-orm";
 import { usageLedger } from "../../drizzle/schema";
+import { ConfigError } from "./config";
 import type { Db } from "./db/factory";
-import { QUOTA_POLICY_VERSION } from "./quota";
+import { QUOTA_POLICY_VERSION, QuotaPolicyError } from "./quota";
 import type { QuotaChargeDetails, QuotaStore } from "./quota-accounting";
 import { idempotencyKey, quotaWindowFor } from "./quota-accounting";
 import type { UsageEvent, UsageOutcome } from "./usage";
@@ -135,6 +136,14 @@ export class PostgresQuotaStore implements QuotaStore {
     cost: number,
     details?: QuotaChargeDetails,
   ): Promise<number> {
+    // Validate pre-insert: unknown/negative costs are caller bugs and must
+    // surface as a typed error, never a Postgres CHECK-violation 500.
+    if (!Number.isInteger(cost) || cost < 0) {
+      throw new QuotaPolicyError(
+        "invalid_quota_cost",
+        "Quota cost must be a non-negative integer.",
+      );
+    }
     await this.writer.insert({
       principal: identity,
       tier: details?.tier ?? "free",
@@ -185,8 +194,9 @@ export async function recordUsageEvent(
  * Env-gated durable store. Returns null unless the operator explicitly opts
  * in (`TUBELENS_QUOTA_DURABLE=1`) with `DATABASE_URL` present — the caller
  * (`getQuotaStore`) falls back to in-memory otherwise. Throws when opted in
- * but the database is unreachable, so a half-configured durable path fails
- * closed instead of silently losing accounting.
+ * but the database is unreachable or unconfigured, so a half-configured
+ * durable path fails closed instead of silently losing accounting (direct
+ * callers must treat null as "not opted in", never as "serve from memory").
  */
 export async function postgresQuotaStoreFromEnv(): Promise<PostgresQuotaStore | null> {
   if (process.env.TUBELENS_QUOTA_DURABLE !== "1") {
@@ -194,7 +204,10 @@ export async function postgresQuotaStoreFromEnv(): Promise<PostgresQuotaStore | 
   }
   const url = process.env.DATABASE_URL;
   if (typeof url !== "string" || url.trim() === "") {
-    return null;
+    throw new ConfigError(
+      "TUBELENS_QUOTA_DURABLE=1 requires DATABASE_URL.",
+      "Set DATABASE_URL to the Neon pooled connection string, or unset TUBELENS_QUOTA_DURABLE to stay on the in-memory default.",
+    );
   }
   const { getDb } = await import("./db/client");
   return new PostgresQuotaStore(drizzleUsageLedgerWriter(await getDb()));
