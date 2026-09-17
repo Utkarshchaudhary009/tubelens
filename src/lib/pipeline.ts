@@ -41,6 +41,7 @@ import {
   allowanceForTier,
   checkAllowance,
   getQuotaStore,
+  idempotencyKey,
   type QuotaCheck,
   type QuotaDecision,
   type QuotaStore,
@@ -503,8 +504,12 @@ export function withRequestContext(
     }
 
     // Consume step: the handler produced a response (success OR error
-    // status), so the admitted attempt is charged now. A failing store
-    // fails closed with 503 rather than serving unaccounted work.
+    // status), so the admitted attempt is charged now. The billing key is
+    // minted FRESH per admitted attempt (never ctx.requestId — that id
+    // echoes caller-supplied X-Request-Id, so keying charges on it would
+    // let one replayed id suppress charges for distinct executions). The
+    // tracing request id still rides along for correlation. A failing
+    // store fails closed with 503 rather than serving unaccounted work.
     if (
       quotaStore !== undefined &&
       quotaCheck !== undefined &&
@@ -520,6 +525,7 @@ export function withRequestContext(
           operation,
           policyVersion: operationPolicyVersion,
           requestId: ctx.requestId,
+          billingKey: idempotencyKey(),
         });
         quotaDecision = {
           allowed: true,

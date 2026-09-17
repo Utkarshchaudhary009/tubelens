@@ -25,6 +25,7 @@
 // doubles and never touch a live database.
 
 import type { AuthContext } from "./auth";
+import { ConfigError } from "./config";
 import type { Tier } from "./product";
 import { QUOTA_POLICY_VERSION } from "./quota";
 
@@ -85,7 +86,13 @@ export interface QuotaChargeDetails {
   operation: string;
   policyVersion: string;
   tier: string;
+  /** Tracing correlation id (client-echoable — never a charging key). */
   requestId: string;
+  /**
+   * Server-minted per-attempt idempotency key charging dedupes on.
+   * Optional for interface convenience; the engine always supplies one.
+   */
+  billingKey?: string;
 }
 
 export interface QuotaStore {
@@ -115,10 +122,12 @@ function storeKey(identity: string, windowId: string): string {
 export class InMemoryQuotaStore implements QuotaStore {
   private readonly used = new Map<string, number>();
   /**
-   * Idempotency keys seen per bucket — mirrors the Postgres UNIQUE(request_id)
-   * so a retried consume with the same request id is a no-op in both stores.
-   * Keyless adds (no request id) always charge: without a key there is
-   * nothing to dedupe on.
+   * Idempotency keys seen per bucket — mirrors the Postgres
+   * UNIQUE(billing_key) so a retried consume with the same billing key is
+   * a no-op in both stores. Dedup keys on the SERVER-MINTED billing key,
+   * never the tracing request id (callers may echo one X-Request-Id across
+   * distinct attempts — every attempt must still charge). Adds without a
+   * billing key always charge: without a key there is nothing to dedupe on.
    */
   private readonly seen = new Set<string>();
 
@@ -135,9 +144,9 @@ export class InMemoryQuotaStore implements QuotaStore {
   ): number {
     requireIdentity(identity);
     const key = storeKey(identity, windowId);
-    const requestId = details?.requestId;
-    if (typeof requestId === "string" && requestId !== "") {
-      const seenKey = `${key}${KEY_SEPARATOR}${requestId}`;
+    const billingKey = details?.billingKey;
+    if (typeof billingKey === "string" && billingKey !== "") {
+      const seenKey = `${key}${KEY_SEPARATOR}${billingKey}`;
       if (this.seen.has(seenKey)) {
         return this.used.get(key) ?? 0;
       }
@@ -206,6 +215,12 @@ export interface QuotaConsumeInput {
   nowMs?: number;
   /** Request id stamped on durable rows (no secrets — ids only). */
   requestId?: string;
+  /**
+   * Per-attempt billing key for retried consumes of the SAME attempt.
+   * Minted when absent; distinct attempts must use distinct keys even
+   * when they share one client-echoed request id.
+   */
+  billingKey?: string;
 }
 
 export interface QuotaDecision {
@@ -272,20 +287,25 @@ export interface QuotaConsumption {
   cost: number;
   operation: string;
   policyVersion: string;
+  /** Tracing correlation id (client-echoable — never a charging key). */
   requestId?: string;
+  /**
+   * Server-minted per-attempt idempotency key. The pipeline mints one
+   * fresh UUID per admitted attempt; when absent (tests, embedding apps)
+   * a key is minted here so every consume still carries one.
+   */
+  billingKey?: string;
 }
 
 /**
- * Ledger idempotency key: the caller's request id when present, otherwise a
- * minted UUID. Never `""` — the durable ledger holds UNIQUE(request_id), so
- * a shared empty key would silently drop every id-less charge after the
- * first. Callers that echo a caller-supplied X-Request-Id share one key by
- * construction (retries safe; see the quota-ledger.ts caveat).
+ * Mint a fresh server-side billing key (UUID). Takes NO input on purpose:
+ * charging keys must never derive from client-echoed values like
+ * X-Request-Id — replaying one id across distinct attempts must charge
+ * every attempt. Retried records of the SAME attempt pass their original
+ * key through instead of minting.
  */
-export function idempotencyKey(requestId?: string): string {
-  return typeof requestId === "string" && requestId !== ""
-    ? requestId
-    : crypto.randomUUID();
+export function idempotencyKey(): string {
+  return crypto.randomUUID();
 }
 
 /**
@@ -300,16 +320,22 @@ export async function recordConsumption(
 ): Promise<{ used: number; windowId: string }> {
   requireIdentity(input.identity);
   const cost = requireCost(input.cost);
-  // requestId is the ledger idempotency key (UNIQUE + ON CONFLICT DO
-  // NOTHING): admitted attempts retry safely, and a future durable
-  // usage.record(accepted) with the same id can never double-charge.
-  const requestId = idempotencyKey(input.requestId);
+  // Charging dedupes on the SERVER-MINTED billing key (UNIQUE + ON
+  // CONFLICT DO NOTHING): a retried record of the SAME attempt (same key)
+  // is safe, while distinct attempts sharing one client-echoed request id
+  // still charge independently. The tracing request id rides along for
+  // correlation only.
+  const billingKey =
+    typeof input.billingKey === "string" && input.billingKey !== ""
+      ? input.billingKey
+      : idempotencyKey();
   const used = requireBalance(
     await store.add(input.identity, input.windowId, cost, {
       operation: input.operation,
       policyVersion: input.policyVersion,
       tier: input.tier,
-      requestId,
+      requestId: input.requestId ?? "",
+      billingKey,
     }),
   );
   return { used, windowId: input.windowId };
@@ -379,6 +405,7 @@ export async function checkAndConsume(
     operation: input.operation,
     policyVersion,
     requestId: input.requestId,
+    billingKey: input.billingKey,
   });
   return {
     allowed: true,
@@ -485,7 +512,13 @@ async function tryResolveDurableStore(): Promise<QuotaStore | null> {
     typeof process.env.DATABASE_URL !== "string" ||
     process.env.DATABASE_URL.trim() === ""
   ) {
-    return null;
+    // Loud misconfiguration, never a silent memory fallback: the operator
+    // asked for durable accounting, so serving unaccounted from memory
+    // would lose charges invisibly. The caller propagates (pipeline → 503).
+    throw new ConfigError(
+      "TUBELENS_QUOTA_DURABLE=1 requires DATABASE_URL.",
+      "Set DATABASE_URL to the Neon pooled connection string, or unset TUBELENS_QUOTA_DURABLE to stay on the in-memory default.",
+    );
   }
   // Server-only chain (Neon client) loads ONLY on this opt-in path — never
   // in tests, never by default. Live `db:migrate` still needs owner Neon

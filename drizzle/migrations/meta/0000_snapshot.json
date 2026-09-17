@@ -1,5 +1,5 @@
 {
-  "id": "59d45f2d-a2b6-440c-854c-bcaf10e25909",
+  "id": "92083e8f-6b88-4154-924c-dddc68276ae6",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "version": "7",
   "dialect": "postgresql",
@@ -62,6 +62,12 @@
           "primaryKey": false,
           "notNull": true
         },
+        "billing_key": {
+          "name": "billing_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
         "created_at": {
           "name": "created_at",
           "type": "timestamp with time zone",
@@ -96,10 +102,10 @@
       "foreignKeys": {},
       "compositePrimaryKeys": {},
       "uniqueConstraints": {
-        "usage_ledger_request_id_uid": {
-          "name": "usage_ledger_request_id_uid",
+        "usage_ledger_billing_key_uid": {
+          "name": "usage_ledger_billing_key_uid",
           "nullsNotDistinct": false,
-          "columns": ["request_id"]
+          "columns": ["billing_key"]
         }
       },
       "policies": {},

@@ -3,10 +3,16 @@
 // `usage_ledger` is the durable record of consumed/quota-relevant usage per
 // plans/PLANS_AND_USAGE.md sections 9+12: one row per accounted outcome
 // (accepted | rejected | partial) stamping principal, tier, operation, cost,
-// policy version, window id, and request id. Balances sum ONLY `accepted`
-// rows (see `src/lib/quota-ledger.ts`); rejected/partial rows are
+// policy version, window id, request id, and billing key. Balances sum ONLY
+// `accepted` rows (see `src/lib/quota-ledger.ts`); rejected/partial rows are
 // explainability history with their stamped policy version — section 14:
 // history is never reinterpreted under today's price.
+//
+// Two ids per row, deliberately: `request_id` is the TRACING correlation id
+// (the pipeline's X-Request-Id, which callers may echo — never trusted for
+// charging), while `billing_key` is the server-minted per-attempt
+// idempotency key charging dedupes on. Replaying one request id across
+// distinct attempts still charges every attempt.
 //
 // Postgres is not a cache: keep large derived payload caches out of here
 // (CDN + in-memory default per plans/PLAN.md Phase 00).
@@ -41,7 +47,14 @@ export const usageLedger = pgTable(
     windowId: text("window_id").notNull(),
     /** accepted | rejected | partial. */
     outcome: text("outcome").notNull(),
+    /** Tracing correlation id (client-echoable — never a charging key). */
     requestId: text("request_id").notNull(),
+    /**
+     * Server-minted per-attempt idempotency key. UNIQUE: one attempt
+     * charges at most once, mechanically, no matter how often the tracing
+     * request id is replayed.
+     */
+    billingKey: text("billing_key").notNull(),
     createdAt: timestamp("created_at", { withTimezone: true })
       .defaultNow()
       .notNull(),
@@ -53,8 +66,11 @@ export const usageLedger = pgTable(
       table.windowId,
     ),
     // Idempotency key for consumes (see quota-ledger.ts single-writer
-    // rule): one request id charges at most once, mechanically.
-    unique("usage_ledger_request_id_uid").on(table.requestId),
+    // rule): one billing key charges at most once, mechanically. The
+    // tracing request id stays non-unique on purpose — callers may echo
+    // one X-Request-Id across distinct attempts, and every attempt must
+    // still charge.
+    unique("usage_ledger_billing_key_uid").on(table.billingKey),
     // Ledger rows are charges or history — never negative adjustments.
     check("usage_ledger_cost_nonnegative", sql`${table.cost} >= 0`),
     check(

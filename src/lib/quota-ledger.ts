@@ -13,14 +13,17 @@
 // consumption.
 //
 // Single-writer rule: the STORE owns `accepted` rows — exactly one per
-// consume, keyed by request id. A future durable `usage.record` MUST skip
-// `outcome === "accepted"` events (it may persist rejected/partial) or
-// dedupe on `request_id`. Belt and suspenders: `request_id` is UNIQUE and
-// the insert below is `ON CONFLICT DO NOTHING`, so even a double-writing
-// caller is mechanically incapable of double-charging. (Caveat: callers
-// that echo a caller-supplied X-Request-Id share one idempotency key —
-// retries are safe, but two distinct requests reusing one id share one
-// charge. Request ids are tracing keys, not unguessable tokens.)
+// consume, keyed by a server-minted billing key. A future durable
+// `usage.record` MUST skip `outcome === "accepted"` events (it may persist
+// rejected/partial) or dedupe on the attempt's billing key. Belt and
+// suspenders: `billing_key` is UNIQUE and inserts are ON CONFLICT DO
+// NOTHING, so even a double-writing caller is mechanically incapable of
+// double-charging one attempt. The tracing `request_id` stays NON-unique
+// on purpose: callers may echo one X-Request-Id across distinct attempts
+// (the pipeline's resolveRequestId echoes valid caller ids), and every
+// attempt must still charge — dedup NEVER keys on it. (Caveat: request ids
+// are tracing keys, not unguessable tokens; replaying one id executes the
+// handler again and charges again, exactly like a fresh request.)
 //
 // There is deliberately NO durable usage-event recorder wired into the
 // pipeline yet (see the rule above before adding one).
@@ -47,7 +50,10 @@ export interface UsageLedgerRow {
   policyVersion: string;
   windowId: string;
   outcome: UsageOutcome;
+  /** Tracing correlation id (client-echoable — never a charging key). */
   requestId: string;
+  /** Server-minted per-attempt idempotency key charging dedupes on. */
+  billingKey: string;
 }
 
 export interface UsageLedgerWriter {
@@ -98,11 +104,13 @@ export function drizzleUsageLedgerWriter(db: Db): UsageLedgerWriter {
           windowId: row.windowId,
           outcome: row.outcome,
           requestId: row.requestId,
+          billingKey: row.billingKey,
         })
-        // Idempotent by request id (UNIQUE): a retried consume or a future
-        // durable usage.record(accepted) with the same id is a no-op, never
-        // a second charge.
-        .onConflictDoNothing({ target: usageLedger.requestId });
+        // Idempotent by server-minted billing key (UNIQUE): a retried
+        // record of the SAME attempt is a no-op, never a second charge —
+        // while distinct attempts sharing one client-echoed request id
+        // carry distinct keys and charge independently.
+        .onConflictDoNothing({ target: usageLedger.billingKey });
     },
   };
 }
@@ -135,9 +143,13 @@ export class PostgresQuotaStore implements QuotaStore {
       policyVersion: details?.policyVersion ?? QUOTA_POLICY_VERSION,
       windowId,
       outcome: "accepted",
-      // Never "" — the column is UNIQUE, so a shared empty key would
-      // silently drop every id-less charge after the first.
-      requestId: idempotencyKey(details?.requestId),
+      requestId: details?.requestId ?? "",
+      // Never "" and never the client-echoed request id — the column is
+      // UNIQUE, so either would silently drop legitimate charges.
+      billingKey:
+        typeof details?.billingKey === "string" && details.billingKey !== ""
+          ? details.billingKey
+          : idempotencyKey(),
     });
     return this.writer.sumAccepted(identity, windowId);
   }
@@ -147,11 +159,14 @@ export class PostgresQuotaStore implements QuotaStore {
  * Persist one usage event — `accepted`, `rejected`, or `partial` (e.g. a
  * batch fan-out with a child-cost summary) — as a ledger row. Only
  * `accepted` rows feed balances; the rest are explainability history with
- * their stamped policy version (§14: history never reinterpreted).
+ * their stamped policy version (§14: history never reinterpreted). The
+ * billing key defaults to a fresh mint (history rows just need uniqueness);
+ * pass the attempt's key to dedupe a retried record of the same attempt.
  */
 export async function recordUsageEvent(
   writer: UsageLedgerWriter,
   event: UsageEvent,
+  billingKey: string = idempotencyKey(),
 ): Promise<void> {
   await writer.insert({
     principal: event.principal ?? "anonymous",
@@ -162,6 +177,7 @@ export async function recordUsageEvent(
     windowId: event.windowId ?? quotaWindowFor(Date.now()).windowId,
     outcome: event.outcome,
     requestId: event.requestId,
+    billingKey,
   });
 }
 

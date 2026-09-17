@@ -1549,6 +1549,11 @@ export function buildOpenApiDocument() {
               },
             },
             429: rateLimitedResponse,
+            503: {
+              description:
+                "service_unavailable; quota accounting unavailable. Retry shortly.",
+              content: { "application/json": { schema: { $ref: errorRef } } },
+            },
           },
         },
       },

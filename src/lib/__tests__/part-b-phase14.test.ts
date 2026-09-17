@@ -47,8 +47,10 @@ function req(url: string): NextRequest {
 
 /** Stub writer double: rows in an array, sums computed locally.
  * Faithful to the real ledger on the two mechanical guarantees that
- * matter: balances sum ONLY `accepted` rows, and `request_id` is UNIQUE —
- * a duplicate id is a no-op (ON CONFLICT DO NOTHING), never a second row.
+ * matter: balances sum ONLY `accepted` rows, and `billing_key` is UNIQUE —
+ * a duplicate server-minted key is a no-op (ON CONFLICT DO NOTHING), never
+ * a second row. The tracing `request_id` is deliberately NOT deduped:
+ * distinct attempts may share one client-echoed id and must still charge.
  */
 function stubWriter(seed: UsageLedgerRow[] = []): {
   writer: UsageLedgerWriter;
@@ -70,7 +72,7 @@ function stubWriter(seed: UsageLedgerRow[] = []): {
             .reduce((total, r) => total + r.cost, 0),
         ),
       insert: (row: UsageLedgerRow) => {
-        if (!rows.some((r) => r.requestId === row.requestId)) {
+        if (!rows.some((r) => r.billingKey === row.billingKey)) {
           rows.push(row);
         }
         return Promise.resolve();
@@ -97,6 +99,7 @@ function acceptedRow(
     windowId,
     outcome,
     requestId: `req_seed_${seedCounter}`,
+    billingKey: `bk_seed_${seedCounter}`,
   };
 }
 
@@ -449,6 +452,35 @@ describe("phase 14 pipeline quota stage", () => {
     });
   });
 
+  test("replayed client request ids still charge every attempt", async () => {
+    // resolveRequestId echoes a valid caller X-Request-Id for tracing, so
+    // ctx.requestId is client-controlled — charging must NOT dedupe on it.
+    // Two distinct executions replaying one id charge twice (evasion closed).
+    const store = new InMemoryQuotaStore();
+    const { windowId } = quotaWindowFor(Date.now());
+    const run = withRequestContext(
+      async (_r, ctx) =>
+        successResponse({ ok: true }, { requestId: ctx.requestId }),
+      { quotaStore: store },
+      "search",
+    );
+    const replay = () =>
+      run(
+        new NextRequest("http://x/api/v1/search?q=lofi", {
+          headers: { "x-request-id": "replayed-client-id" },
+        }),
+      );
+    const first = await replay();
+    const second = await replay();
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    // Both responses echo the replayed tracing id...
+    expect(first.headers.get("X-Request-Id")).toBe("replayed-client-id");
+    expect(second.headers.get("X-Request-Id")).toBe("replayed-client-id");
+    // ...but the server-minted billing keys differ, so both charged.
+    expect(await store.get("anonymous", windowId)).toBe(2);
+  });
+
   test("unknown operation fails closed: typed 500, quota untouched", async () => {
     const store = new InMemoryQuotaStore();
     const events: UsageEvent[] = [];
@@ -577,6 +609,31 @@ describe("phase 14 quota endpoint", () => {
       resetQuotaStore();
     }
   });
+
+  test("opted-in durable without DATABASE_URL throws config error", async () => {
+    const savedFlag = process.env.TUBELENS_QUOTA_DURABLE;
+    const savedUrl = process.env.DATABASE_URL;
+    try {
+      process.env.TUBELENS_QUOTA_DURABLE = "1";
+      delete process.env.DATABASE_URL;
+      resetQuotaStore();
+      // Half-configured durability must fail loudly (→ pipeline 503), not
+      // fall back to memory and silently lose accounting.
+      await expect(getQuotaStore()).rejects.toThrow(/DATABASE_URL/);
+    } finally {
+      if (savedFlag === undefined) {
+        delete process.env.TUBELENS_QUOTA_DURABLE;
+      } else {
+        process.env.TUBELENS_QUOTA_DURABLE = savedFlag;
+      }
+      if (savedUrl === undefined) {
+        delete process.env.DATABASE_URL;
+      } else {
+        process.env.DATABASE_URL = savedUrl;
+      }
+      resetQuotaStore();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -643,33 +700,67 @@ describe("phase 14 attempt-based charging", () => {
 // ---------------------------------------------------------------------------
 
 describe("phase 14 double-charge guard", () => {
-  test("consume + same-requestId accepted record = one row, one charge", async () => {
+  test("same billing key twice = one row, one charge (retry-safe)", async () => {
     const { writer, rows } = stubWriter();
     const durable = new PostgresQuotaStore(writer);
     const { windowId } = quotaWindowFor(SEP_NOW);
-    await checkAndConsume(durable, {
-      identity: "user:idem",
-      tier: "free",
-      cost: 2,
-      operation: "search.query",
-      requestId: "req_idem_1",
-      nowMs: SEP_NOW,
-    });
-    // A future durable usage.record(accepted) carrying the same request id
-    // hits ON CONFLICT DO NOTHING — mechanically incapable of double-charge.
-    await recordUsageEvent(writer, {
+    const event = {
       requestId: "req_idem_1",
       route: "search",
       operation: "search.query",
       cost: 2,
       policyVersion: QUOTA_POLICY_VERSION,
-      outcome: "accepted",
+      outcome: "accepted" as const,
       principal: "user:idem",
       tier: "free",
       windowId,
-    });
+    };
+    await recordUsageEvent(writer, event, "bk_idem_1");
+    // A retried record of the SAME attempt (same billing key) hits ON
+    // CONFLICT DO NOTHING — mechanically incapable of double-charge.
+    await recordUsageEvent(writer, event, "bk_idem_1");
     expect(rows).toHaveLength(1);
     expect(await durable.get("user:idem", windowId)).toBe(2);
+  });
+
+  test("same request id, distinct billing keys = distinct charges", async () => {
+    const { writer, rows } = stubWriter();
+    // Distinct attempts may share one client-echoed X-Request-Id (the
+    // pipeline echoes valid caller ids for tracing) — every attempt must
+    // still charge. Dedup NEVER keys on the tracing id.
+    await recordUsageEvent(
+      writer,
+      {
+        requestId: "req_replayed",
+        route: "search",
+        operation: "search.query",
+        cost: 1,
+        policyVersion: QUOTA_POLICY_VERSION,
+        outcome: "accepted",
+        principal: "user:replay",
+        tier: "free",
+        windowId: "2026-09",
+      },
+      "bk_replay_1",
+    );
+    await recordUsageEvent(
+      writer,
+      {
+        requestId: "req_replayed",
+        route: "search",
+        operation: "search.query",
+        cost: 1,
+        policyVersion: QUOTA_POLICY_VERSION,
+        outcome: "accepted",
+        principal: "user:replay",
+        tier: "free",
+        windowId: "2026-09",
+      },
+      "bk_replay_2",
+    );
+    expect(rows).toHaveLength(2);
+    const durable = new PostgresQuotaStore(writer);
+    expect(await durable.get("user:replay", "2026-09")).toBe(2);
   });
 
   test("quotaPrincipal is one choke point for store key and ledger row", () => {
@@ -948,21 +1039,23 @@ describe("phase 14 free balance reads", () => {
 });
 
 describe("phase 14 retry-safe stores", () => {
-  test("in-memory retries with the same request id charge once", async () => {
+  test("in-memory retries with the same billing key charge once", async () => {
     const store = new InMemoryQuotaStore();
     const details = {
       operation: "search.query",
       policyVersion: QUOTA_POLICY_VERSION,
       tier: "free",
-      requestId: "req_retry_1",
+      // Tracing id replays across attempts — charging must NOT key on it.
+      requestId: "req_replayed_1",
+      billingKey: "bk_retry_1",
     };
     expect(await store.add("user:retry", "2026-09", 3, details)).toBe(3);
     expect(await store.add("user:retry", "2026-09", 3, details)).toBe(3);
-    // A different id is a different attempt...
+    // Same tracing id, distinct billing key = distinct attempt = charge.
     expect(
       await store.add("user:retry", "2026-09", 3, {
         ...details,
-        requestId: "req_retry_2",
+        billingKey: "bk_retry_2",
       }),
     ).toBe(6);
     // ...and keyless adds always charge (nothing to dedupe on).
@@ -976,17 +1069,36 @@ describe("phase 14 retry-safe stores", () => {
       operation: "search.query",
       policyVersion: QUOTA_POLICY_VERSION,
       tier: "free",
-      requestId: "req_pg_retry_1",
+      requestId: "req_pg_replayed_1",
+      billingKey: "bk_pg_retry_1",
     };
     expect(await durable.add("user:pgr", "2026-09", 2, details)).toBe(2);
     expect(await durable.add("user:pgr", "2026-09", 2, details)).toBe(2);
     expect(rows).toHaveLength(1);
-    // Id-less adds mint distinct keys — both charge, never "".
+    // Key-less adds mint distinct billing keys — both charge, never "".
     await durable.add("user:pgr", "2026-09", 2);
     await durable.add("user:pgr", "2026-09", 2);
     expect(rows).toHaveLength(3);
-    expect(rows.every((r) => r.requestId !== "")).toBe(true);
-    expect(new Set(rows.map((r) => r.requestId)).size).toBe(3);
+    expect(rows.every((r) => r.billingKey !== "")).toBe(true);
+    expect(new Set(rows.map((r) => r.billingKey)).size).toBe(3);
     expect(await durable.get("user:pgr", "2026-09")).toBe(6);
+  });
+
+  test("recordConsumption with one billing key twice charges once", async () => {
+    const store = new InMemoryQuotaStore();
+    const { windowId } = quotaWindowFor(SEP_NOW);
+    const input = {
+      identity: "user:engine",
+      tier: "free" as const,
+      windowId,
+      cost: 2,
+      operation: "search.query",
+      policyVersion: QUOTA_POLICY_VERSION,
+      requestId: "req_engine_replayed",
+      billingKey: "bk_engine_1",
+    };
+    expect((await recordConsumption(store, input)).used).toBe(2);
+    expect((await recordConsumption(store, input)).used).toBe(2);
+    expect(await store.get("user:engine", windowId)).toBe(2);
   });
 });

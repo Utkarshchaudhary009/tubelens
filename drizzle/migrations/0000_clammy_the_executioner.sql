@@ -8,8 +8,9 @@ CREATE TABLE "usage_ledger" (
 	"window_id" text NOT NULL,
 	"outcome" text NOT NULL,
 	"request_id" text NOT NULL,
+	"billing_key" text NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
-	CONSTRAINT "usage_ledger_request_id_uid" UNIQUE("request_id"),
+	CONSTRAINT "usage_ledger_billing_key_uid" UNIQUE("billing_key"),
 	CONSTRAINT "usage_ledger_cost_nonnegative" CHECK ("usage_ledger"."cost" >= 0),
 	CONSTRAINT "usage_ledger_outcome_values" CHECK ("usage_ledger"."outcome" IN ('accepted', 'rejected', 'partial'))
 );
