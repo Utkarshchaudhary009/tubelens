@@ -247,6 +247,14 @@ describe("centralized rate-limit policy (Phase 12)", () => {
     expect(RATE_LIMIT_POLICY_VERSION).toMatch(/^20\d\d-/);
   });
 
+  test("lua script carries no Upstash-only shebang (must run on Redis OSS)", () => {
+    // `#!lua flags=...` is rejected by Redis OSS (`ERR Unexpected flag in
+    // script shebang`) and would 503 every request in Docker e2e. Any
+    // future flag must be valid on BOTH Upstash and Redis OSS.
+    expect(RATE_LIMIT_LUA_SCRIPT).not.toContain("flags=");
+    expect(RATE_LIMIT_LUA_SCRIPT).not.toMatch(/^#!/m);
+  });
+
   test("invalid factory windows fail closed at construction", () => {
     const backend = new InMemoryRateLimitBackend();
     expect(() =>

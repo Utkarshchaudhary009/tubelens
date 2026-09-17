@@ -117,9 +117,12 @@ export interface RedisRateLimitProviderOptions {
 
 /**
  * Atomic check-then-add for both windows. KEYS = [burstKey, sustainedKey] —
- * the ONLY keys touched (no dynamic/unlisted keys, no DB-wide commands),
- * so the script declares `allow-key-locking` and Upstash locks just these
- * two keys instead of the global lock.
+ * the ONLY keys touched (no dynamic/unlisted keys, no DB-wide commands).
+ * Deliberately NO `allow-key-locking` shebang: that flag is Upstash-only
+ * and Redis OSS (Docker e2e) rejects it (`ERR Unexpected flag in script
+ * shebang`), which would 503 every request. The script stays tiny (two
+ * keys, O(window)) so the default lock is held only briefly — revisit
+ * per-key locking only if lock contention is ever measured.
  * ARGV = [nowMs, burstWindowMs, burstLimit, sustainedWindowMs,
  * sustainedLimit, cost, memberNonce, burstTtlSec, sustainedTtlSec].
  * Returns [allowed, burstCount, burstScore, sustainedCount,
@@ -128,8 +131,7 @@ export interface RedisRateLimitProviderOptions {
  * oldest, i.e. the slot whose expiry actually frees enough room for this
  * cost (plain oldest when cost is 1); on allow the oldest (unused).
  */
-export const RATE_LIMIT_LUA_SCRIPT = `#!lua flags=allow-key-locking
-local burst_key = KEYS[1]
+export const RATE_LIMIT_LUA_SCRIPT = `local burst_key = KEYS[1]
 local sustained_key = KEYS[2]
 local now = tonumber(ARGV[1])
 local burst_window = tonumber(ARGV[2])
