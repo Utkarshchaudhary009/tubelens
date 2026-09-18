@@ -34,13 +34,28 @@
 # the live POST + the 1d t3-url.txt artifact) + a safe t3-runtime.json
 # {tunnel_host, environment_id, minted_at} and scrubbed ~/.t3 snapshots
 # (keys matching token/auth/secret/password/etc. removed before persisting)
-# into cache key t3-work-<run_number> AND the t3-state artifact (7d). The
+# into cache key t3-work-<run_number> AND the t3-state artifact (7d), plus
+# the whole ~/.t3/userdata/state.sqlite snapshotted via `.backup` and
+# encrypted with the tunnel bearer (TUNNEL_UPDATE_TOKEN) as the openssl
+# passphrase -> state.sqlite.enc in the private t3-sqlite-enc artifact (1d)
+# AND the t3-sqlite-<run_number> cache (restore-key prefix t3-sqlite-, so
+# chain gaps past the 1d artifact retention still find a backup). The
 # next chained run RESTORES that cache at job start (exact key
 # t3-work-<prev run> via the t3-work- restore-key prefix), `git apply
-# work.patch || true`, and copies the snapshots back to ~/.t3 (best-effort)
-# before serving, so uncommitted work carries forward.
+# work.patch || true`, copies the snapshots back to ~/.t3 (best-effort),
+# and decrypts state.sqlite.enc back to ~/.t3/userdata/state.sqlite
+# (best-effort, before `t3 serve`) so auth_sessions carry forward.
 # Artifact fallback: download t3-state and `git apply work.patch` by hand.
-# NEVER persisted: userdata/secrets/*, state.sqlite*, userdata/logs/.
+# NEVER persisted in plaintext: userdata/secrets/*, state.sqlite-wal/-shm,
+# userdata/logs/. The only sqlite copy that leaves the runner is the
+# encrypted state.sqlite.enc (never the raw DB).
+#
+# SQLITE ENCRYPTION KEY-REUSE TRADEOFF: the tunnel bearer doubles as the
+# openssl passphrase (no second secret to manage). Rotating
+# TUNNEL_UPDATE_TOKEN invalidates older state.sqlite.enc backups (decrypt
+# just fails fail-open -> fresh identity), which is safe. Short-lived
+# pairing tokens (~5min) are still re-minted fresh every run and are never
+# relied upon from the restored DB — only the 30d auth_sessions carry over.
 #
 # PAIRING TOKEN TTL (single mint): the /pair#token= fragment expires ~5 min
 # after minting (t3 pair default TTL 5m), so the workflow mints the pairing
@@ -102,6 +117,11 @@ jobs:
         with:
           node-version: "22"
 
+      # NOTE: worktrees and backup/t3code/* branches are never auto-restored
+      # here — only work.patch/state.json/t3 runtime files. Deleting a
+      # worktree via scripts/t3-worktree-delete.sh (which also deletes its
+      # backup branch from origin) is final; re-running this workflow
+      # cannot bring it back.
       - name: Restore prior work.patch + state.json
         uses: actions/cache/restore@v4
         with:
@@ -129,8 +149,9 @@ jobs:
       # (fail-open: missing files just mean fresh defaults). Runs before
       # `t3 serve` starts, which overwrites server-runtime.json with the new
       # run's own pid/ports. t3-runtime.json is debug/history for chained
-      # runs — logged when present. NEVER restores secrets, sqlite state,
-      # or logs — those are never saved (see the save step).
+      # runs — logged when present. NEVER restores plaintext secrets, raw
+      # sqlite (-wal/-shm), or logs — the only sqlite carried over is the
+      # encrypted state.sqlite.enc backup (see the restore step below).
       - name: Restore t3 runtime files
         run: |
           mkdir -p ~/.t3/userdata ~/.t3/caches || true
@@ -139,6 +160,106 @@ jobs:
           cp "$GITHUB_WORKSPACE/caches/opencode.json" ~/.t3/caches/opencode.json 2>/dev/null || true
           cat "$GITHUB_WORKSPACE/t3-runtime.json" 2>/dev/null || echo "No prior t3-runtime.json."
           echo "t3 runtime files restored (best-effort)."
+
+      # Best-effort restore of the previous run's encrypted sqlite backup
+      # via cache (exact key t3-sqlite-<this run> misses; the t3-sqlite-
+      # prefix then matches the newest prior run). Fail-open: a miss just
+      # means the artifact step below may still supply the backup. Only the
+      # encrypted state.sqlite.enc ever enters the cache — never plaintext.
+      - name: Restore encrypted sqlite (cache)
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.sqlite-restore/state.sqlite.enc
+          key: t3-sqlite-${{ github.run_number }}
+          restore-keys: |
+            t3-sqlite-
+
+      # Best-effort download of the previous run's encrypted sqlite backup
+      # artifact. NOTE: actions/download-artifact without run-id only reads
+      # the CURRENT run — whose backup is uploaded later in this same run —
+      # so it always misses; fetch from a PRIOR run via `gh run download
+      # -n t3-sqlite-enc` instead. Fail-open (continue-on-error + the
+      # decrypt step never exits 1); single-mint flow untouched.
+      - name: Download encrypted sqlite backup (prior run artifact)
+        continue-on-error: true
+        env:
+          PAT_TOKEN: ${{ secrets.PAT }}
+          FALLBACK_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.sqlite-restore" || true
+          ENC="$GITHUB_WORKSPACE/.sqlite-restore/state.sqlite.enc"
+          if [ -s "$ENC" ]; then
+            echo "Cache already supplied state.sqlite.enc; skipping artifact download."
+            exit 0
+          fi
+          if [ -n "$PAT_TOKEN" ]; then
+            GH_TOKEN="$PAT_TOKEN"
+          else
+            GH_TOKEN="$FALLBACK_TOKEN"
+          fi
+          export GH_TOKEN
+          if [ -z "$GH_TOKEN" ]; then
+            echo "No token available; skipping sqlite artifact download (fail-open)."
+            exit 0
+          fi
+          ME="${{ github.run_id }}"
+          IDS="$(gh run list --workflow remote-t3.yml --limit 10 --json databaseId --jq '.[].databaseId' 2>/dev/null || true)"
+          for ID in $IDS; do
+            if [ "$ID" = "$ME" ]; then
+              continue
+            fi
+            if gh run download "$ID" -n t3-sqlite-enc -D "$GITHUB_WORKSPACE/.sqlite-restore" 2>/dev/null && [ -s "$ENC" ]; then
+              echo "Downloaded t3-sqlite-enc from prior run $ID."
+              chmod 600 "$ENC" || true
+              exit 0
+            fi
+          done
+          echo "No prior t3-sqlite-enc artifact found; starting with fresh identity (fail-open)."
+          exit 0
+
+      # Decrypt state.sqlite.enc (passphrase = TUNNEL_UPDATE_TOKEN) back to
+      # ~/.t3/userdata/state.sqlite BEFORE `t3 serve` starts. Fail-open:
+      # missing token/artifact, corrupt backup, or decrypt failure just
+      # means a fresh identity — always `exit 0`. openssl only (-pass env:
+      # keeps the passphrase out of ps/logs); no gpg path.
+      - name: Restore encrypted sqlite
+        env:
+          TUNNEL_UPDATE_TOKEN: ${{ secrets.TUNNEL_UPDATE_TOKEN }}
+        run: |
+          if [ -n "${TUNNEL_UPDATE_TOKEN:-}" ]; then
+            echo "::add-mask::$TUNNEL_UPDATE_TOKEN"
+          fi
+          umask 077
+          ENC="$GITHUB_WORKSPACE/.sqlite-restore/state.sqlite.enc"
+          if [ -z "${TUNNEL_UPDATE_TOKEN:-}" ]; then
+            echo "TUNNEL_UPDATE_TOKEN not set; skipping sqlite restore (fresh identity, fail-open)."
+            exit 0
+          fi
+          if [ ! -s "$ENC" ]; then
+            echo "No encrypted sqlite backup found; starting with fresh identity."
+            exit 0
+          fi
+          if ! command -v openssl >/dev/null 2>&1; then
+            echo "openssl missing; skipping sqlite restore (fresh identity, fail-open)."
+            exit 0
+          fi
+          rm -f /tmp/state.sqlite.dec
+          if ! openssl enc -d -aes-256-cbc -pbkdf2 -pass env:TUNNEL_UPDATE_TOKEN -in "$ENC" -out /tmp/state.sqlite.dec 2>/dev/null || [ ! -s /tmp/state.sqlite.dec ]; then
+            echo "sqlite decrypt failed (wrong token or corrupt backup); starting with fresh identity."
+            rm -f /tmp/state.sqlite.dec
+            exit 0
+          fi
+          echo "Decrypted sqlite backup with openssl."
+          if [ "$(head -c 16 /tmp/state.sqlite.dec 2>/dev/null)" != "SQLite format 3" ]; then
+            echo "Decrypted file is not a sqlite DB; discarding (fresh identity)."
+            rm -f /tmp/state.sqlite.dec
+            exit 0
+          fi
+          mkdir -p ~/.t3/userdata || true
+          cp /tmp/state.sqlite.dec ~/.t3/userdata/state.sqlite
+          rm -f ~/.t3/userdata/state.sqlite-wal ~/.t3/userdata/state.sqlite-shm /tmp/state.sqlite.dec
+          chmod 600 ~/.t3/userdata/state.sqlite
+          echo "Restored encrypted sqlite backup to ~/.t3/userdata/state.sqlite."
 
       - name: Duplicate guard (yield when another remote-t3 run is live/queued)
         env:
@@ -222,6 +343,9 @@ jobs:
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
         run: |
+          if [ -n "${TUNNEL_UPDATE_TOKEN:-}" ]; then
+            echo "::add-mask::$TUNNEL_UPDATE_TOKEN"
+          fi
           nohup cloudflared tunnel --url http://localhost:3773 --no-autoupdate > /tmp/cloudflared.log 2>&1 &
           echo "Waiting for tunnel URL..."
           TUNNEL_HOST=""
@@ -356,11 +480,12 @@ jobs:
           # are carried separately via the cache/artifact paths below, and
           # including them would make `git apply` fail on the next chained
           # run (restored files already exist). Real work still diffs fully.
-          git diff -- . ':!work.patch' ':!state.json' ':!last-remint.txt' ':!t3-url.txt' ':!t3-runtime.json' ':!server-runtime.json' ':!settings.json' ':!caches/opencode.json' > "$GITHUB_WORKSPACE/work.patch" || true
+          git diff -- . ':!work.patch' ':!state.json' ':!last-remint.txt' ':!t3-url.txt' ':!t3-runtime.json' ':!server-runtime.json' ':!settings.json' ':!caches/opencode.json' ':!state.sqlite.enc' ':!.sqlite-restore' > "$GITHUB_WORKSPACE/work.patch" || true
           wc -c "$GITHUB_WORKSPACE/work.patch"
           # Snapshot t3 runtime files for the next chained run (best-effort,
-          # fail-open). NEVER copy userdata/secrets/*, state.sqlite*, or
-          # userdata/logs/ — those stay on the ephemeral runner. The copies
+          # fail-open). NEVER copy userdata/secrets/*, plaintext state.sqlite*
+          # (-wal/-shm), or userdata/logs/ — the only sqlite copy that leaves
+          # the runner is the encrypted state.sqlite.enc (separate step).
           # below are scrubbed of sensitive keys (token/auth/secret/password
           # and friends) before they reach the cache/artifact (see python).
           ENVIRONMENT_ID="$(cat ~/.t3/userdata/environment-id 2>/dev/null || true)"
@@ -481,6 +606,102 @@ jobs:
             caches/opencode.json
           if-no-files-found: error
           retention-days: 7
+
+      # Snapshot the WHOLE sqlite DB via `.backup` to a temp file — never the
+      # live file: `t3 serve` keeps writing, so checkpoint + raw-copy risks a
+      # torn DB — then encrypt the snapshot with the tunnel bearer as the
+      # openssl passphrase (-pass env: keeps it out of ps/logs; openssl
+      # only, no gpg). Fail-open: missing token/tooling or encrypt failure
+      # just skips the backup (fresh identity next run). Only
+      # state.sqlite.enc leaves the runner — never the plaintext DB,
+      # -wal/-shm, or userdata/secrets/*.
+      - name: Save encrypted sqlite
+        id: sqlite_enc
+        if: always()
+        env:
+          TUNNEL_UPDATE_TOKEN: ${{ secrets.TUNNEL_UPDATE_TOKEN }}
+        run: |
+          if [ -n "${TUNNEL_UPDATE_TOKEN:-}" ]; then
+            echo "::add-mask::$TUNNEL_UPDATE_TOKEN"
+          fi
+          umask 077
+          if [ -z "${TUNNEL_UPDATE_TOKEN:-}" ]; then
+            echo "TUNNEL_UPDATE_TOKEN not set; skipping encrypted sqlite backup (fail-open)."
+            exit 0
+          fi
+          DB="$HOME/.t3/userdata/state.sqlite"
+          OUT="$GITHUB_WORKSPACE/state.sqlite.enc"
+          if [ ! -s "$DB" ]; then
+            echo "No state.sqlite to back up; skipping."
+            exit 0
+          fi
+          if ! command -v openssl >/dev/null 2>&1; then
+            echo "openssl missing; skipping encrypted sqlite backup (fail-open)."
+            exit 0
+          fi
+          TMP="$(mktemp /tmp/state-sqlite-backup-XXXXXX.sqlite 2>/dev/null || echo /tmp/state-sqlite-backup.sqlite)"
+          rm -f "$TMP"
+          if command -v sqlite3 >/dev/null 2>&1; then
+            sqlite3 "$DB" ".backup main '$TMP'" 2>/dev/null \
+              || echo "sqlite3 .backup failed; trying python fallback (fail-open)."
+          fi
+          if [ ! -s "$TMP" ] && command -v python3 >/dev/null 2>&1; then
+            python3 - "$DB" "$TMP" <<'EOF' 2>/dev/null || echo "python sqlite backup failed (fail-open)."
+          import sqlite3, sys
+          src = sqlite3.connect(sys.argv[1])
+          dst = sqlite3.connect(sys.argv[2])
+          with dst:
+            src.backup(dst)
+          src.close()
+          dst.close()
+          EOF
+          fi
+          if [ ! -s "$TMP" ]; then
+            echo "Could not snapshot sqlite DB; skipping backup (fail-open)."
+            rm -f "$TMP"
+            exit 0
+          fi
+          rm -f "$OUT"
+          if openssl enc -aes-256-cbc -pbkdf2 -pass env:TUNNEL_UPDATE_TOKEN -in "$TMP" -out "$OUT" 2>/dev/null && [ -s "$OUT" ]; then
+            echo "Encrypted sqlite backup with openssl."
+          else
+            echo "sqlite encrypt failed; skipping backup (fail-open)."
+            rm -f "$OUT" "$TMP"
+            exit 0
+          fi
+          rm -f "$TMP"
+          chmod 600 "$OUT"
+          ls -l "$OUT"
+          # Mirror to the cache path (actions/cache keys on path, so restore
+          # and save must use the same one). Fail-open: copy failure just
+          # means the cache save below has nothing to store.
+          mkdir -p "$GITHUB_WORKSPACE/.sqlite-restore" || true
+          cp "$OUT" "$GITHUB_WORKSPACE/.sqlite-restore/state.sqlite.enc" 2>/dev/null \
+            || echo "cache-path copy failed; artifact backup still uploaded (fail-open)."
+          chmod 600 "$GITHUB_WORKSPACE/.sqlite-restore/state.sqlite.enc" 2>/dev/null || true
+          echo "have=1" >> "$GITHUB_OUTPUT"
+
+      - name: Upload encrypted sqlite (private)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: t3-sqlite-enc
+          path: state.sqlite.enc
+          if-no-files-found: warn
+          retention-days: 1
+
+      # Cache copy of the encrypted backup so a >1d chain gap still finds a
+      # backup via the t3-sqlite- restore-key prefix (the artifact above is
+      # only 1d). Same path the restore step reads
+      # (.sqlite-restore/state.sqlite.enc) — cache keys on path, so a
+      # mismatch would never hit. Runs only when the save step actually
+      # produced state.sqlite.enc (missing paths would fail the save).
+      - name: Save encrypted sqlite to cache
+        if: always() && steps.sqlite_enc.outputs.have == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.sqlite-restore/state.sqlite.enc
+          key: t3-sqlite-${{ github.run_number }}
 
       - name: Self-chain next run
         if: always()
