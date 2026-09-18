@@ -326,7 +326,14 @@ jobs:
             T3_ALIVE=0
             TUN_ALIVE=0
             if curl -s -o /dev/null --max-time 10 http://127.0.0.1:3773/ 2>/dev/null; then T3_ALIVE=1; fi
-            if curl -s -o /dev/null --max-time 10 "$TUNNEL_HOST/" 2>/dev/null; then TUN_ALIVE=1; fi
+            # curl exits 0 for HTTP error pages: a dead `t3 serve` behind a
+            # live cloudflared (502) must not count as alive, or DEAD_COUNT
+            # never trips and the loop burns the full ~276 min. Treat
+            # 2xx/3xx/4xx as live; 5xx/000 (transport failure) as down.
+            TUN_CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$TUNNEL_HOST/" 2>/dev/null || true)"
+            case "$TUN_CODE" in
+              2??|3??|4??) TUN_ALIVE=1 ;;
+            esac
             echo "[$i/69] keepalive: t3_serve=$T3_ALIVE tunnel=$TUN_ALIVE"
             if [ "$T3_ALIVE" = 1 ] || [ "$TUN_ALIVE" = 1 ]; then
               DEAD_COUNT=0
