@@ -1,9 +1,11 @@
 name: docs-sync
 
-on:
-  pull_request:
-    types: [closed]
-    branches: [main]
+on: {}
+
+# WORKFLOW TRIGGERS DISABLED: on:
+#   pull_request:
+#     types: [closed]
+#     branches: [main]
 
 permissions:
   contents: write
