@@ -16,12 +16,14 @@ import { isT3PairingUrl } from "@/lib/tunnel-url";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
-// Staleness guard: the /pair#token= fragment expires ~5 min after minting,
-// and every successful workflow publish (initial capture or re-mint loop)
-// refreshes the slot's server-set `updatedAt`. Past this age auto-pairing
-// has likely expired, so the page shows the stale warning (with a manual
-// click-through link, fail-open) instead of redirecting into a dead token.
-// Kept slightly above the ~5 min TTL as grace for clock skew.
+// Staleness guard: the /pair#token= fragment is one-time and expires ~5 min
+// after minting, and the workflow's single publish at session start sets the
+// slot's server-set `updatedAt`. Past this age auto-pairing has likely
+// expired, so the page shows the stale warning (with a manual click-through
+// link, fail-open) instead of redirecting into a dead token. A persistently
+// stale slot means re-run the workflow for a fresh pairing URL;
+// already-paired devices stay connected. Kept slightly above the ~5 min TTL
+// as grace for clock skew.
 const STALE_AFTER_MS = 6 * 60 * 1000;
 
 interface TunnelSlotPayload {
@@ -68,9 +70,10 @@ export default async function DevT3Page() {
         <meta httpEquiv="refresh" content="15" />
         <h1 className="text-2xl font-semibold">T3 pairing may be stale</h1>
         <p className="max-w-md text-zinc-600 dark:text-zinc-400">
-          The stored pairing token is {ageMin} min old (auto-pair tokens expire
-          after ~5 min). The workflow re-mints it every ~4 min — wait a moment
-          and this page will redirect on its own (it retries every 15 seconds).
+          The stored pairing token is {ageMin} min old (pairing tokens are
+          one-time and expire after ~5 min). If this stays stale, re-run the
+          workflow for a fresh pairing URL — already-paired devices stay
+          connected. This page retries every 15 seconds.
         </p>
         <p className="max-w-md text-zinc-600 dark:text-zinc-400">
           <a className="underline" href={rec.url}>

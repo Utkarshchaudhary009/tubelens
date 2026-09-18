@@ -1,9 +1,9 @@
 # remote-t3 — persistent T3 remote-dev behind a free Cloudflare quick tunnel.
 #
 # Trigger: Actions tab -> remote-t3 -> Run workflow. The job runs
-# `npx t3 serve`, exposes :3773 via cloudflared, publishes the pairing URL,
-# then idles ~276 min with a ~4 min pairing re-mint loop so the session stays
-# usable (job budget 300 min).
+# `npx t3 serve`, exposes :3773 via cloudflared, publishes the pairing URL
+# once, then idles ~276 min on a plain sleep keepalive so the tunnel and
+# `t3 serve` stay up for already-paired devices (job budget 300 min).
 #
 # CRITICAL OTP catch (live probe): `npx t3 serve` prints
 #   Connection string: http://127.0.0.1:3773
@@ -30,22 +30,49 @@
 #     PAT/Blob publish flow works unchanged.
 #
 # Resume: the final step always saves `git diff` -> work.patch + run metadata
-# -> state.json into cache key t3-work-<run_number> AND the t3-state
-# artifact (7d). The next chained run RESTORES that cache at job start
-# (exact key t3-work-<prev run> via the t3-work- restore-key prefix) and
-# `git apply work.patch || true`, so uncommitted work carries forward.
+# -> state.json (pairing #token= redacted; the full URL only ever lives in
+# the live POST + the 1d t3-url.txt artifact) + a safe t3-runtime.json
+# {tunnel_host, environment_id, minted_at} and scrubbed ~/.t3 snapshots
+# (keys matching token/auth/secret/password/etc. removed before persisting)
+# into cache key t3-work-<run_number> AND the t3-state artifact (7d), plus
+# the whole ~/.t3/userdata/state.sqlite snapshotted via `.backup` and
+# encrypted with the tunnel bearer (TUNNEL_UPDATE_TOKEN) as the openssl
+# passphrase -> state.sqlite.enc in the private t3-sqlite-enc artifact (1d)
+# AND the t3-sqlite-<run_number> cache (restore-key prefix t3-sqlite-, so
+# chain gaps past the 1d artifact retention still find a backup). The
+# next chained run RESTORES that cache at job start (exact key
+# t3-work-<prev run> via the t3-work- restore-key prefix), `git apply
+# work.patch || true`, copies the snapshots back to ~/.t3 (best-effort),
+# and decrypts state.sqlite.enc back to ~/.t3/userdata/state.sqlite
+# (best-effort, before `t3 serve`) so auth_sessions carry forward.
 # Artifact fallback: download t3-state and `git apply work.patch` by hand.
+# NEVER persisted in plaintext: userdata/secrets/*, state.sqlite-wal/-shm,
+# userdata/logs/. The only sqlite copy that leaves the runner is the
+# encrypted state.sqlite.enc (never the raw DB).
 #
-# PAIRING TOKEN TTL (re-minted in the keep-alive loop): the /pair#token=
-# fragment expires ~5 min after minting (t3 pair default TTL 5m), so the
-# keep-alive step re-mints the pairing URL every ~4 min (`npx t3 pair` —
-# if `pair` prints no pairing URL that cycle just warns and keeps the previous
-# pairing) and re-POSTs it to the t3 slot. Any single re-mint failure is
-# fail-open: the tunnel stays up on the last good pairing.
+# SQLITE ENCRYPTION KEY-REUSE TRADEOFF: the tunnel bearer doubles as the
+# openssl passphrase (no second secret to manage). Rotating
+# TUNNEL_UPDATE_TOKEN invalidates older state.sqlite.enc backups (decrypt
+# just fails fail-open -> fresh identity), which is safe. Short-lived
+# pairing tokens (~5min) are still re-minted fresh every run and are never
+# relied upon from the restored DB — only the 30d auth_sessions carry over.
 #
-# STALENESS SURFACING (no silent expiry): every successful POST refreshes the
-# slot's server-set `updatedAt`, so /dev/t3 treats a record older than ~6 min
-# as stale and shows a warning page instead of redirecting into a dead token.
+# PAIRING TOKEN TTL (single mint): the /pair#token= fragment expires ~5 min
+# after minting (t3 pair default TTL 5m), so the workflow mints the pairing
+# URL ONCE at publish time (preferring a long-TTL `t3 pair --ttl 5h` mint
+# when that flag is supported, else the `t3 serve` log URL) and POSTs it to
+# the t3 slot a single time. Already-paired devices use the persistent
+# session and are unaffected by token expiry; only late/new pairings need a
+# fresh token, which means re-running the workflow. The keep-alive step is a
+# plain sleep loop — no re-mint, no re-POST (~69 Blob writes saved per run).
+# Any publish failure is fail-open: the tunnel stays up and the t3-url.txt
+# artifact remains the fallback.
+#
+# STALENESS SURFACING (no silent expiry): the single publish sets the slot's
+# server-set `updatedAt`, so /dev/t3 treats a record older than ~6 min as
+# stale and shows a warning page (with a manual click-through link,
+# fail-open) instead of redirecting into a dead token. A persistently stale
+# slot means re-run the workflow for a fresh pairing URL.
 #
 # MULTI-USER LIMITATION (documented, by design): the `t3` slot is a single
 # global pointer — concurrent publishers are last-writer-wins, runId names
@@ -91,12 +118,21 @@ jobs:
         with:
           node-version: "24"
 
+      # NOTE: worktrees and backup/t3code/* branches are never auto-restored
+      # here — only work.patch/state.json/t3 runtime files. Deleting a
+      # worktree via scripts/t3-worktree-delete.sh (which also deletes its
+      # backup branch from origin) is final; re-running this workflow
+      # cannot bring it back.
       - name: Restore prior work.patch + state.json
         uses: actions/cache/restore@v4
         with:
           path: |
             work.patch
             state.json
+            t3-runtime.json
+            server-runtime.json
+            settings.json
+            caches/opencode.json
           key: t3-work-${{ github.run_number }}
           restore-keys: |
             t3-work-
@@ -109,6 +145,122 @@ jobs:
           else
             echo "No prior work.patch to restore."
           fi
+
+      # Best-effort restore of the t3 snapshots saved by the previous run
+      # (fail-open: missing files just mean fresh defaults). Runs before
+      # `t3 serve` starts, which overwrites server-runtime.json with the new
+      # run's own pid/ports. t3-runtime.json is debug/history for chained
+      # runs — logged when present. NEVER restores plaintext secrets, raw
+      # sqlite (-wal/-shm), or logs — the only sqlite carried over is the
+      # encrypted state.sqlite.enc backup (see the restore step below).
+      - name: Restore t3 runtime files
+        run: |
+          mkdir -p ~/.t3/userdata ~/.t3/caches || true
+          cp "$GITHUB_WORKSPACE/settings.json" ~/.t3/userdata/settings.json 2>/dev/null || true
+          cp "$GITHUB_WORKSPACE/server-runtime.json" ~/.t3/userdata/server-runtime.json 2>/dev/null || true
+          cp "$GITHUB_WORKSPACE/caches/opencode.json" ~/.t3/caches/opencode.json 2>/dev/null || true
+          cat "$GITHUB_WORKSPACE/t3-runtime.json" 2>/dev/null || echo "No prior t3-runtime.json."
+          echo "t3 runtime files restored (best-effort)."
+
+      # Best-effort restore of the previous run's encrypted sqlite backup
+      # via cache (exact key t3-sqlite-<this run> misses; the t3-sqlite-
+      # prefix then matches the newest prior run). Fail-open: a miss just
+      # means the artifact step below may still supply the backup. Only the
+      # encrypted state.sqlite.enc ever enters the cache — never plaintext.
+      - name: Restore encrypted sqlite (cache)
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.sqlite-restore/state.sqlite.enc
+          key: t3-sqlite-${{ github.run_number }}
+          restore-keys: |
+            t3-sqlite-
+
+      # Best-effort download of the previous run's encrypted sqlite backup
+      # artifact. NOTE: actions/download-artifact without run-id only reads
+      # the CURRENT run — whose backup is uploaded later in this same run —
+      # so it always misses; fetch from a PRIOR run via `gh run download
+      # -n t3-sqlite-enc` instead. Fail-open (continue-on-error + the
+      # decrypt step never exits 1); single-mint flow untouched.
+      - name: Download encrypted sqlite backup (prior run artifact)
+        continue-on-error: true
+        env:
+          PAT_TOKEN: ${{ secrets.PAT }}
+          FALLBACK_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.sqlite-restore" || true
+          ENC="$GITHUB_WORKSPACE/.sqlite-restore/state.sqlite.enc"
+          if [ -s "$ENC" ]; then
+            echo "Cache already supplied state.sqlite.enc; skipping artifact download."
+            exit 0
+          fi
+          if [ -n "$PAT_TOKEN" ]; then
+            GH_TOKEN="$PAT_TOKEN"
+          else
+            GH_TOKEN="$FALLBACK_TOKEN"
+          fi
+          export GH_TOKEN
+          if [ -z "$GH_TOKEN" ]; then
+            echo "No token available; skipping sqlite artifact download (fail-open)."
+            exit 0
+          fi
+          ME="${{ github.run_id }}"
+          IDS="$(gh run list --workflow remote-t3.yml --limit 10 --json databaseId --jq '.[].databaseId' 2>/dev/null || true)"
+          for ID in $IDS; do
+            if [ "$ID" = "$ME" ]; then
+              continue
+            fi
+            if gh run download "$ID" -n t3-sqlite-enc -D "$GITHUB_WORKSPACE/.sqlite-restore" 2>/dev/null && [ -s "$ENC" ]; then
+              echo "Downloaded t3-sqlite-enc from prior run $ID."
+              chmod 600 "$ENC" || true
+              exit 0
+            fi
+          done
+          echo "No prior t3-sqlite-enc artifact found; starting with fresh identity (fail-open)."
+          exit 0
+
+      # Decrypt state.sqlite.enc (passphrase = TUNNEL_UPDATE_TOKEN) back to
+      # ~/.t3/userdata/state.sqlite BEFORE `t3 serve` starts. Fail-open:
+      # missing token/artifact, corrupt backup, or decrypt failure just
+      # means a fresh identity — always `exit 0`. openssl only (-pass env:
+      # keeps the passphrase out of ps/logs); no gpg path.
+      - name: Restore encrypted sqlite
+        env:
+          TUNNEL_UPDATE_TOKEN: ${{ secrets.TUNNEL_UPDATE_TOKEN }}
+        run: |
+          if [ -n "${TUNNEL_UPDATE_TOKEN:-}" ]; then
+            echo "::add-mask::$TUNNEL_UPDATE_TOKEN"
+          fi
+          umask 077
+          ENC="$GITHUB_WORKSPACE/.sqlite-restore/state.sqlite.enc"
+          if [ -z "${TUNNEL_UPDATE_TOKEN:-}" ]; then
+            echo "TUNNEL_UPDATE_TOKEN not set; skipping sqlite restore (fresh identity, fail-open)."
+            exit 0
+          fi
+          if [ ! -s "$ENC" ]; then
+            echo "No encrypted sqlite backup found; starting with fresh identity."
+            exit 0
+          fi
+          if ! command -v openssl >/dev/null 2>&1; then
+            echo "openssl missing; skipping sqlite restore (fresh identity, fail-open)."
+            exit 0
+          fi
+          rm -f /tmp/state.sqlite.dec
+          if ! openssl enc -d -aes-256-cbc -pbkdf2 -pass env:TUNNEL_UPDATE_TOKEN -in "$ENC" -out /tmp/state.sqlite.dec 2>/dev/null || [ ! -s /tmp/state.sqlite.dec ]; then
+            echo "sqlite decrypt failed (wrong token or corrupt backup); starting with fresh identity."
+            rm -f /tmp/state.sqlite.dec
+            exit 0
+          fi
+          echo "Decrypted sqlite backup with openssl."
+          if [ "$(head -c 16 /tmp/state.sqlite.dec 2>/dev/null)" != "SQLite format 3" ]; then
+            echo "Decrypted file is not a sqlite DB; discarding (fresh identity)."
+            rm -f /tmp/state.sqlite.dec
+            exit 0
+          fi
+          mkdir -p ~/.t3/userdata || true
+          cp /tmp/state.sqlite.dec ~/.t3/userdata/state.sqlite
+          rm -f ~/.t3/userdata/state.sqlite-wal ~/.t3/userdata/state.sqlite-shm /tmp/state.sqlite.dec
+          chmod 600 ~/.t3/userdata/state.sqlite
+          echo "Restored encrypted sqlite backup to ~/.t3/userdata/state.sqlite."
 
       - name: Duplicate guard (yield when another remote-t3 run is live/queued)
         env:
@@ -215,6 +367,9 @@ jobs:
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
         run: |
+          if [ -n "${TUNNEL_UPDATE_TOKEN:-}" ]; then
+            echo "::add-mask::$TUNNEL_UPDATE_TOKEN"
+          fi
           nohup cloudflared tunnel --url http://localhost:3773 --no-autoupdate > /tmp/cloudflared.log 2>&1 &
           echo "Waiting for tunnel URL..."
           TUNNEL_HOST=""
@@ -224,22 +379,36 @@ jobs:
             sleep 2
           done
           if [ -z "$TUNNEL_HOST" ]; then
-            echo "FAILED to get tunnel URL. cloudflared log:"
+            echo "FAILED to get tunnel URL (fail-open: ending publish with empty outputs; work is still saved and chained)."
             cat /tmp/cloudflared.log
-            exit 1
+            exit 0
           fi
           LOCAL_PAIRING=$(grep -oE 'http://[^[:space:]/]*:3773/pair#token=[A-Za-z0-9]{8,64}' /tmp/t3.log | head -n 1 || true)
           if [ -z "$LOCAL_PAIRING" ]; then
-            echo "FAILED to find the Pairing URL line in t3 log:"
+            echo "FAILED to find the Pairing URL line in t3 log (fail-open: ending publish with empty outputs; work is still saved and chained)."
             cat /tmp/t3.log
-            exit 1
+            exit 0
+          fi
+          # Single-mint policy: one pairing token per run, published once
+          # below. Prefer a long-TTL mint when `t3 pair --ttl` is supported;
+          # fall back to plain `t3 pair`, then to the serve-log URL. Every
+          # fallback is fail-open — the serve-log URL is always good enough.
+          LONG_LIVED="$(timeout 60 npx -y t3@latest pair --ttl 5h 2>/dev/null | grep -oE 'http://[^[:space:]/]*:3773/pair#token=[A-Za-z0-9]{8,64}' | head -n 1 || true)"
+          if [ -z "$LONG_LIVED" ]; then
+            LONG_LIVED="$(timeout 60 npx -y t3@latest pair 2>/dev/null | grep -oE 'http://[^[:space:]/]*:3773/pair#token=[A-Za-z0-9]{8,64}' | head -n 1 || true)"
+          fi
+          if [ -n "$LONG_LIVED" ]; then
+            echo "Using freshly minted pairing URL (long-TTL when supported)."
+            LOCAL_PAIRING="$LONG_LIVED"
+          else
+            echo "Fresh mint unavailable; using the t3 serve log pairing URL."
           fi
           PAIRING_PUBLIC="$(printf '%s' "$LOCAL_PAIRING" | sed -E "s|http://[^[:space:]/]*:3773|${TUNNEL_HOST}|")"
           case "$PAIRING_PUBLIC" in
             https://*.trycloudflare.com/pair\#token=?*) ;;
             *)
-              echo "Host-swapped pairing URL looks wrong: $PAIRING_PUBLIC"
-              exit 1
+              echo "Host-swapped pairing URL looks wrong (fail-open: ending publish; work is still saved and chained)."
+              exit 0
               ;;
           esac
           echo "::add-mask::$PAIRING_PUBLIC"
@@ -277,10 +446,14 @@ jobs:
           echo "BLOB_PUBLISH http_code=$HTTP_CODE error=$ERROR"
           rm -f "$RESP"
           case "$HTTP_CODE" in
-            2*) echo "Published pairing URL to the t3 slot of the production API" ;;
-            *) echo "Publish failed; see BLOB_PUBLISH line above."; exit 1 ;;
+            2*)
+              echo "Published pairing URL to the t3 slot of the production API"
+              date -u +"%Y-%m-%dT%H:%M:%SZ" > "$GITHUB_WORKSPACE/last-remint.txt"
+              ;;
+            *)
+              echo "Publish failed; tunnel stays up and the t3-url.txt artifact remains the fallback (fail-open)."
+              ;;
           esac
-          date -u +"%Y-%m-%dT%H:%M:%SZ" > "$GITHUB_WORKSPACE/last-remint.txt"
 
       - name: Upload t3 URL (artifact fallback)
         uses: actions/upload-artifact@v4
@@ -290,50 +463,36 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      - name: Keep alive ~276 min + re-mint pairing every ~4 min
+      - name: Keep alive ~276 min (plain sleep; single pairing mint)
         if: steps.tunnel.outputs.host != ''
-        env:
-          TUNNEL_UPDATE_TOKEN: ${{ secrets.TUNNEL_UPDATE_TOKEN }}
         run: |
           TUNNEL_HOST="${{ steps.tunnel.outputs.host }}"
-          echo "T3 session live; re-minting pairing URL every ~4 min for ~276 min."
+          echo "T3 session live; plain sleep keepalive for ~276 min (pairing was minted once at publish time; already-paired devices stay connected)."
+          DEAD_COUNT=0
           for i in $(seq 1 69); do
             sleep 240
-            NEW_LOCAL="$(timeout 60 npx -y t3@latest pair 2>/dev/null | grep -oE 'http://[^[:space:]/]*:3773/pair#token=[A-Za-z0-9]{8,64}' | head -n 1 || true)"
-            if [ -z "$NEW_LOCAL" ]; then
-              echo "[$i/69] re-mint: no pairing URL from t3 pair; keeping previous pairing."
-              continue
-            fi
-            NEW_PUBLIC="$(printf '%s' "$NEW_LOCAL" | sed -E "s|http://[^[:space:]/]*:3773|${TUNNEL_HOST}|")"
-            case "$NEW_PUBLIC" in
-              https://*.trycloudflare.com/pair\#token=?*) ;;
-              *)
-                echo "[$i/69] re-mint: host-swapped URL looks wrong; keeping previous pairing."
-                continue
-                ;;
+            T3_ALIVE=0
+            TUN_ALIVE=0
+            if curl -s -o /dev/null --max-time 10 http://127.0.0.1:3773/ 2>/dev/null; then T3_ALIVE=1; fi
+            # curl exits 0 for HTTP error pages: a dead `t3 serve` behind a
+            # live cloudflared (502) must not count as alive, or DEAD_COUNT
+            # never trips and the loop burns the full ~276 min. Treat
+            # 2xx/3xx/4xx as live; 5xx/000 (transport failure) as down.
+            TUN_CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$TUNNEL_HOST/" 2>/dev/null || true)"
+            case "$TUN_CODE" in
+              2??|3??|4??) TUN_ALIVE=1 ;;
             esac
-            echo "::add-mask::$NEW_PUBLIC"
-            if [ -z "$TUNNEL_UPDATE_TOKEN" ]; then
-              echo "[$i/69] re-mint: TUNNEL_UPDATE_TOKEN not set; skipping API publish."
-              continue
+            echo "[$i/69] keepalive: t3_serve=$T3_ALIVE tunnel=$TUN_ALIVE"
+            if [ "$T3_ALIVE" = 1 ] || [ "$TUN_ALIVE" = 1 ]; then
+              DEAD_COUNT=0
+            else
+              DEAD_COUNT=$((DEAD_COUNT + 1))
+              echo "[$i/69] keepalive: both endpoints down ($DEAD_COUNT/3)."
+              if [ "$DEAD_COUNT" -ge 3 ]; then
+                echo "Session looks dead (~12 min with nothing reachable); ending keepalive early (save+chain still run)."
+                break
+              fi
             fi
-            RESP="$(mktemp)"
-            HTTP_CODE="$(curl -s -o "$RESP" -w "%{http_code}" --max-time 30 -X POST "https://tubelens-neon.vercel.app/api/v1/tunnel-url" \
-              -H "Authorization: Bearer $TUNNEL_UPDATE_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "{\"name\": \"t3\", \"url\": \"$NEW_PUBLIC\", \"runId\": \"${{ github.run_id }}\"}")" || true
-            ERROR="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); e=d.get('error') or {}; print((e.get('code','')+':'+e.get('message','')) if e else 'none')" "$RESP" 2>/dev/null || echo unparseable)"
-            echo "[$i/69] BLOB_PUBLISH http_code=$HTTP_CODE error=$ERROR"
-            rm -f "$RESP"
-            case "$HTTP_CODE" in
-              2*)
-                echo "[$i/69] re-mint: published a fresh pairing URL to the t3 slot."
-                date -u +"%Y-%m-%dT%H:%M:%SZ" > "$GITHUB_WORKSPACE/last-remint.txt"
-                ;;
-              *)
-                echo "[$i/69] re-mint: publish failed; keeping previous pairing."
-                ;;
-            esac
           done
           echo "Keep-alive window done; proceeding to save+chain."
 
@@ -341,26 +500,107 @@ jobs:
         if: always()
         run: |
           git add -N . || true
-          git diff > "$GITHUB_WORKSPACE/work.patch" || true
+          # Exclude this workflow's own machine files from the patch: they
+          # are carried separately via the cache/artifact paths below, and
+          # including them would make `git apply` fail on the next chained
+          # run (restored files already exist). Real work still diffs fully.
+          git diff -- . ':!work.patch' ':!state.json' ':!last-remint.txt' ':!t3-url.txt' ':!t3-runtime.json' ':!server-runtime.json' ':!settings.json' ':!caches/opencode.json' ':!state.sqlite.enc' ':!.sqlite-restore' > "$GITHUB_WORKSPACE/work.patch" || true
           wc -c "$GITHUB_WORKSPACE/work.patch"
+          # Snapshot t3 runtime files for the next chained run (best-effort,
+          # fail-open). NEVER copy userdata/secrets/*, plaintext state.sqlite*
+          # (-wal/-shm), or userdata/logs/ — the only sqlite copy that leaves
+          # the runner is the encrypted state.sqlite.enc (separate step).
+          # below are scrubbed of sensitive keys (token/auth/secret/password
+          # and friends) before they reach the cache/artifact (see python).
+          ENVIRONMENT_ID="$(cat ~/.t3/userdata/environment-id 2>/dev/null || true)"
+          cp ~/.t3/userdata/server-runtime.json "$GITHUB_WORKSPACE/server-runtime.json" 2>/dev/null || true
+          cp ~/.t3/userdata/settings.json "$GITHUB_WORKSPACE/settings.json" 2>/dev/null || true
+          mkdir -p "$GITHUB_WORKSPACE/caches" 2>/dev/null || true
+          cp ~/.t3/caches/opencode.json "$GITHUB_WORKSPACE/caches/opencode.json" 2>/dev/null || true
           TUNNEL_HOST="${{ steps.tunnel.outputs.host }}"
           PAIRING_PUBLIC="${{ steps.tunnel.outputs.pairing }}"
-          GITHUB_RUN_NUMBER="${{ github.run_number }}" TUNNEL_HOST="$TUNNEL_HOST" PAIRING_PUBLIC="$PAIRING_PUBLIC" python3 - <<'EOF'
-          import json, os
+          GITHUB_RUN_NUMBER="${{ github.run_number }}" TUNNEL_HOST="$TUNNEL_HOST" PAIRING_PUBLIC="$PAIRING_PUBLIC" ENVIRONMENT_ID="$ENVIRONMENT_ID" python3 - <<'EOF'
+          import json, os, re
+          # Drop any key whose name looks credential-ish (settings.json holds
+          # provider config + serverPassword; caches/opencode.json holds an
+          # `auth` subtree). Keys are removed (not placeholdered) so a
+          # redacted password can never be mistaken for a real one on
+          # restore. Non-JSON copies are deleted rather than persisted blind.
+          SENSITIVE_RE = re.compile(
+            r"token|apikey|api_key|secret|password|auth|bearer|session|"
+            r"cookie|credential|privatekey|private_key",
+            re.IGNORECASE,
+          )
+          def scrub(obj):
+            n = 0
+            if isinstance(obj, dict):
+              for k in list(obj.keys()):
+                if SENSITIVE_RE.search(k):
+                  del obj[k]
+                  n += 1
+                else:
+                  n += scrub(obj[k])
+            elif isinstance(obj, list):
+              for v in obj:
+                n += scrub(v)
+            return n
+          for path in ("server-runtime.json", "settings.json", "caches/opencode.json"):
+            try:
+              with open(path) as f:
+                doc = json.load(f)
+            except FileNotFoundError:
+              continue
+            except (OSError, ValueError) as e:
+              print(f"scrub: dropping unparseable {path} ({e})")
+              try:
+                os.remove(path)
+              except OSError:
+                pass
+              continue
+            n = scrub(doc)
+            with open(path, "w") as f:
+              json.dump(doc, f, indent=2)
+            print(f"scrub: {path}: removed {n} sensitive key(s)")
           try:
             with open("last-remint.txt") as f:
-              last_remint_at = f.read().strip()
+              minted_at = f.read().strip()
           except OSError:
-            last_remint_at = ""
+            minted_at = ""
+          tunnel_host = os.environ.get("TUNNEL_HOST", "")
+          environment_id = os.environ.get("ENVIRONMENT_ID", "").strip()
+          full_pairing = os.environ.get("PAIRING_PUBLIC", "")
+          # The pairing #token= is a short-lived credential: the live POST
+          # above carries the full URL, but the 7d cache/artifact keeps only
+          # this masked form (key name unchanged for compat).
+          masked_pairing = re.sub(
+            r"(#token=)[^&\s]+", r"\1***REDACTED***", full_pairing
+          )
           state = {
             "run_number": int(os.environ.get("GITHUB_RUN_NUMBER", "0")),
-            "tunnel_url": os.environ.get("TUNNEL_HOST", ""),
-            "pairing_url": os.environ.get("PAIRING_PUBLIC", ""),
-            "last_remint_at": last_remint_at,
+            "tunnel_url": tunnel_host,
+            "pairing_url": masked_pairing,
+            # Compat: set once at publish time under the single-mint policy.
+            "last_remint_at": minted_at,
+            "minted_at": minted_at,
+            "tunnel_host": tunnel_host,
+            "environment_id": environment_id,
           }
           with open("state.json", "w") as f:
             json.dump(state, f, indent=2)
           print(open("state.json").read())
+          # Debug/history for chained runs: safe scalar fields only (never
+          # the full server-runtime blob, never the pairing token).
+          with open("t3-runtime.json", "w") as f:
+            json.dump(
+              {
+                "tunnel_host": tunnel_host,
+                "environment_id": environment_id,
+                "minted_at": minted_at,
+              },
+              f,
+              indent=2,
+            )
+          print(open("t3-runtime.json").read())
           EOF
 
       - name: Save state to cache
@@ -370,6 +610,10 @@ jobs:
           path: |
             work.patch
             state.json
+            t3-runtime.json
+            server-runtime.json
+            settings.json
+            caches/opencode.json
           key: t3-work-${{ github.run_number }}
 
       - name: Upload t3-state
@@ -380,8 +624,108 @@ jobs:
           path: |
             work.patch
             state.json
+            t3-runtime.json
+            server-runtime.json
+            settings.json
+            caches/opencode.json
           if-no-files-found: error
           retention-days: 7
+
+      # Snapshot the WHOLE sqlite DB via `.backup` to a temp file — never the
+      # live file: `t3 serve` keeps writing, so checkpoint + raw-copy risks a
+      # torn DB — then encrypt the snapshot with the tunnel bearer as the
+      # openssl passphrase (-pass env: keeps it out of ps/logs; openssl
+      # only, no gpg). Fail-open: missing token/tooling or encrypt failure
+      # just skips the backup (fresh identity next run). Only
+      # state.sqlite.enc leaves the runner — never the plaintext DB,
+      # -wal/-shm, or userdata/secrets/*.
+      - name: Save encrypted sqlite
+        id: sqlite_enc
+        if: always()
+        env:
+          TUNNEL_UPDATE_TOKEN: ${{ secrets.TUNNEL_UPDATE_TOKEN }}
+        run: |
+          if [ -n "${TUNNEL_UPDATE_TOKEN:-}" ]; then
+            echo "::add-mask::$TUNNEL_UPDATE_TOKEN"
+          fi
+          umask 077
+          if [ -z "${TUNNEL_UPDATE_TOKEN:-}" ]; then
+            echo "TUNNEL_UPDATE_TOKEN not set; skipping encrypted sqlite backup (fail-open)."
+            exit 0
+          fi
+          DB="$HOME/.t3/userdata/state.sqlite"
+          OUT="$GITHUB_WORKSPACE/state.sqlite.enc"
+          if [ ! -s "$DB" ]; then
+            echo "No state.sqlite to back up; skipping."
+            exit 0
+          fi
+          if ! command -v openssl >/dev/null 2>&1; then
+            echo "openssl missing; skipping encrypted sqlite backup (fail-open)."
+            exit 0
+          fi
+          TMP="$(mktemp /tmp/state-sqlite-backup-XXXXXX.sqlite 2>/dev/null || echo /tmp/state-sqlite-backup.sqlite)"
+          rm -f "$TMP"
+          if command -v sqlite3 >/dev/null 2>&1; then
+            sqlite3 "$DB" ".backup main '$TMP'" 2>/dev/null \
+              || echo "sqlite3 .backup failed; trying python fallback (fail-open)."
+          fi
+          if [ ! -s "$TMP" ] && command -v python3 >/dev/null 2>&1; then
+            python3 - "$DB" "$TMP" <<'EOF' 2>/dev/null || echo "python sqlite backup failed (fail-open)."
+          import sqlite3, sys
+          src = sqlite3.connect(sys.argv[1])
+          dst = sqlite3.connect(sys.argv[2])
+          with dst:
+            src.backup(dst)
+          src.close()
+          dst.close()
+          EOF
+          fi
+          if [ ! -s "$TMP" ]; then
+            echo "Could not snapshot sqlite DB; skipping backup (fail-open)."
+            rm -f "$TMP"
+            exit 0
+          fi
+          rm -f "$OUT"
+          if openssl enc -aes-256-cbc -pbkdf2 -pass env:TUNNEL_UPDATE_TOKEN -in "$TMP" -out "$OUT" 2>/dev/null && [ -s "$OUT" ]; then
+            echo "Encrypted sqlite backup with openssl."
+          else
+            echo "sqlite encrypt failed; skipping backup (fail-open)."
+            rm -f "$OUT" "$TMP"
+            exit 0
+          fi
+          rm -f "$TMP"
+          chmod 600 "$OUT"
+          ls -l "$OUT"
+          # Mirror to the cache path (actions/cache keys on path, so restore
+          # and save must use the same one). Fail-open: copy failure just
+          # means the cache save below has nothing to store.
+          mkdir -p "$GITHUB_WORKSPACE/.sqlite-restore" || true
+          cp "$OUT" "$GITHUB_WORKSPACE/.sqlite-restore/state.sqlite.enc" 2>/dev/null \
+            || echo "cache-path copy failed; artifact backup still uploaded (fail-open)."
+          chmod 600 "$GITHUB_WORKSPACE/.sqlite-restore/state.sqlite.enc" 2>/dev/null || true
+          echo "have=1" >> "$GITHUB_OUTPUT"
+
+      - name: Upload encrypted sqlite (private)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: t3-sqlite-enc
+          path: state.sqlite.enc
+          if-no-files-found: warn
+          retention-days: 1
+
+      # Cache copy of the encrypted backup so a >1d chain gap still finds a
+      # backup via the t3-sqlite- restore-key prefix (the artifact above is
+      # only 1d). Same path the restore step reads
+      # (.sqlite-restore/state.sqlite.enc) — cache keys on path, so a
+      # mismatch would never hit. Runs only when the save step actually
+      # produced state.sqlite.enc (missing paths would fail the save).
+      - name: Save encrypted sqlite to cache
+        if: always() && steps.sqlite_enc.outputs.have == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.sqlite-restore/state.sqlite.enc
+          key: t3-sqlite-${{ github.run_number }}
 
       - name: Self-chain next run
         if: always()
