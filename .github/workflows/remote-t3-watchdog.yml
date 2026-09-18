@@ -11,10 +11,12 @@
 # exits 0 without dispatching, so API hiccups never cause dispatch storms.
 name: remote-t3-watchdog
 
-on:
-  schedule:
-    - cron: "*/30 * * * *"
-  workflow_dispatch:
+on: {}
+
+# WORKFLOW TRIGGERS DISABLED: on:
+#   schedule:
+#     - cron: "*/30 * * * *"
+#   workflow_dispatch:
 
 permissions:
   contents: read
