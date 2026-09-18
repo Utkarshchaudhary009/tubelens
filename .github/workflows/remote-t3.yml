@@ -728,15 +728,17 @@ jobs:
           path: ${{ github.workspace }}/.sqlite-restore/state.sqlite.enc
           key: t3-sqlite-${{ github.run_number }}
 
-      - name: Self-chain next run
-        if: always()
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
-        run: |
-          if [ -z "$GH_TOKEN" ]; then
-            echo "PAT secret not set; skipping self-chain (state is still saved in cache t3-work-${{ github.run_number }} + t3-state artifact)."
-            exit 0
-          fi
-          gh workflow run remote-t3.yml --ref main
-          echo "Chained the next remote-t3 run."
+      # Self-chain disabled: do not automatically start another remote-t3 run.
+      # To resume persistent looping later, uncomment the original step below.
+      # - name: Self-chain next run
+      # if: always()
+      # continue-on-error: true
+      # env:
+      # GH_TOKEN: ${{ secrets.PAT }}
+      # run: |
+      # if [ -z "$GH_TOKEN" ]; then
+      # echo "PAT secret not set; skipping self-chain (state is still saved in cache t3-work-${{ github.run_number }} + t3-state artifact)."
+      # exit 0
+      # fi
+      # gh workflow run remote-t3.yml --ref main
+      # echo "Chained the next remote-t3 run."
