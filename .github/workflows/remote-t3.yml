@@ -85,10 +85,11 @@ jobs:
           persist-credentials: true
           token: ${{ secrets.PAT }}
 
-      # T3 remote envs want Node ^22.16 || ^23.11 || >=24.10 for `npx t3 serve`.
+      # T3 remote envs want Node ^22.16 || ^23.11 || >=24.10 for `npx t3 serve`;
+      # agent-browser engines require Node >= 24, so pin 24 to satisfy both.
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "24"
 
       - name: Restore prior work.patch + state.json
         uses: actions/cache/restore@v4
@@ -151,6 +152,29 @@ jobs:
           export PATH="$NPM_GLOBAL_BIN:$PATH"
           command -v opencode
           opencode --version
+
+      # agent-browser (Vercel Labs Rust CLI) drives headless Chrome for remote
+      # QA/dogfooding. Install it pinned for reproducibility on every fresh
+      # runner, fetch Chrome-for-Testing with system libs (--with-deps needs
+      # sudo for apt on ubuntu-latest; intentionally fail-closed alongside
+      # opencode via set -euo pipefail), and verify the install with doctor
+      # before t3 serve starts.
+      - name: Install agent-browser CLI
+        run: |
+          set -euo pipefail
+          npm install --global agent-browser@0.38.1
+          NPM_GLOBAL_BIN="$(npm prefix --global)/bin"
+          echo "$NPM_GLOBAL_BIN" >> "$GITHUB_PATH"
+          export PATH="$NPM_GLOBAL_BIN:$PATH"
+          command -v agent-browser
+          agent-browser --version
+          echo "Installing Chrome-for-Testing with system deps (fail-closed)..."
+          sudo -E "$(command -v agent-browser)" install --with-deps
+          echo "--- doctor (offline, quick) ---"
+          agent-browser doctor --offline --quick > /tmp/agent-browser-doctor.log 2>&1 || DOCTOR_STATUS=$?
+          head -n 30 /tmp/agent-browser-doctor.log || true
+          tail -n 30 /tmp/agent-browser-doctor.log || true
+          test "${DOCTOR_STATUS:-0}" -eq 0
 
       - name: Start t3 serve (port 3773)
         run: |
