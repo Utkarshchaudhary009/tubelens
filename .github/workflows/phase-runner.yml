@@ -1,9 +1,11 @@
 name: phase-runner
 
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: "17 */3 * * *"
+on: {}
+
+# WORKFLOW TRIGGERS DISABLED: on:
+#   workflow_dispatch:
+#   schedule:
+#     - cron: "17 */3 * * *"
 
 permissions:
   contents: write
