@@ -123,11 +123,12 @@ jobs:
         with:
           node-version: "24"
 
-      # NOTE: worktrees and backup/t3code/* branches are never auto-restored
-      # here — only work.patch/state.json/t3 runtime files. Deleting a
-      # worktree via scripts/t3-worktree-delete.sh (which also deletes its
-      # backup branch from origin) is final; re-running this workflow
-      # cannot bring it back.
+      # NOTE: t3 worktrees (~/.t3/worktrees/tubelens/t3code-*) are backed up
+      # to origin backup/t3code/* branches on every run (save step below)
+      # and recreated here via `git worktree add` (restore step below).
+      # Deleting a worktree via scripts/t3-worktree-delete.sh (which also
+      # deletes its backup branch from origin) is final; without its backup
+      # branch there is nothing to restore.
       - name: Restore prior work.patch + state.json
         uses: actions/cache/restore@v4
         with:
@@ -266,6 +267,47 @@ jobs:
           rm -f ~/.t3/userdata/state.sqlite-wal ~/.t3/userdata/state.sqlite-shm /tmp/state.sqlite.dec
           chmod 600 ~/.t3/userdata/state.sqlite
           echo "Restored encrypted sqlite backup to ~/.t3/userdata/state.sqlite."
+
+      # Best-effort recreate of t3 worktrees from the origin
+      # backup/t3code/* branches saved by prior runs. Fail-open: missing
+      # branches, fetch failures, or `git worktree add` errors just mean
+      # empty-dir fallback / no worktrees — always `exit 0`. Runs before
+      # `t3 serve` so the restored absolute paths
+      # (~/.t3/worktrees/tubelens/t3code-<ID>) match what state.sqlite
+      # recorded in `worktree_path`.
+      - name: Restore t3 worktrees from backup branches
+        run: |
+          mkdir -p ~/.t3/worktrees/tubelens || true
+          git fetch origin '+refs/heads/backup/t3code/*:refs/remotes/origin/backup/t3code/*' || true
+          REFS="$(git for-each-ref --format='%(refname:short)' 'refs/remotes/origin/backup/t3code/*' 2>/dev/null || true)"
+          if [ -z "$REFS" ]; then
+            echo "No backup/t3code branches to restore."
+            exit 0
+          fi
+          for REF in $REFS; do
+            ID="${REF#origin/backup/t3code/}"
+            if [ -z "$ID" ]; then
+              continue
+            fi
+            case "$ID" in
+              *[!A-Za-z0-9_-]*)
+                echo "Skipping unexpected backup ref (unsafe ID): $REF"
+                continue
+                ;;
+            esac
+            WT="$HOME/.t3/worktrees/tubelens/t3code-$ID"
+            if [ -d "$WT" ]; then
+              echo "Worktree already exists: $WT; skipping."
+              continue
+            fi
+            if git worktree add "$WT" -B "t3code/$ID" "$REF" 2>/dev/null; then
+              echo "Restored worktree $WT from $REF."
+            else
+              echo "git worktree add failed for $WT ($REF); creating empty dir fallback (fail-open)."
+              mkdir -p "$WT" || true
+            fi
+          done
+          exit 0
 
       - name: Duplicate guard (yield when another remote-t3 run is live/queued)
         env:
@@ -607,6 +649,35 @@ jobs:
             )
           print(open("t3-runtime.json").read())
           EOF
+
+      # Best-effort backup of t3 worktrees so the next chained run can
+      # recreate the exact ~/.t3/worktrees/tubelens/t3code-* paths that
+      # state.sqlite references in `worktree_path`. Fail-open: no worktrees
+      # or push failures just mean nothing to restore — always `exit 0`,
+      # never fails the job.
+      - name: Save t3 worktrees to backup branches
+        if: always()
+        run: |
+          for WT in ~/.t3/worktrees/tubelens/t3code-*; do
+            [ -d "$WT" ] || continue
+            git -C "$WT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || continue
+            BN="$(basename "$WT")"
+            ID="${BN#t3code-}"
+            if [ -z "$ID" ] || [ "$ID" = "$BN" ]; then
+              echo "Skipping unexpected worktree dir: $WT"
+              continue
+            fi
+            case "$ID" in
+              *[!A-Za-z0-9_-]*)
+                echo "Skipping unexpected worktree dir (unsafe ID): $WT"
+                continue
+                ;;
+            esac
+            echo "Backing up worktree $WT -> origin backup/t3code/$ID"
+            git -C "$WT" push origin "HEAD:backup/t3code/$ID" --force-with-lease || true
+          done
+          echo "Worktree backup done (fail-open)."
+          exit 0
 
       - name: Save state to cache
         if: always()
