@@ -1,12 +1,11 @@
 name: unit-test
 
-on: {}
+on:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
 
-# WORKFLOW TRIGGERS DISABLED: on:
-#   push:
-#     branches:
-#       - '**'
-#   workflow_dispatch:
 
 permissions:
   pull-requests: write
