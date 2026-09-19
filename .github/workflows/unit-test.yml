@@ -51,7 +51,7 @@ jobs:
               [ -z "$matches" ] && continue
               # Drop documentation/placeholder lines (mirrors
               # isPlaceholderLine in src/lib/redact.ts).
-              matches="$(printf '%s\n' "$matches" | grep -viE '<|YOUR_|\b(USER|PASSWORD|HOST|example)\b|changeme|placeholder|\.\.\.|\$\{\{|secrets\.|\$\{[A-Z_][A-Z0-9_]*(?::-[^}]*)?\}' || true)"
+              matches="$(printf '%s\n' "$matches" | grep -viE '<|YOUR_|\b(USER|PASSWORD|HOST|example)\b|changeme|placeholder|\.\.\.|\$\{\{|secrets\.|\$\{[A-Z_][A-Z0-9_]*(:-[^}]*)?\}' || true)"
               # The unicode ellipsis cannot sit in the bracket above in some
               # locales, so filter it explicitly as well.
               matches="$(printf '%s\n' "$matches" | grep -v '…' || true)"
