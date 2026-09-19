@@ -1,12 +1,11 @@
 name: e2e
 
-on: {}
+on:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
 
-# WORKFLOW TRIGGERS DISABLED: on:
-#   push:
-#     branches:
-#       - '**'
-#   workflow_dispatch:
 
 permissions:
   contents: read
