@@ -1,6 +1,6 @@
 # remote-t3 — persistent T3 remote-dev behind a free Cloudflare quick tunnel.
 #
-# Trigger: Actions tab -> remote-t3 -> Run workflow. The job runs
+# Trigger: scheduled every 5 hours (UTC) or manually from Actions. The job runs
 # `npx t3 serve`, exposes :3773 via cloudflared, publishes the pairing URL
 # once, then idles ~276 min on a plain sleep keepalive so the tunnel and
 # `t3 serve` stay up for already-paired devices (job budget 300 min).
@@ -85,6 +85,9 @@
 name: remote-t3
 
 on:
+  schedule:
+    # Every 5 hours, UTC.
+    - cron: "0 */5 * * *"
   workflow_dispatch:
 
 
