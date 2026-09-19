@@ -378,7 +378,7 @@ export const SECRET_SCAN_PATTERNS: readonly RegExp[] = [
  * db.test.ts scan + CI job).
  */
 export const PLACEHOLDER_PATTERN =
-  /<|YOUR_|\b(USER|PASSWORD|HOST|example)\b|changeme|placeholder|\.\.\.|…|\$\{\{|secrets\./i;
+  /<|YOUR_|\b(USER|PASSWORD|HOST|example)\b|changeme|placeholder|\.\.\.|…|\$\{\{|secrets\.|\$\{[A-Z_][A-Z0-9_]*(?::-[^}]*)?\}/i;
 
 /** True when a matched line is documentation/fixture noise, not a leak. */
 export function isPlaceholderLine(line: string): boolean {
