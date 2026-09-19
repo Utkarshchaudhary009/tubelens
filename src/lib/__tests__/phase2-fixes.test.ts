@@ -18,6 +18,7 @@ import {
   classifyFeedError,
   classifyTranscriptError,
 } from "../mappers";
+import { clearTunnelCache } from "../tunnel-cache";
 
 // ---------------------------------------------------------------------------
 // Finding 1 (HIGH): single 8s fail-fast budget. The default deps lazily import
@@ -43,6 +44,7 @@ mock.module("@/lib/youtube", () => ({
 beforeEach(() => {
   clearCache();
   clearContinuations();
+  clearTunnelCache();
   timeoutCalls.length = 0;
   fakeInnertube = {};
 });

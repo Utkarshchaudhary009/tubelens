@@ -574,8 +574,8 @@ describe("safe-fetch caller regressions", () => {
         text: async () => "",
       };
     }) as unknown as FetchLike;
-    const yttools = TRANSCRIPT_PROVIDERS[1];
-    const fallback = TRANSCRIPT_PROVIDERS[3];
+    const yttools = TRANSCRIPT_PROVIDERS.find((d) => d.name === "yttools");
+    const fallback = TRANSCRIPT_PROVIDERS.find((d) => d.name === "kome");
     if (!yttools || !fallback) {
       throw new Error("registry fixture missing");
     }
@@ -608,7 +608,7 @@ describe("safe-fetch caller regressions", () => {
         text: async () => "",
       };
     }) as unknown as FetchLike;
-    const yttools = TRANSCRIPT_PROVIDERS[1];
+    const yttools = TRANSCRIPT_PROVIDERS.find((d) => d.name === "yttools");
     if (!yttools) {
       throw new Error("registry fixture missing");
     }
@@ -660,7 +660,7 @@ describe("safe-fetch caller regressions", () => {
       });
       throw new Error("unreachable");
     }) as unknown as FetchLike;
-    const yttools = TRANSCRIPT_PROVIDERS[1];
+    const yttools = TRANSCRIPT_PROVIDERS.find((d) => d.name === "yttools");
     if (!yttools) {
       throw new Error("registry fixture missing");
     }
