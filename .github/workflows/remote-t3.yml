@@ -84,10 +84,9 @@
 # workflow), THEN cancel the run.
 name: remote-t3
 
-on: {}
+on:
+  workflow_dispatch:
 
-# WORKFLOW TRIGGERS DISABLED: on:
-#   workflow_dispatch:
 
 concurrency:
   group: remote-dev-main
