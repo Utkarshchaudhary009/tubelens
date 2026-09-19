@@ -106,7 +106,6 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.PAT }}
       GITHUB_TOKEN: ${{ secrets.PAT }}
-      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
       KILO_CODE_API_KEY: ${{ secrets.KILO_CODE_API_KEY }}
       VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
       VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
