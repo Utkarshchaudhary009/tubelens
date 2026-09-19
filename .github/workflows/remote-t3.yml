@@ -304,6 +304,10 @@ jobs:
             fi
             if git worktree add "$WT" -B "t3code/$ID" "$REF" 2>/dev/null; then
               echo "Restored worktree $WT from $REF."
+              # `worktree add -B` with a remote-tracking start point sets it
+              # as upstream; clear it so plain `git pull/push` in the
+              # worktree never targets the machine-only backup ref.
+              git -C "$WT" branch --unset-upstream "t3code/$ID" 2>/dev/null || true
             else
               echo "git worktree add failed for $WT ($REF); creating empty dir fallback (fail-open)."
               mkdir -p "$WT" || true
@@ -655,10 +659,12 @@ jobs:
       # Best-effort backup of t3 worktrees so the next chained run can
       # recreate the exact ~/.t3/worktrees/tubelens/t3code-* paths that
       # state.sqlite references in `worktree_path`. Uncommitted
-      # (staged/unstaged/untracked) changes are snapshotted into a
-      # machine-only backup commit first, because `git push` transfers
-      # only HEAD. Fail-open: no worktrees or push failures just mean
-      # nothing to restore — always `exit 0`, never fails the job.
+      # (staged/unstaged/untracked-but-unignored) changes are snapshotted
+      # into a machine-only backup commit first, because `git push`
+      # transfers only HEAD. Gitignored files (build output, regenerable)
+      # and the secret-bearing paths below are intentionally excluded.
+      # Fail-open: no worktrees or push failures just mean the prior
+      # backup state is restored — always `exit 0`, never fails the job.
       - name: Save t3 worktrees to backup branches
         if: always()
         run: |
@@ -679,14 +685,24 @@ jobs:
             esac
             echo "Backing up worktree $WT -> origin backup/t3code/$ID"
             # `git push` transfers only HEAD, so snapshot uncommitted work
-            # (staged/unstaged/untracked) into a machine-only backup commit
-            # first; backup refs are never merged. Fail-open throughout.
+            # (staged/unstaged/untracked-but-unignored) into a machine-only
+            # backup commit first; backup refs are never merged. Mirrors
+            # the work.patch `:!` exclusions so secret-bearing files
+            # (.env, runtime snapshots) never land in the backup branch.
+            # Fail-open throughout.
             if ! git -C "$WT" diff --quiet HEAD -- 2>/dev/null || [ -n "$(git -C "$WT" ls-files --others --exclude-standard 2>/dev/null)" ]; then
-              git -C "$WT" -c user.name="t3-backup" -c user.email="t3-backup@localhost" add -A 2>/dev/null || true
-              git -C "$WT" -c user.name="t3-backup" -c user.email="t3-backup@localhost" commit -m "t3 backup: snapshot uncommitted work" --no-verify 2>/dev/null || true
-              echo "Snapshotted uncommitted changes in $WT."
+              git -C "$WT" -c user.name="t3-backup" -c user.email="t3-backup@localhost" add -A -- . ':!settings.json' ':!server-runtime.json' ':!caches/opencode.json' ':!.env' ':!.env.local' 2>/dev/null || true
+              if git -C "$WT" -c user.name="t3-backup" -c user.email="t3-backup@localhost" commit -m "t3 backup: snapshot uncommitted work" --no-verify 2>/dev/null; then
+                echo "Snapshotted uncommitted changes in $WT."
+              else
+                echo "No snapshottable changes in $WT (only excluded files differ, or commit failed; continuing)."
+              fi
             fi
-            git -C "$WT" push origin "HEAD:backup/t3code/$ID" --force-with-lease || true
+            if git -C "$WT" push origin "HEAD:backup/t3code/$ID" --force-with-lease 2>/dev/null; then
+              echo "Backed up $WT."
+            else
+              echo "WARNING: backup push failed for $WT (fail-open; next run restores the prior backup state)."
+            fi
           done
           echo "Worktree backup done (fail-open)."
           exit 0
