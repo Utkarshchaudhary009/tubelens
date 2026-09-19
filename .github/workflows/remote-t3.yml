@@ -128,7 +128,9 @@ jobs:
       # and recreated here via `git worktree add` (restore step below).
       # Deleting a worktree via scripts/t3-worktree-delete.sh (which also
       # deletes its backup branch from origin) is final; without its backup
-      # branch there is nothing to restore.
+      # branch there is nothing to restore. If the helper reports that the
+      # remote backup-branch deletion failed, re-run it — restore
+      # recreates any surviving backup/t3code/* ref (fail-open).
       - name: Restore prior work.patch + state.json
         uses: actions/cache/restore@v4
         with:
@@ -652,9 +654,11 @@ jobs:
 
       # Best-effort backup of t3 worktrees so the next chained run can
       # recreate the exact ~/.t3/worktrees/tubelens/t3code-* paths that
-      # state.sqlite references in `worktree_path`. Fail-open: no worktrees
-      # or push failures just mean nothing to restore — always `exit 0`,
-      # never fails the job.
+      # state.sqlite references in `worktree_path`. Uncommitted
+      # (staged/unstaged/untracked) changes are snapshotted into a
+      # machine-only backup commit first, because `git push` transfers
+      # only HEAD. Fail-open: no worktrees or push failures just mean
+      # nothing to restore — always `exit 0`, never fails the job.
       - name: Save t3 worktrees to backup branches
         if: always()
         run: |
@@ -674,6 +678,14 @@ jobs:
                 ;;
             esac
             echo "Backing up worktree $WT -> origin backup/t3code/$ID"
+            # `git push` transfers only HEAD, so snapshot uncommitted work
+            # (staged/unstaged/untracked) into a machine-only backup commit
+            # first; backup refs are never merged. Fail-open throughout.
+            if ! git -C "$WT" diff --quiet HEAD -- 2>/dev/null || [ -n "$(git -C "$WT" ls-files --others --exclude-standard 2>/dev/null)" ]; then
+              git -C "$WT" -c user.name="t3-backup" -c user.email="t3-backup@localhost" add -A 2>/dev/null || true
+              git -C "$WT" -c user.name="t3-backup" -c user.email="t3-backup@localhost" commit -m "t3 backup: snapshot uncommitted work" --no-verify 2>/dev/null || true
+              echo "Snapshotted uncommitted changes in $WT."
+            fi
             git -C "$WT" push origin "HEAD:backup/t3code/$ID" --force-with-lease || true
           done
           echo "Worktree backup done (fail-open)."
