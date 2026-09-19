@@ -1,6 +1,6 @@
 # remote-t3-watchdog — safety net that keeps one remote-t3 session alive.
 #
-# Runs every 30 min: if no remote-t3 run is in_progress/queued, dispatches a
+# Runs every 5 min: if no remote-t3 run is in_progress/queued, dispatches a
 # fresh one on main. Chained remote-t3 runs normally cover this themselves
 # (each run self-chains at the end), so this only fires when a chain dies
 # early (failed save step, expired PAT, workflow re-enabled after a stop).
@@ -11,12 +11,11 @@
 # exits 0 without dispatching, so API hiccups never cause dispatch storms.
 name: remote-t3-watchdog
 
-on: {}
-
-# WORKFLOW TRIGGERS DISABLED: on:
-#   schedule:
-#     - cron: "*/30 * * * *"
-#   workflow_dispatch:
+on:
+  schedule:
+    # GitHub Actions minimum scheduled interval is 5 minutes.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
