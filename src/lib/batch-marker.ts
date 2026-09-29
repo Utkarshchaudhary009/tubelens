@@ -79,12 +79,19 @@ export function getBatchMarkerSecrets(env: Env): string[] {
 }
 
 /**
- * Resolve the marker signing secret (element zero of
- * {@link getBatchMarkerSecrets}); null when unconfigured (children
- * unsigned, normal admission).
+ * Resolve the marker SIGNING secret: current dedicated key, else Clerk
+ * fallback — the rotation-previous key is deliberately excluded (verify
+ * only), so newly started batches never mint with a retired key. Null
+ * when unconfigured (children unsigned, normal admission).
  */
 export function getBatchMarkerSecret(env: Env): string | null {
-  return getBatchMarkerSecrets(env)[0] ?? null;
+  for (const raw of [env.TUBELENS_BATCH_HMAC_KEY, env.CLERK_SECRET_KEY]) {
+    const secret = (raw ?? "").trim();
+    if (secret !== "") {
+      return secret;
+    }
+  }
+  return null;
 }
 
 function payload(method: string, pathQuery: string): string {

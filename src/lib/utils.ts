@@ -965,7 +965,10 @@ export async function executeBatchTasks(
       cacheControl: CACHE_CONTROL.noStore,
     },
   );
-  if (results.some((result) => result.status >= 400)) {
+  // Gated on childCtx: only pipeline-driven executions pass one (the
+  // route always does; the deprecated direct handleBatch never does), so
+  // the internal signal exists exactly where a pipeline wrapper strips it.
+  if (childCtx && results.some((result) => result.status >= 400)) {
     // Internal partial-success signal for the pipeline's usage row (the
     // pipeline strips it before serving — never wire contract).
     response.headers.set(BATCH_PARTIAL_HEADER, "1");

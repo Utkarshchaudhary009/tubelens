@@ -18,6 +18,7 @@ import { anonymousAuthContext } from "../auth";
 import {
   BATCH_CHILD_HEADER,
   getBatchMarkerSecret,
+  getBatchMarkerSecrets,
   mintBatchChildMarker,
   verifyBatchChildMarker,
 } from "../batch-marker";
@@ -32,7 +33,7 @@ import { InMemoryQuotaStore, quotaWindowFor } from "../quota-accounting";
 import type { RateLimitCheck } from "../rate-limit";
 import type { UsageEvent } from "../usage";
 import type { BatchDeps, BatchSubResult, BatchTask } from "../utils";
-import { demoteUnpriceableBatchTasks } from "../utils";
+import { demoteUnpriceableBatchTasks, handleBatch } from "../utils";
 
 const savedOrigin = process.env.TUBELENS_PUBLIC_URL;
 const savedMarkerKey = process.env.TUBELENS_BATCH_HMAC_KEY;
@@ -731,6 +732,24 @@ describe("phase 16 already-billed marker", () => {
         CLERK_SECRET_KEY: "ck",
       }),
     ).toBe("ck");
+    // The rotation-previous key is verify-only: never minted with, even
+    // when the current key is absent.
+    expect(
+      getBatchMarkerSecret({
+        TUBELENS_BATCH_HMAC_PREVIOUS_KEY: "old",
+        CLERK_SECRET_KEY: "ck",
+      }),
+    ).toBe("ck");
+    expect(
+      getBatchMarkerSecret({ TUBELENS_BATCH_HMAC_PREVIOUS_KEY: "old" }),
+    ).toBeNull();
+    expect(
+      getBatchMarkerSecrets({
+        TUBELENS_BATCH_HMAC_KEY: "new",
+        TUBELENS_BATCH_HMAC_PREVIOUS_KEY: "old",
+        CLERK_SECRET_KEY: "ck",
+      }),
+    ).toEqual(["new", "old", "ck"]);
   });
 
   test("verified child skips limiter/quota/usage; forged or keyless markers admit normally", async () => {
@@ -1056,6 +1075,25 @@ describe("phase 16 already-billed marker", () => {
     expect(await authed.json().then((b) => b.data.userId)).toBe("user_42");
     expect(await store.get("user:user_42", windowId)).toBe(2);
     expect(await store.get("anonymous", windowId)).toBe(0);
+  });
+
+  test("legacy handleBatch never leaks the internal partial header", async () => {
+    process.env.TUBELENS_PUBLIC_URL = "http://x";
+    const res = await handleBatch(
+      postReq({
+        requests: [
+          { method: "GET", path: "/api/v1/health" },
+          { method: "POST", path: "/api/v1/health" },
+        ],
+      }),
+      { execute: async () => ({ status: 200, body: { ok: true } }) },
+    );
+    expect(res.status).toBe(200);
+    const results = await res.json().then((b) => b.data.results);
+    expect(results.map((r: { status: number }) => r.status)).toEqual([
+      200, 400,
+    ]);
+    expect(res.headers.get("x-tubelens-batch-partial")).toBeNull();
   });
 
   test("defaultBatchDeps forwards credentials + marker over the pinned sub-fetch", async () => {
