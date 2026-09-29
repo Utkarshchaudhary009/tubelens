@@ -29,6 +29,11 @@ import {
   can,
   toAuthorizationResponse,
 } from "./authorize";
+import {
+  BATCH_CHILD_HEADER,
+  getBatchMarkerSecret,
+  verifyBatchChildMarker,
+} from "./batch-marker";
 import { ConfigError, getConfig } from "./config";
 import { errorResponse } from "./errors";
 import { applyCorsHeaders, applySecurityHeaders } from "./http-headers";
@@ -69,7 +74,11 @@ import {
   type RequestContext,
   resolveRequestId,
 } from "./request-context";
-import { getUsageRecorder, type UsageRecorder } from "./usage";
+import {
+  getUsageRecorder,
+  type UsageChildCost,
+  type UsageRecorder,
+} from "./usage";
 
 export type RouteHandler = (
   req: NextRequest,
@@ -105,6 +114,30 @@ export interface PipelineOptions {
    * byte-identical. Never set in production routes.
    */
   authorizationAction?: AuthorizeAction;
+  /**
+   * Phase 16 batch economics: per-request summed weighted-credit cost that
+   * replaces the catalog's static label cost for THIS admission only. The
+   * batch route prices its children preflight (costForBatch) and passes the
+   * total here, so one batch faces exactly one rate-limit weight and one
+   * quota peek+consume. Must be a finite integer >= 1 (the quota and
+   * limiter stages fail closed below that floor); anything else is
+   * programmer error and fails closed with a typed 500. The operation name
+   * and policy version still come from the catalog.
+   */
+  costOverride?: number;
+  /**
+   * Phase 16 zero-work batches: admitted for auth, rate-limit (weighted by
+   * costOverride), and observability, but EXEMPT from the quota peek and
+   * consume — nothing executed, so nothing is billable. The usage row still
+   * emits with cost 0. Never set for batches that executed children.
+   */
+  quotaExempt?: boolean;
+  /**
+   * Phase 16 batch economics: priced runnable-child summary stamped on the
+   * batch's SINGLE usage row (summed cost + child count + policy version),
+   * never one row per child. Only honored alongside a priced route label.
+   */
+  usageChildren?: UsageChildCost[];
 }
 
 /** Bound for best-effort usage accounting: never delay the response. */
@@ -164,7 +197,9 @@ export async function createRequestContext(
  *     typed 401/403 with rate-limit headers; the default `read:public`
  *     baseline allows every principal),
  *  4. runs the rate-limit check (deny → 429 with decision headers;
- *     liveness bypass honored only on /api/v1/health, else a typed 500),
+ *     liveness bypass honored only on /api/v1/health, else a typed 500;
+ *     `options.costOverride` — Phase 16 batch summed total — replaces the
+ *     static label cost as this admission's single weight),
  *  5. peeks the monthly quota allowance (deny → 429 `quota_exceeded`
  *     with `Retry-After`; rejections consume nothing; liveness bypass
  *     and the free `quota` balance-read label skip the stage),
@@ -174,8 +209,15 @@ export async function createRequestContext(
  *     responses still charge; store failure → typed 503),
  *  8. stamps X-Request-Id / X-RateLimit-* from the limiter decision,
  *     preserving the Part A wire contract (defaults match the old stubs),
- *  9. records a usage event via the (no-op) recorder (accounting stage),
+ *  9. records a usage event via the (no-op) recorder (accounting stage;
+ *     verified already-billed batch children record nothing — the parent's
+ *     single row covers the fan-out),
  *  10. emits trace/log hooks via best-effort observability (never throws).
+ *
+ * Phase 16 verified batch children (server-minted HMAC marker): skip the
+ * rate-limit weight, quota peek/consume, and usage row — the parent batch
+ * admission already charged the summed cost. Unverifiable markers fall
+ * through to normal admission (fail toward charging).
  */
 export function withRequestContext(
   handler: RouteHandler,
@@ -350,8 +392,73 @@ export function withRequestContext(
         });
       }
     }
+    // Phase 16: a per-request cost override (batch summed total) replaces
+    // the static label cost for this admission's rate-limit weight, quota
+    // peek/consume, and usage row. Invalid overrides are programmer error
+    // (like an unpriced label above) and fail closed with a typed 500 —
+    // never free, never silently clamped.
+    if (options.costOverride !== undefined) {
+      const floored = Math.floor(options.costOverride);
+      if (!Number.isFinite(options.costOverride) || floored < 1) {
+        safe(() =>
+          observability.captureError(
+            scrubError(
+              new QuotaPolicyError(
+                "invalid_quota_cost",
+                "Route passed an invalid cost override.",
+              ),
+            ),
+            { requestId: ctx.requestId },
+          ),
+        );
+        span.recordError(
+          scrubError(
+            new QuotaPolicyError(
+              "invalid_quota_cost",
+              "Route passed an invalid cost override.",
+            ),
+          ),
+        );
+        span.end();
+        return errorResponse(ctx.requestId, {
+          code: "internal",
+          message: "Service route misconfigured.",
+          hint: "Report the X-Request-Id; route passed an invalid quota cost.",
+          status: 500,
+          origin,
+        });
+      }
+      operationCost = floored;
+    }
+    // Phase 16 already-billed batch child: the parent batch was admitted
+    // once with the summed child cost, and each child carries a
+    // server-minted HMAC for exactly this method + path. A VERIFIED marker
+    // skips the rate-limit weight, the quota peek/consume, and the usage
+    // row — the parent's single charge and single row cover the whole
+    // fan-out, so re-admitting children would double-charge. A forged
+    // marker, or a marker with no secret configured, is IGNORED (normal
+    // admission below) — fail toward charging, never toward free serving.
+    // Auth, authorization, handler, and headers still apply.
+    let batchChildBilled = false;
+    const childMarker = req.headers.get(BATCH_CHILD_HEADER);
+    if (childMarker) {
+      const secret = getBatchMarkerSecret(providers.env ?? process.env);
+      if (
+        secret &&
+        verifyBatchChildMarker(
+          secret,
+          req.method,
+          req.nextUrl.pathname + req.nextUrl.search,
+          childMarker,
+        )
+      ) {
+        batchChildBilled = true;
+      }
+    }
     let decision: RateLimitDecision;
     if (options.bypassRateLimit) {
+      decision = defaultRateLimitDecision();
+    } else if (batchChildBilled) {
       decision = defaultRateLimitDecision();
     } else {
       try {
@@ -417,8 +524,15 @@ export function withRequestContext(
     let quotaStore: QuotaStore | undefined;
     let quotaCheck: QuotaCheck | undefined;
     let quotaDecision: QuotaDecision | undefined;
+    // Verified batch children skip the peek: the parent already covered
+    // their cost, so there is nothing to peek for and (with quotaStore left
+    // unset) nothing to consume post-response either. Quota-exempt
+    // admissions (zero-work batches) skip for the same mechanical reason:
+    // nothing executed, nothing billable.
     if (
       !options.bypassRateLimit &&
+      !batchChildBilled &&
+      !options.quotaExempt &&
       route !== undefined &&
       operation !== undefined &&
       !QUOTA_FREE_ROUTES.has(route)
@@ -465,6 +579,11 @@ export function withRequestContext(
             windowId: outcome.windowId,
             resetMs: outcome.resetMs,
             allowance: outcome.allowance,
+            // Phase 16: a quota-rejected batch still emits its single row
+            // (summed cost + child summary), marked rejected.
+            ...(options.usageChildren !== undefined
+              ? { children: options.usageChildren }
+              : {}),
           }),
         );
         span.end();
@@ -590,25 +709,41 @@ export function withRequestContext(
     // charge above already completed synchronously in-request, so a dropped
     // macrotask loses at most an observability event, never a charge (Phase
     // 15 separation). No waitUntil is threaded through by design: that would
-    // need new runtime plumbing for zero accounting gain.
-    setTimeout(() => {
-      safe(() => {
-        const controller = new AbortController();
-        return Promise.race([
-          usageRecord(
-            usage,
-            ctx,
-            route,
-            res.ok,
-            controller.signal,
-            observability,
-            quotaDecision,
-            nowMs,
-          ),
-          accountingTimeout(controller),
-        ]);
-      });
-    }, 0);
+    // need new runtime plumbing for zero accounting gain. Verified batch
+    // children record nothing — the parent emits the fan-out's single row,
+    // never one row per child.
+    if (!batchChildBilled) {
+      setTimeout(() => {
+        safe(() => {
+          const controller = new AbortController();
+          return Promise.race([
+            usageRecord(
+              usage,
+              ctx,
+              route,
+              res.ok,
+              controller.signal,
+              observability,
+              quotaDecision,
+              nowMs,
+              // Phase 16: the admitted batch emits ONE row with its summed
+              // cost + child summary (operation/policyVersion still catalog).
+              // Quota-exempt (zero-work) admissions stamp cost 0 — admitted
+              // and throttled, but nothing consumed.
+              {
+                cost: options.quotaExempt
+                  ? 0
+                  : options.costOverride === undefined
+                    ? undefined
+                    : operationCost,
+                children: options.usageChildren,
+              },
+            ),
+            accountingTimeout(controller),
+          ]);
+        });
+      }, 0);
+    }
 
     safe(() =>
       observability.log(
@@ -662,6 +797,7 @@ function usageRecord(
   observability: ObservabilityProvider,
   quota?: QuotaDecision | undefined,
   nowMs: number = Date.now(),
+  accounting?: { cost?: number; children?: UsageChildCost[] },
 ): Promise<void> | void {
   // Phase 13: credit rows stamp the resolved catalog record, and the QUOTA
   // policy version is authoritative for them (not the entitlements
@@ -700,7 +836,9 @@ function usageRecord(
   try {
     const resolved = resolveOperationCost(route);
     operation = resolved.operation;
-    cost = resolved.cost;
+    // Phase 16: a per-request cost override (batch summed total) replaces
+    // the static label cost on this single row.
+    cost = accounting?.cost ?? resolved.cost;
     policyVersion = resolved.policyVersion;
   } catch {
     // Unpriced labels must not mint credit rows — record nothing, but emit
@@ -733,6 +871,11 @@ function usageRecord(
       windowId: window.windowId,
       resetMs: window.resetMs,
       allowance,
+      // Phase 16: one batch row carries its priced-child summary (child
+      // count + per-child costs), never one row per child.
+      ...(accounting?.children !== undefined
+        ? { children: accounting.children }
+        : {}),
     },
     { signal },
   );
