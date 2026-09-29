@@ -321,9 +321,19 @@ describe("phase 16 retry and partial semantics", () => {
     expect(sut.executions()).toBe(2);
     const { windowId } = quotaWindowFor(Date.now());
     expect(await sut.store.get("anonymous", windowId)).toBe(4);
+    // Failed children degrade the usage row to partial (telemetry history
+    // only — the summed charge already landed), with the full child
+    // summary; the internal signal never reaches the wire.
+    expect(res.headers.get("x-tubelens-batch-partial")).toBeNull();
     await flushAccounting();
     expect(sut.events).toHaveLength(1);
-    expect(sut.events[0]).toMatchObject({ cost: 4, outcome: "accepted" });
+    expect(sut.events[0]).toMatchObject({
+      route: "batch",
+      operation: "batch.execute",
+      cost: 4,
+      policyVersion: QUOTA_POLICY_VERSION,
+      outcome: "partial",
+    });
     expect(sut.events[0]?.children).toHaveLength(2);
   });
 
@@ -428,7 +438,8 @@ describe("phase 16 review fixes: zero-work bypass and per-item pricing", () => {
     // Quota-exempt: the store total is untouched...
     const { windowId } = quotaWindowFor(Date.now());
     expect(await sut.store.get("anonymous", windowId)).toBe(0);
-    // ...and the single usage row honestly stamps the zero charge.
+    // ...and the single usage row honestly stamps the zero charge. Every
+    // child failed, so the row is partial — same rule as runnable batches.
     await flushAccounting();
     expect(sut.events).toHaveLength(1);
     expect(sut.events[0]).toMatchObject({
@@ -436,7 +447,7 @@ describe("phase 16 review fixes: zero-work bypass and per-item pricing", () => {
       operation: "batch.execute",
       cost: 0,
       policyVersion: QUOTA_POLICY_VERSION,
-      outcome: "accepted",
+      outcome: "partial",
     });
     expect(sut.events[0]?.children).toEqual([]);
   });
@@ -648,6 +659,13 @@ describe("phase 16 already-billed marker", () => {
         CLERK_SECRET_KEY: "ck",
       }),
     ).toBe("ded");
+    // A blank dedicated key never shadows a valid fallback.
+    expect(
+      getBatchMarkerSecret({
+        TUBELENS_BATCH_HMAC_KEY: "  ",
+        CLERK_SECRET_KEY: "ck",
+      }),
+    ).toBe("ck");
   });
 
   test("verified child skips limiter/quota/usage; forged or keyless markers admit normally", async () => {
@@ -840,6 +858,110 @@ describe("phase 16 already-billed marker", () => {
     expect(plain.status).toBe(200);
     expect(await store.get("anonymous", windowId)).toBe(3);
     expect(childLimiter).toHaveLength(1);
+  });
+
+  test("signer honors the injected pipeline env, not just process.env", async () => {
+    delete process.env.TUBELENS_BATCH_HMAC_KEY;
+    process.env.TUBELENS_PUBLIC_URL = "http://x";
+    let captured: Record<string, string> = {};
+    const run = createBatchHandler(
+      {
+        execute: async (_u, _r, _s, extra) => {
+          captured = { ...(extra ?? {}) };
+          return { status: 200, body: { ok: true } };
+        },
+      },
+      {
+        auth: { resolve: async () => ({ ...anonymousAuthContext }) },
+        quotaStore: new InMemoryQuotaStore(),
+        env: { TUBELENS_BATCH_HMAC_KEY: MARKER_TEST_SECRET },
+      },
+    );
+    const res = await run(
+      postReq({ requests: [{ method: "GET", path: "/api/v1/health" }] }),
+    );
+    expect(res.status).toBe(200);
+    // Mint and verify must agree on the environment: a providers.env-only
+    // secret still signs children the pipeline (same env) accepts.
+    expect(
+      verifyBatchChildMarker(
+        MARKER_TEST_SECRET,
+        "GET",
+        "/api/v1/health",
+        captured[BATCH_CHILD_HEADER] as string,
+      ),
+    ).toBe(true);
+  });
+
+  test("forwarded credentials resolve the caller principal in the child", async () => {
+    process.env.TUBELENS_BATCH_HMAC_KEY = MARKER_TEST_SECRET;
+    process.env.TUBELENS_PUBLIC_URL = "http://x";
+    const TOKEN = "Bearer user_42_token";
+    // Test double for Clerk: this bearer maps to user_42, anything else
+    // resolves anonymous.
+    const mappingAuth = {
+      resolve: async (req: Request) =>
+        req.headers.get("authorization") === TOKEN
+          ? {
+              ...anonymousAuthContext,
+              type: "user" as const,
+              authenticated: true,
+              userId: "user_42",
+            }
+          : { ...anonymousAuthContext },
+    };
+    const store = new InMemoryQuotaStore();
+    let captured: Record<string, string> = {};
+    const run = createBatchHandler(
+      {
+        execute: async (_u, _r, _s, extra) => {
+          captured = { ...(extra ?? {}) };
+          return { status: 200, body: { ok: true } };
+        },
+      },
+      { auth: mappingAuth, quotaStore: store },
+    );
+    const res = await run(
+      postReq(
+        { requests: [{ method: "GET", path: "/api/v1/health" }] },
+        "p16-authed",
+        false,
+        { authorization: TOKEN },
+      ),
+    );
+    expect(res.status).toBe(200);
+    expect(captured.authorization).toBe(TOKEN);
+    const { windowId } = quotaWindowFor(Date.now());
+    // Parent charged the caller's bucket, not the shared anonymous one.
+    expect(await store.get("user:user_42", windowId)).toBe(1);
+    expect(await store.get("anonymous", windowId)).toBe(0);
+
+    // Re-drive a child through the real pipeline with exactly the captured
+    // headers: the forwarded credential must resolve the same principal,
+    // so the charge lands on the caller's bucket (a forwarding break would
+    // misattribute it to anonymous instead).
+    const driveChild = withRequestContext(
+      async (_r, ctx) =>
+        successResponse(
+          { userId: ctx.auth.userId ?? null },
+          { requestId: ctx.requestId },
+        ),
+      {
+        auth: mappingAuth,
+        quotaStore: store,
+        env: { TUBELENS_BATCH_HMAC_KEY: MARKER_TEST_SECRET },
+      },
+      "search",
+    );
+    const authed = await driveChild(
+      new NextRequest("http://x/api/v1/search?q=lofi", {
+        headers: { authorization: captured.authorization as string },
+      }),
+    );
+    expect(authed.status).toBe(200);
+    expect(await authed.json().then((b) => b.data.userId)).toBe("user_42");
+    expect(await store.get("user:user_42", windowId)).toBe(2);
+    expect(await store.get("anonymous", windowId)).toBe(0);
   });
 
   test("defaultBatchDeps forwards credentials + marker over the pinned sub-fetch", async () => {

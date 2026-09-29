@@ -31,6 +31,7 @@ import {
 } from "./authorize";
 import {
   BATCH_CHILD_HEADER,
+  BATCH_PARTIAL_HEADER,
   getBatchMarkerSecret,
   verifyBatchChildMarker,
 } from "./batch-marker";
@@ -606,8 +607,18 @@ export function withRequestContext(
     }
 
     let res: NextResponse;
+    // Batch-only internal signal: any failed child degrades the usage row
+    // to `partial` (telemetry history only — the quota charge already
+    // landed via the store, which keys on `accepted` rows it writes
+    // itself). Read from the handler-built response, then strip so the
+    // wire contract stays byte-identical.
+    let batchPartial = false;
     try {
       res = await handler(req, ctx);
+      if (res.headers.get(BATCH_PARTIAL_HEADER) === "1") {
+        batchPartial = true;
+        res.headers.delete(BATCH_PARTIAL_HEADER);
+      }
     } catch (err) {
       safe(() =>
         observability.captureError(scrubError(err), {
@@ -737,6 +748,7 @@ export function withRequestContext(
                     ? undefined
                     : operationCost,
                 children: options.usageChildren,
+                partial: batchPartial,
               },
             ),
             accountingTimeout(controller),
@@ -797,7 +809,11 @@ function usageRecord(
   observability: ObservabilityProvider,
   quota?: QuotaDecision | undefined,
   nowMs: number = Date.now(),
-  accounting?: { cost?: number; children?: UsageChildCost[] },
+  accounting?: {
+    cost?: number;
+    children?: UsageChildCost[];
+    partial?: boolean;
+  },
 ): Promise<void> | void {
   // Phase 13: credit rows stamp the resolved catalog record, and the QUOTA
   // policy version is authoritative for them (not the entitlements
@@ -806,7 +822,14 @@ function usageRecord(
   // the ledger can explain balances without re-deriving policy. The window
   // derives from the request's single `nowMs` (never a fresh clock), and
   // the principal is the quota principal — identical to the store key.
-  const outcome = ok ? "accepted" : "rejected";
+  // A 200 envelope with failed children is partial success, not full:
+  // batch rows then carry `partial` (history only — balances sum the
+  // store-written `accepted` rows, never these telemetry rows).
+  const outcome = !ok
+    ? "rejected"
+    : accounting?.partial
+      ? "partial"
+      : "accepted";
   const principal = quotaPrincipal(ctx);
   const window = quota
     ? { windowId: quota.windowId, resetMs: quota.resetMs }

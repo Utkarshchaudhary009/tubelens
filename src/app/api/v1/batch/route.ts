@@ -101,8 +101,13 @@ let warnedMissingMarkerSecret = false;
  * (tracked follow-up #34) — a silent double-charge. The first batch per
  * process logs a warn so the misconfiguration is visible in instance logs.
  */
-function batchChildSigner(): ((childUrl: string) => string | null) | undefined {
-  const secret = getBatchMarkerSecret(process.env);
+function batchChildSigner(
+  env: Record<string, string | undefined> = process.env,
+): ((childUrl: string) => string | null) | undefined {
+  // Same environment the pipeline verifies against (providers.env when
+  // injected, else process.env) — mint and verify must agree, or every
+  // child falls through to normal admission and double-charges.
+  const secret = getBatchMarkerSecret(env);
   if (!secret) {
     if (!warnedMissingMarkerSecret) {
       warnedMissingMarkerSecret = true;
@@ -170,7 +175,7 @@ export function createBatchHandler(
     const admitted = preflight.value;
     const childCtx: BatchChildContext = {
       forwardedHeaders: callerCredentialHeaders(req),
-      signChild: batchChildSigner(),
+      signChild: batchChildSigner(providers.env ?? process.env),
     };
     // Zero-work batches admit at the limiter floor (weight 1) with quota
     // exemption: throttled and observed like any admission, but consuming

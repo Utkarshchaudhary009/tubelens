@@ -10,7 +10,7 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { type AuthContext, anonymousAuthContext } from "@/lib/auth";
-import { BATCH_CHILD_HEADER } from "@/lib/batch-marker";
+import { BATCH_CHILD_HEADER, BATCH_PARTIAL_HEADER } from "@/lib/batch-marker";
 import { cached } from "@/lib/cache";
 import {
   classifyChannelError,
@@ -942,13 +942,19 @@ export async function executeBatchTasks(
   }
 
   // Private: the composed page is caller-specific, never CDN-shared.
-  return successResponse(
+  const response = successResponse(
     { results },
     {
       requestId,
       cacheControl: CACHE_CONTROL.noStore,
     },
   );
+  if (results.some((result) => result.status >= 400)) {
+    // Internal partial-success signal for the pipeline's usage row (the
+    // pipeline strips it before serving — never wire contract).
+    response.headers.set(BATCH_PARTIAL_HEADER, "1");
+  }
+  return response;
 }
 
 /**

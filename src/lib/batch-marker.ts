@@ -39,17 +39,30 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 /** Header carrying the already-billed marker on batch-child sub-requests. */
 export const BATCH_CHILD_HEADER = "x-tubelens-batch-child";
 
+/**
+ * Internal partial-success signal: `executeBatchTasks` sets it on the
+ * admitted 200 when any child result is status >= 400, and the pipeline
+ * reads it for the usage row's `partial` outcome, then STRIPS it — never
+ * part of the wire contract. Read from the handler-built RESPONSE only, so
+ * client request headers can never inject it.
+ */
+export const BATCH_PARTIAL_HEADER = "x-tubelens-batch-partial";
+
 const HMAC_DOMAIN = "tubelens-batch-child:v1";
 
 type Env = Record<string, string | undefined>;
 
 /**
- * Resolve the marker signing secret. Dedicated key wins, Clerk secret
- * falls back; blank/missing → null (children unsigned, normal admission).
+ * Resolve the marker signing secret. First non-blank value wins (dedicated
+ * key, then Clerk fallback — the same alias-resolution rule as config.ts,
+ * so a blank dedicated key never shadows a valid fallback); blank/missing
+ * → null (children unsigned, normal admission).
  */
 export function getBatchMarkerSecret(env: Env): string | null {
-  const raw = env.TUBELENS_BATCH_HMAC_KEY ?? env.CLERK_SECRET_KEY;
-  const secret = (raw ?? "").trim();
+  const secret =
+    [env.TUBELENS_BATCH_HMAC_KEY, env.CLERK_SECRET_KEY]
+      .find((value) => value !== undefined && value.trim() !== "")
+      ?.trim() ?? "";
   return secret === "" ? null : secret;
 }
 
