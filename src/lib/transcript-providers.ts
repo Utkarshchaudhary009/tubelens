@@ -1,8 +1,9 @@
 // Dictionary-driven transcript provider registry (Phase 2 plan, TRANSCRIPT_PROVIDERS).
 //
 // Adding a provider is one dict entry — no route edits. Array order is chain
-// order (innertube fast path first, then the youtube-cli doc/plan.md:28-35
-// waterfall). Each entry declares everything the generic runner needs:
+// order (the cost-zero tts-test experiment first when configured, then the
+// innertube fast path, then the youtube-cli doc/plan.md:28-35 waterfall).
+// Each entry declares everything the generic runner needs:
 // request shape, parse mapping, lang handling, per-step budget, key, and kill
 // switch. Pure fetch-based helpers (no server-only imports) stay
 // unit-testable; callers inject fetchNative/fetchFn in tests.
@@ -27,7 +28,11 @@ export interface TranscriptProviderDef {
   /** Which shared parser runs (native dispatches to fetchNative). */
   kind: TranscriptProviderKind;
   method: "GET" | "POST";
-  url: (id: string, lang: string) => string;
+  url: (
+    id: string,
+    lang: string,
+    env?: Record<string, string | undefined>,
+  ) => string;
   params?: (id: string, lang: string) => Record<string, string>;
   body?: (id: string, lang: string) => unknown;
   headers?: Record<string, string> | ((id: string) => Record<string, string>);
@@ -43,6 +48,23 @@ export interface TranscriptProviderDef {
   timeoutMs: number;
   /** When set, the entry is skipped if `env[apiKeyEnv]` is unset. */
   apiKeyEnv?: string;
+  /**
+   * When set, the entry's base URL comes from `env[baseUrlEnv]` (third `url`
+   * arg); unset/empty/non-https bases skip the entry silently, same as the
+   * apiKeyEnv pattern. Never a per-request Blob/tunnel read.
+   */
+  baseUrlEnv?: string;
+  /** Raw offset/duration units; `"s"` pre-multiplies x1000 (default `"ms"`). */
+  units?: "ms" | "s";
+  /** Skip silently when the remaining overall budget is below this (tail). */
+  minRemainingMs?: number;
+  /**
+   * When true, this entry never short-circuits the chain with video_not_found:
+   * its 404s soften to transcript_unavailable fall-through (stale stays
+   * eligible). For ephemeral helpers whose 404s describe tunnel/helper state,
+   * not the video — only the native fast path may declare a video dead.
+   */
+  fallThrough404?: boolean;
   /** Per-provider kill switch, no route edit to flip. */
   enabled: boolean;
 }
@@ -61,6 +83,42 @@ const watchUrl = (id: string): string =>
   `https://www.youtube.com/watch?v=${id}`;
 
 export const TRANSCRIPT_PROVIDERS: TranscriptProviderDef[] = [
+  {
+    name: "tts-test",
+    kind: "json",
+    method: "GET",
+    // Optional cost-zero experiment: base comes from TTS_TRANSCRIPT_URL
+    // (validated https in the runner); unset/empty disables silently.
+    // Chain head: when configured it runs before the Innertube fast path.
+    // Hangs burn at most the capped 3s step (never stall the tail beyond
+    // stepMs); transient 429/5xx fall through immediately with Retry-After
+    // preserved, and 404s never short-circuit (fallThrough404 below).
+    url: (id, lang, env) => {
+      const base = ((env ?? process.env).TTS_TRANSCRIPT_URL ?? "")
+        .trim()
+        .replace(/\/+$/, "");
+      return `${base}/transcript/${encodeURIComponent(id)}?lang=${encodeURIComponent(lang)}`;
+    },
+    parse: {
+      segmentsPath: "transcript",
+      textField: "text",
+      offsetField: "start",
+      durationField: "duration",
+    },
+    lang: "best-effort",
+    timeoutMs: 3000,
+    baseUrlEnv: "TTS_TRANSCRIPT_URL",
+    // tts-test serves seconds floats; normalizeSegments expects ms.
+    units: "s",
+    // Budget floor: as chain head it always has budget, so the guard passes;
+    // kept so the entry stays tail-safe if reordered later.
+    minRemainingMs: 1500,
+    // Ephemeral tunnel: a 404 (stale Blob URL, cold helper cache, missing
+    // captions) must never short-circuit the tail or disable stale — only
+    // Innertube may declare a video private/deleted.
+    fallThrough404: true,
+    enabled: true,
+  },
   {
     name: "innertube",
     kind: "native",
@@ -580,22 +638,26 @@ function throwForHttpStatus(
 }
 
 /** Registry-wide SSRF pin for the HTTP providers (mirrors every `url()`
- * entry below; extend it when a provider host is added or retired). A new
- * entry's own host is additionally pinned per-request (providerPin), so the
- * chain enforces the boundary before this list is extended. */
+ * entry below; extend it when a provider host is added or retired). The
+ * `.trycloudflare.com` suffix covers the tts-test experiment's dynamic
+ * tunnel host; a new entry's own host is additionally pinned per-request
+ * (providerPin), so the chain enforces the boundary before this list is
+ * extended. */
 export const TRANSCRIPT_PROVIDER_HOSTS = [
   "yttools.co",
   "youtube-transcript.ai",
   "kome.ai",
   "api.supadata.ai",
+  ".trycloudflare.com",
 ];
 
 /**
  * The listing fetch's own declared host (a code constant per dict entry).
- * Unioned with TRANSCRIPT_PROVIDER_HOSTS at the call site so a new entry
- * still needs no route edit — its first hop is pinned to its own host while
- * every redirect hop re-validates against the union. Unparseable endpoints
- * contribute nothing (checkUrl rejects them first).
+ * Pinned strictly per-request at the call site — the first hop must match
+ * the entry's own host, and redirect hops re-validate against the same pin;
+ * TRANSCRIPT_PROVIDER_HOSTS is only the fallback when the endpoint is
+ * unparseable (checkUrl rejects those first). A new entry still needs no
+ * route edit: its first hop is pinned to its own host automatically.
  */
 function providerPin(endpoint: string): string[] {
   try {
@@ -604,6 +666,38 @@ function providerPin(endpoint: string): string[] {
   } catch {
     return [];
   }
+}
+
+/** True only for absolute https bases (experiment env pointers). */
+function isHttpsBase(base: string): boolean {
+  try {
+    const u = new URL(base.trim());
+    return u.protocol === "https:" && u.hostname !== "";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Seconds-unit providers (tts-test serves seconds floats) scaled to the ms
+ * shape normalizeSegments expects. Non-object items pass through; non-finite
+ * fields keep their raw value so the normalizer drops them as usual.
+ */
+function scaleSecondsToMs(items: unknown[], parse: ParseMapping): unknown[] {
+  return items.map((item) => {
+    if (typeof item !== "object" || item === null) {
+      return item;
+    }
+    const o = item as Record<string, unknown>;
+    const out = { ...o };
+    for (const f of [parse.offsetField, parse.durationField]) {
+      const n = toFiniteNumber(o[f]);
+      if (n !== undefined) {
+        out[f] = n * 1000;
+      }
+    }
+    return out;
+  });
 }
 
 /**
@@ -791,7 +885,7 @@ async function runHttpProvider(
   // remaining step budget (never a fresh full timeout on top of the first).
   const nowFn = deps.now ?? Date.now;
   const stepStarted = nowFn();
-  let endpoint = def.url(id, lang);
+  let endpoint = def.url(id, lang, env);
   if (def.params) {
     try {
       const u = new URL(endpoint);
@@ -898,7 +992,10 @@ async function runHttpProvider(
   }
   // Strict mismatch throws (falls through); best-effort keeps first-available.
   const filtered = filterByLang(payload, lang, def.lang);
-  const segments = normalizeSegments(filtered, def.parse);
+  const segments = normalizeSegments(
+    def.units === "s" ? scaleSecondsToMs(filtered, def.parse) : filtered,
+    def.parse,
+  );
   if (segments.length === 0) {
     throw new Error(
       `transcript_unavailable: ${def.name} returned no transcript segments`,
@@ -1065,6 +1162,14 @@ export async function runTranscriptWaterfall(
     if (def.apiKeyEnv && !env[def.apiKeyEnv]) {
       continue;
     }
+    // Base-URL experiments (tts-test) are disabled by default: unset, empty,
+    // or non-https bases skip silently — never a fetch, never a 500.
+    if (def.baseUrlEnv) {
+      const base = (env[def.baseUrlEnv] ?? "").trim();
+      if (base === "" || !isHttpsBase(base)) {
+        continue;
+      }
+    }
     const remaining = budgetMs - (now() - started);
     if (remaining <= 0) {
       const err = new Error(`Upstream timed out after ${budgetMs}ms`);
@@ -1072,6 +1177,11 @@ export async function runTranscriptWaterfall(
       firstErr ??= err;
       firstTransientErr ??= err;
       break;
+    }
+    // Budget floor: entries with a floor (tts-test) yield when the
+    // remaining overall budget is too thin for a useful attempt.
+    if (def.minRemainingMs !== undefined && remaining < def.minRemainingMs) {
+      continue;
     }
     const stepMs = Math.min(def.timeoutMs, remaining);
     try {
@@ -1089,9 +1199,18 @@ export async function runTranscriptWaterfall(
       );
     } catch (err) {
       // No provider can resurrect a private/deleted video — short-circuit and
-      // (via the route's predicate) never serve stale for it.
+      // (via the route's predicate) never serve stale for it. Ephemeral
+      // helpers (fallThrough404) never make that call: their 404s describe
+      // tunnel/helper state, so they soften to transcript_unavailable and the
+      // chain falls through with stale still eligible.
       if (classifyTranscriptError(err).code === "video_not_found") {
-        throw err;
+        if (!def.fallThrough404) {
+          throw err;
+        }
+        firstErr ??= new Error(
+          `transcript_unavailable: ${def.name} reported this video as unavailable`,
+        );
+        continue;
       }
       firstErr ??= err;
       if (isTransientError(err)) {

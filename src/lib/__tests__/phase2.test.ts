@@ -15,10 +15,12 @@ import {
   mapRelatedItem,
   mapTranscriptSegment,
 } from "../mappers";
+import { clearTunnelCache } from "../tunnel-cache";
 
 beforeEach(() => {
   clearCache();
   clearContinuations();
+  clearTunnelCache();
 });
 
 function req(url: string, requestId = "phase2"): NextRequest {

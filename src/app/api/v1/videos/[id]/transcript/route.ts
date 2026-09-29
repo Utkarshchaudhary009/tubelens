@@ -1,5 +1,5 @@
 import type { NextRequest, NextResponse } from "next/server";
-import { cached } from "@/lib/cache";
+import { cached, cacheGet } from "@/lib/cache";
 import { CACHE_CONTROL, getRequestId, successResponse } from "@/lib/envelope";
 import { errorResponse } from "@/lib/errors";
 import {
@@ -12,6 +12,12 @@ import {
   type FetchLike,
   runTranscriptWaterfall,
 } from "@/lib/transcript-providers";
+import {
+  getCachedTunnelUrl,
+  isTunnelUrl,
+  resolveTunnelUrl,
+  TUNNEL_RESOLVE_BUDGET_MS,
+} from "@/lib/tunnel-cache";
 import { isPlausibleVideoId, parseLang, parseRegion } from "@/lib/validate";
 
 export const runtime = "nodejs";
@@ -221,7 +227,7 @@ export async function GET(
 // stale copy); a stale non-empty copy is served as 200 + `stale_served`
 // regardless of the fresh outcome, and only a cold-miss empty is 404. A
 // legacy stale-empty copy is still 404 — empties are never served as 200.
-// Waterfall contract: the registry chain (innertube -> yttools ->
+// Waterfall contract: the registry chain (tts-test -> innertube -> yttools ->
 // youtube-transcript-ai -> kome -> supadata) runs under a SINGLE overall
 // withTimeout(8000) around fast-path + chain combined (never stacked
 // per-step budgets; each entry clamps to the remaining budget). First
@@ -263,6 +269,39 @@ export async function handleTranscript(
   const withTimeout =
     deps.withTimeout ??
     (deps.fetchNative ? localWithTimeout : defaultWithTimeout);
+  // tts-test base resolution (zero Blob on the hot path): sync memory hit or
+  // env pointer first; a budget-bounded Blob get only when neither carries a
+  // valid tunnel URL and Blob is configured. Fresh L0 hits never run the
+  // waterfall, so they skip resolution entirely and never wait on Blob. The
+  // resolved base is injected via env so the provider's sync url() never
+  // awaits Blob; resolution never throws, so a missing/unreachable URL just
+  // disables the head entry silently.
+  const baseEnv = deps.env ?? process.env;
+  let envForWaterfall = deps.env;
+  try {
+    const envUrl = (baseEnv.TTS_TRANSCRIPT_URL ?? "").trim();
+    let ttsBase = getCachedTunnelUrl("transcript") ?? envUrl;
+    const l0 = cacheGet<CachedTranscript>(cacheKey);
+    if (l0 && !l0.stale) {
+      // Fresh hit: the fetcher below never runs — no Blob, no waterfall.
+      ttsBase = isTunnelUrl(ttsBase) ? ttsBase : "";
+    } else if (!isTunnelUrl(ttsBase) && process.env.BLOB_READ_WRITE_TOKEN) {
+      const { readTunnelRecord } = await import("@/lib/tunnel-blob");
+      const resolved = await resolveTunnelUrl("transcript", {
+        envUrl,
+        read: () => readTunnelRecord("transcript"),
+        timeoutMs: TUNNEL_RESOLVE_BUDGET_MS,
+      });
+      if (resolved !== undefined) {
+        ttsBase = resolved;
+      }
+    }
+    if (isTunnelUrl(ttsBase)) {
+      envForWaterfall = { ...baseEnv, TTS_TRANSCRIPT_URL: ttsBase };
+    }
+  } catch {
+    // URL resolution must never fail the transcript request.
+  }
   try {
     const result = await cached<CachedTranscript>(
       cacheKey,
@@ -278,7 +317,7 @@ export async function handleTranscript(
             fetchNative,
             fetchFn: deps.fetchFn,
             resolveFn,
-            env: deps.env,
+            env: envForWaterfall,
           });
           if (out.segments.length === 0) {
             throw new Error("transcript_unavailable: no transcript segments");

@@ -72,6 +72,16 @@ _WATCH_ID_RES = (
 # Longest text we will synthesize (early 400 beyond this, before any I/O).
 MAX_TEXT_LEN = 500
 
+# Bounded ?lang= tags only (e.g. "en", "en-us"): anything else falls back to
+# "en" so junk input cannot churn the transcript cache with junk keys.
+_LANG_RE = re.compile(r"^[A-Za-z]{2,8}(-[A-Za-z]{2,8})?$")
+
+
+def normalize_lang(raw: str | None) -> str:
+    """Clamp ?lang= to a bounded lowercase tag, else "en"."""
+    lang = (raw or "").strip().lower()
+    return lang if _LANG_RE.match(lang) else "en"
+
 # Shared pool for blocking calls (transcript HTTP, fallback beep synthesis).
 # Sized for 100+ parallel clients; the loop itself never blocks.
 _EXEC = concurrent.futures.ThreadPoolExecutor(max_workers=100, thread_name_prefix="tts")
@@ -246,13 +256,19 @@ def extract_video_id_from_url(url: str) -> str | None:
     return None
 
 
-def fetch_transcript(video_id: str) -> list[dict]:
+def fetch_transcript(video_id: str, lang: str = "en") -> list[dict]:
     """Fetch captions via youtube-transcript-api, normalized to text/start/duration.
+
+    Best-effort language (mirrors the registry's best-effort mode): the
+    requested language first, then English, so an en-only video still serves
+    a non-en request instead of 404ing.
 
     Supports both the >=1.x instance API (YouTubeTranscriptApi().fetch) and
     the legacy static API (YouTubeTranscriptApi.get_transcript).
     Raises RuntimeError when the package is not installed.
     """
+    lang = normalize_lang(lang)
+    languages = [lang] if lang == "en" else [lang, "en"]
     try:
         from youtube_transcript_api import YouTubeTranscriptApi  # type: ignore
     except ImportError as e:
@@ -262,11 +278,11 @@ def fetch_transcript(video_id: str) -> list[dict]:
     if hasattr(YouTubeTranscriptApi, "fetch"):
         # Some releases expose fetch as instance method, some as static.
         try:
-            raw = YouTubeTranscriptApi().fetch(video_id, languages=["en"])  # type: ignore[attr-defined]
+            raw = YouTubeTranscriptApi().fetch(video_id, languages=languages)  # type: ignore[attr-defined]
         except TypeError:
-            raw = YouTubeTranscriptApi.fetch(video_id, languages=["en"])  # type: ignore[attr-defined]
+            raw = YouTubeTranscriptApi.fetch(video_id, languages=languages)  # type: ignore[attr-defined]
     elif hasattr(YouTubeTranscriptApi, "get_transcript"):
-        raw = YouTubeTranscriptApi.get_transcript(video_id, languages=["en"])  # type: ignore[attr-defined]
+        raw = YouTubeTranscriptApi.get_transcript(video_id, languages=languages)  # type: ignore[attr-defined]
     else:  # pragma: no cover - defensive for unknown future API shapes
         raise RuntimeError("installed youtube-transcript-api has no fetch/get_transcript API")
 
@@ -501,35 +517,44 @@ async def _transcript(video_id: str, request: Request) -> JSONResponse:
     video_id, err = _resolve_video_id(video_id, request)
     if err is not None or not video_id:
         return err or _json(400, {"error": "invalid request"})
+    lang = normalize_lang(request.query_params.get("lang", ""))
 
     release = await _guarded("transcript")
     try:
-        cached = await _cache_get(video_id)
-        if cached is not None:
+        cache_key = f"{video_id}:{lang}"
+        cached = await _cache_get(cache_key)
+        if cached is None:
+            loop = asyncio.get_running_loop()
+            try:
+                transcript = await asyncio.wait_for(
+                    loop.run_in_executor(_EXEC, lambda: fetch_transcript(video_id, lang)),
+                    timeout=UPSTREAM_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                return _json(
+                    504,
+                    {
+                        "error": "transcript upstream timed out",
+                        "hint": "YouTube timedtext took >8s; retry shortly",
+                    },
+                )
+            await _cache_put(cache_key, transcript)
+        else:
+            transcript = cached
+        if len(transcript) == 0:
+            # Empty is a direct 404 (never a 200 with transcript:[]), so the
+            # caller falls through without a wasted cold-miss hop.
             return _json(
-                200,
-                {"videoId": video_id, "transcript": cached, "cached": True},
-                {"Cache-Control": "public, max-age=600, stale-while-revalidate=60", "X-Cache": "HIT"},
-            )
-        loop = asyncio.get_running_loop()
-        try:
-            transcript = await asyncio.wait_for(
-                loop.run_in_executor(_EXEC, lambda: fetch_transcript(video_id)),
-                timeout=UPSTREAM_TIMEOUT_S,
-            )
-        except asyncio.TimeoutError:
-            return _json(
-                504,
+                404,
                 {
-                    "error": "transcript upstream timed out",
-                    "hint": "YouTube timedtext took >8s; retry shortly",
+                    "error": "no transcript segments available for this video",
+                    "hint": "captions may be disabled, auto-generated only, age-restricted, private, or the video is unavailable",
                 },
             )
-        await _cache_put(video_id, transcript)
         return _json(
             200,
-            {"videoId": video_id, "transcript": transcript, "cached": False},
-            {"Cache-Control": "public, max-age=600, stale-while-revalidate=60", "X-Cache": "MISS"},
+            {"videoId": video_id, "transcript": transcript, "cached": cached is not None},
+            {"Cache-Control": "public, max-age=600, stale-while-revalidate=60", "X-Cache": "HIT" if cached is not None else "MISS"},
         )
     except RuntimeError as e:
         return _json(502, {"error": str(e), "hint": "pip install -r tts-test/requirements.txt"})
