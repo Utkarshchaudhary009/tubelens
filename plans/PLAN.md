@@ -604,7 +604,7 @@ principal model.
 
 ## Phase 16 — Batch protection and partial-abuse resistance
 
-**Status:** `[ ]` not started.
+**Status:** `[x]` done — shipped via PR #39 (merged 2026-09-29): preflight-priced single summed pipeline admission (count 10 + cost 20 gates, quota-exempt zero-work floor, backslash pricing guard), server-minted HMAC already-billed child markers with rotation-previous verification, caller-credential forwarding, frozen partial semantics (`partial` usage rows, never whole-batch 502), deterministic retry re-charge, with 1127 unit tests + e2e PASS on live upstream.
 
 **Build:** Define deterministic batch semantics: maximum child count, maximum total weighted cost, preflight vs incremental charging, partial-failure behavior, and response accounting. Prevent a batch from bypassing per-operation limits or turning one network call into unlimited upstream work.
 
