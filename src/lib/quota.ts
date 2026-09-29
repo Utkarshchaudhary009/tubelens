@@ -50,7 +50,8 @@ export type QuotaPolicyErrorCode =
   | "unknown_operation"
   | "unknown_policy_version"
   | "batch_cost_exceeded"
-  | "invalid_batch";
+  | "invalid_batch"
+  | "invalid_quota_cost";
 
 /** Typed policy failure — never a bare Error, never a silent free pass. */
 export class QuotaPolicyError extends Error {

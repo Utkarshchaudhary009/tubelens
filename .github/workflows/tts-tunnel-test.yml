@@ -2,8 +2,10 @@
 # Trigger: Actions tab -> tts-tunnel-test -> Run workflow. Job stays alive ~30 min.
 name: tts-tunnel-test
 
-on:
-  workflow_dispatch:
+on: {}
+
+# WORKFLOW TRIGGERS DISABLED: on:
+#   workflow_dispatch:
 
 jobs:
   tunnel:

@@ -1,6 +1,10 @@
 // L0 in-memory cache: tiny TTL Map with stale-while-revalidate semantics.
 // $0 ladder level L0 — dedupes hot keys within one instance. L1 is handled
 // via Cache-Control headers set per route (see lib/envelope.ts).
+//
+// Phase 15 separation: L0 holds DERIVED upstream payloads only — never
+// allowance, ledger, or limiter state. clearCache() therefore cannot delete
+// accounting history by construction (it clears this Map + inflight only).
 
 interface Entry {
   value: unknown;

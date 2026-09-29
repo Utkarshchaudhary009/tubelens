@@ -1,0 +1,142 @@
+{
+  "id": "026a094a-8351-4f29-bb69-311bddf040b6",
+  "prevId": "92083e8f-6b88-4154-924c-dddc68276ae6",
+  "version": "7",
+  "dialect": "postgresql",
+  "tables": {
+    "public.usage_ledger": {
+      "name": "usage_ledger",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "serial",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "principal": {
+          "name": "principal",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "tier": {
+          "name": "tier",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "operation": {
+          "name": "operation",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "cost": {
+          "name": "cost",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "policy_version": {
+          "name": "policy_version",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "window_id": {
+          "name": "window_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "outcome": {
+          "name": "outcome",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "request_id": {
+          "name": "request_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "billing_key": {
+          "name": "billing_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "usage_ledger_principal_window_idx": {
+          "name": "usage_ledger_principal_window_idx",
+          "columns": [
+            {
+              "expression": "principal",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "window_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "outcome",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "usage_ledger_billing_key_uid": {
+          "name": "usage_ledger_billing_key_uid",
+          "nullsNotDistinct": false,
+          "columns": ["billing_key"]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "usage_ledger_cost_nonnegative": {
+          "name": "usage_ledger_cost_nonnegative",
+          "value": "\"usage_ledger\".\"cost\" >= 0"
+        },
+        "usage_ledger_outcome_values": {
+          "name": "usage_ledger_outcome_values",
+          "value": "\"usage_ledger\".\"outcome\" IN ('accepted', 'rejected', 'partial')"
+        }
+      },
+      "isRLSEnabled": false
+    }
+  },
+  "enums": {},
+  "schemas": {},
+  "sequences": {},
+  "roles": {},
+  "policies": {},
+  "views": {},
+  "_meta": {
+    "columns": {},
+    "schemas": {},
+    "tables": {}
+  }
+}

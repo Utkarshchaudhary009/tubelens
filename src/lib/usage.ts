@@ -5,6 +5,13 @@
 
 export type UsageOutcome = "accepted" | "rejected" | "partial";
 
+/** One priced child inside a batch fan-out (PLANS_AND_USAGE.md §9). */
+export interface UsageChildCost {
+  route: string;
+  operation: string;
+  cost: number;
+}
+
 export interface UsageEvent {
   requestId: string;
   route: string;
@@ -18,6 +25,21 @@ export interface UsageEvent {
   principal?: string;
   latencyMs?: number;
   cached?: boolean;
+  /** Effective tier at charge time (Phase 14). */
+  tier?: string;
+  /** Monthly UTC-calendar window id, e.g. "2026-09" (Phase 14). */
+  windowId?: string;
+  /** Epoch ms of the next UTC month boundary (Phase 14). */
+  resetMs?: number;
+  /** Monthly credit allowance for `tier` (Phase 14). */
+  allowance?: number;
+  /**
+   * Batch child-cost summary (Phase 14 seam, full economics Phase 16):
+   * priced children of a `batch.execute` event recorded with outcome
+   * `partial`. The durable ledger keeps operation + total cost; the summary
+   * travels the recorder seam for traces and future economics.
+   */
+  children?: UsageChildCost[];
 }
 
 export interface UsageRecordOptions {

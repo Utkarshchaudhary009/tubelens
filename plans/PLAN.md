@@ -568,9 +568,17 @@ principal model.
 
 ## Phase 14 — Quota accounting and monthly allowance
 
-**Status:** `[ ]` not started.
+**Status:** `[x]` done — shipped via PR #32 (merged 2026-09-17): monthly UTC-window allowance (Free 10,000), pipeline quota stage, real `GET /quota` balance, `usage_ledger` table + migrations (0000 + 0001 covering index), with 1068 unit tests + e2e PASS on live upstream. Note: atomic reserve/release deferred to Phase 15 (Redis Lua); durable-migrate apply still needs owner Neon credentials.
 
-**Build:** Implement monthly/daily usage windows according to [`PLANS_AND_USAGE.md`](./PLANS_AND_USAGE.md). Track consumed weighted credits, allowance, remaining amount, reset time, account/user/project/key identity, tier, policy version, and accepted/rejected/partial outcome as appropriate. Keep durable accounting in Postgres only when the product requires it; Redis is the fast enforcement layer, not the historical source of truth.
+**Build:**
+- Goal: monthly weighted-credit accounting per principal, 10k free credits (`product.ts` `monthlyCredits`, cost from `quota.ts`).
+- Decision rule: Redis = fast enforcement (check/reject now), Postgres = durable truth (ledger forever).
+- Redis: key `quota:v1:{principal}:{YYYY-MM}`, INCRBY cost + EXPIRE at month reset, 1 cmd/request. Lua check-and-charge. Fail-safe 503 on Redis down (never fail-open).
+- Postgres: `usage_ledger` table (principal, operation, cost, policyVersion, window YYYY-MM, outcome accepted/rejected, requestId, timestamp) + `quota_windows` summary. Drizzle migration. Background write via waitUntil, 500ms bound.
+- Pipeline order (`pipeline.ts`): resolve cost via `quota.ts` → Redis pre-check → serve → record accepted/rejected to both Redis (sync) + Postgres (async). Cache hits still charge. Batch = summed preflight cost. Unknown op = fail-closed.
+- `/quota` route: upgrade stub to real remaining/reset/allowance per `PLANS_AND_USAGE.md` §5, §8.
+- Tests/exit: 10k-balance exact, reject at zero with `quota_exceeded` 429 + `Retry-After`, month-rollover, restart durability (rebuild Redis from Postgres), Redis-down 503.
+- Files: drizzle migration, new `src/lib/quota-accounting.ts`, `pipeline.ts` wiring, `usage.ts` replace noop, `quota` route.
 
 **Test:** Start a test account with 10,000 monthly credits. Consume known costs and verify exact remaining balance. Drive usage to zero and verify the next charge is rejected. Move the clock across a reset boundary and verify a new window. Restart the application and verify durable usage remains correct when Postgres accounting is enabled.
 
@@ -578,19 +586,21 @@ principal model.
 
 ## Phase 15 — Rate limit vs quota vs cache separation
 
-**Status:** `[ ]` not started.
+**Status:** `[x]` done — shipped via PR #35 (merged 2026-09-17): pipeline/`cached()` seam contract tests (13 tests: charge-regardless-of-cache, clearCache isolation, PG-absent transcript serving, no-store + stale headers) with zero behavioral change; invariant 1 scoped to `withRequestContext`, route-wide wiring tracked as follow-up #34.
 
-**Build:** Enforce the architecture distinction:
+**Build:** Hardening-only separation of three subsystems (no new infra):
 
-- **Rate limit:** can this principal make a request now? → Redis.
-- **Quota/credits:** how much allowance has been consumed? → durable accounting when required, with Redis for fast checks.
-- **Cache:** can an upstream fetch be avoided? → Part A CDN/in-memory by default.
+- **Goal:** rate-limit = can-request-now (Redis sliding-window burst 60/10s + sustained 100/60s); quota = monthly allowance consumed (Redis fast-check + Postgres ledger from Phase 14); cache = avoid upstream (L0 in-memory + CDN Part A, transcripts never live-only).
+- **Invariants:** cache-hit served through `withRequestContext` still faces rate-limit + quota charge (data routes not yet wired through the pipeline are tracked follow-up #34); cache-miss must charge usage; `clearCache()` must never delete `usage_ledger` (monthly windows derive from its `window_id` column — no separate `quota_windows` table was shipped in Phase 14, and none is added here by design: a summary table would itself be a second source of truth, violating the exit criterion); removing Postgres must not break Part A transcript serving.
+- **Pipeline order:** `auth → rate-limit` (cost via `quota.ts`) `→ service` (cache lookup inside, but charge regardless) `→ accounting`. Correction to the earlier sketch ("Redis INCRBY + async PG ledger via `waitUntil`"): the quota *charge* is synchronous in-request (peek pre-handler + consume post-response against the `QuotaStore` — in-memory default, Postgres ledger when opted in), so a dropped deferred task can never lose a charge; only the usage-*telemetry* event is best-effort deferred (`setTimeout`, 500ms bound). No `waitUntil`/new infra in this phase.
+- **Cache rules:** `quota`/`batch`/`audio` = `private, no-store`; serve-stale-on-error sets `meta.cached: true` + `warnings[]`. Transcripts stay out of Postgres unless a later explicit storage/cost/privacy decision enables it.
+- **Deferred (deliberate, not drift):** quota reserve/release Lua (distinct from the existing rate-limit Lua) stays deferred — the peek+consume race is acceptable for this hardening phase (over-admission bounded by the burst limiter; billing-key dedup makes double-charge mechanically impossible). Most data routes still call `handleX()` directly instead of `withRequestContext`, so the invariants are pinned at the pipeline/`cached()` seam by contract tests; wiring every route behind the pipeline is tracked follow-up #34 (it changes anonymous-quota behavior — shared bucket — so it needs its own product decision), NOT Phase 16 batch economics.
 
-Keep transcript caching out of Postgres unless a later explicit storage/cost/privacy decision enables it.
+**Test:** Contract tests for the 4 invariants above, no new infra.
 
-**Test:** Cache-hit request must still face rate-limit/quota rules. A cache miss must not bypass usage charging. Clearing the cache must not delete durable usage. Removing Postgres from a cache-only environment must not break Part A transcript functionality.
+**Exit:** No subsystem is used as another's source of truth.
 
-**Exit:** No subsystem is accidentally used as another subsystem's source of truth.
+> **Note:** blocked on Phase 14 (needs quota-accounting + `usage_ledger` first); Phase 15 is hardening-only.
 
 ## Phase 16 — Batch protection and partial-abuse resistance
 
@@ -678,12 +688,250 @@ Keep transcript caching out of Postgres unless a later explicit storage/cost/pri
 
 **Status:** `[ ]` not started.
 
-**Build:** Define metrics for request volume, p50/p95/p99 latency, 4xx/5xx rates, endpoint health, cache hit rate, upstream failure rate, Redis latency/errors, authentication failures, rate-limit rejections, quota exhaustion, weighted credit consumption, and deployment health. Build focused Datadog dashboards.
+**Build:** Implement the canonical TubeLens metric catalog below. This catalog is
+normative: when the observability provider is implemented, every metric marked
+`REQUIRED` must have a collector/emission path or a clearly documented native
+source (for example Vercel edge analytics). New operationally significant work
+must update this catalog rather than inventing ad-hoc metrics in individual
+routes.
 
-**Test:** Generate controlled traffic/errors and verify metric increments and dimensions are correct. Compare one endpoint against another. Deploy a deliberately isolated test regression and verify the relevant dashboard signal changes. Ensure high-cardinality raw identifiers are not used indiscriminately as metric labels.
+### Canonical metric catalog
 
-**Exit:** Datadog answers what is happening without overwhelming itself with useless cardinality.
+#### 1. Traffic and request volume — REQUIRED
+Collect:
+- `tubelens.requests.total` — origin requests reaching the application.
+- `tubelens.requests.accepted` — requests that reach the service handler.
+- `tubelens.requests.rejected` — rejected before service work, split by reason.
+- `tubelens.requests.by_endpoint` — request volume by logical operation/route.
+- `tubelens.requests.by_tier` — request volume by product tier.
+- `tubelens.requests.by_auth_type` — session vs API key vs anonymous where applicable.
+- `tubelens.requests.batch_children` — child operations executed inside batch.
+- `tubelens.edge_requests.total` — total customer-facing requests seen at the edge/CDN.
+- `tubelens.edge_requests.cache_hits` / `cache_misses` — edge cache behavior.
 
+**Important:** edge totals and origin totals are different metrics. CDN hits do
+not invoke the Vercel function, so origin-side telemetry must never be treated as
+the complete customer traffic count.
+
+#### 2. Latency and performance — REQUIRED
+Collect:
+- `tubelens.request.duration_ms` — distribution, not just an average.
+- p50, p95, p99 request latency by endpoint/operation.
+- Upstream duration by provider.
+- Redis operation duration.
+- Postgres operation duration.
+- Authentication/authorization duration when non-trivial.
+- Batch total duration and child-operation duration.
+- Timeout count and timeout rate.
+
+Use distributions/histograms for latency so percentiles can be computed later.
+
+#### 3. HTTP reliability — REQUIRED
+Collect:
+- total 2xx / 3xx / 4xx / 5xx.
+- 429 rate and count.
+- 401 and 403 rate and count.
+- 400 / 413 validation rejection rate.
+- 404 rate by operation.
+- 5xx rate by operation.
+- error counts by stable `error.code`.
+- success rate / availability by endpoint.
+- stale-on-error responses.
+- partial-success responses and warnings.
+- request cancellation/aborted-handler count where observable.
+
+#### 4. Cache effectiveness — REQUIRED
+Collect separately for each cache layer:
+- `tubelens.cache.l1_hits` — CDN/edge hit count (native Vercel source where available).
+- `tubelens.cache.l1_misses`.
+- `tubelens.cache.l0_hits` — in-process memory cache hits.
+- `tubelens.cache.l0_misses`.
+- `tubelens.cache.stale_served`.
+- `tubelens.cache.revalidation` attempts/success/failure.
+- Effective cache-hit ratio by endpoint.
+- Requests that reached upstream because all applicable cache layers missed.
+
+Never collapse CDN and L0 into one "cache hit" number; they have different cost
+and capacity implications.
+
+#### 5. YouTube / external upstream work — REQUIRED
+Collect:
+- total upstream calls.
+- upstream calls by provider/source.
+- upstream success/failure/timeout/429/403 counts.
+- upstream latency distribution.
+- upstream retry count.
+- upstream work avoided by cache.
+- provider fallback count and winning provider for transcript requests.
+- stale served after upstream failure.
+- upstream calls per successful API request.
+- upstream calls per 1,000 weighted credits.
+
+For the transcript provider chain, also collect provider-attempt count,
+fallback count, final provider, and provider failure reason without logging
+request secrets or raw transcript payloads.
+
+#### 6. Redis health and rate limiting — REQUIRED
+Collect:
+- Redis operation count.
+- Redis latency distribution.
+- Redis errors/timeouts.
+- rate-limit checks allowed.
+- rate-limit checks rejected.
+- rate-limit rejection rate.
+- burst-limit rejections.
+- sustained-limit rejections.
+- quota enforcement checks and failures.
+- Redis fail-closed events.
+- Redis availability.
+
+#### 7. Postgres / durable accounting — REQUIRED
+Collect:
+- database query count where useful.
+- query latency distribution for important paths.
+- connection/query errors.
+- usage-ledger write success/failure.
+- usage-ledger write latency.
+- durable usage-accounting lag/backlog if asynchronous delivery exists.
+- quota reconciliation discrepancies.
+- migration/health-check failures.
+
+Do not turn every SQL statement into a custom metric; instrument important
+operations and dependency health.
+
+#### 8. Quota, credits, and plan economics — REQUIRED
+Collect:
+- weighted credits consumed.
+- weighted credits rejected due to quota.
+- credits by operation class.
+- credits by tier.
+- credits by endpoint/operation.
+- quota-exhaustion count and rate.
+- quota remaining distribution/buckets.
+- monthly active principals consuming credits.
+- average credits/request.
+- average credits per active user.
+- paid vs free credit consumption.
+- paid vs free origin-request consumption.
+- paid vs free upstream-call consumption.
+- policy-version usage distribution.
+
+These are product-economics metrics. They must remain consistent with the durable
+usage ledger and must not make Datadog the source of truth.
+
+#### 9. Customer / account usage — REQUIRED, but bounded
+Collect:
+- active API users/principals.
+- active API keys.
+- requests per tier.
+- credits per tier.
+- usage concentration (top consumers as bounded aggregates).
+- number of principals nearing quota.
+- number of principals exhausting quota.
+- number of rate-limited principals.
+
+Do not use raw `user_id`, API key, IP, or request ID as unbounded custom-metric
+tags. Use logs/traces for individual investigations and bounded dimensions for
+metrics.
+
+#### 10. Authentication, authorization, and abuse — REQUIRED
+Collect:
+- authentication success/failure counts by safe reason.
+- authorization denial counts.
+- revoked/expired credential attempts.
+- invalid API-key attempts.
+- suspicious burst/rejection signals.
+- abuse-control warnings/revocations/downgrades/queued bans.
+- credential issuance/revocation/rotation counts as operational counters.
+- admin/security-action counts.
+
+Security events must remain sanitized and must never contain credentials/tokens.
+
+#### 11. Dependency and platform health — REQUIRED
+Collect:
+- Clerk dependency success/failure/latency.
+- Upstash dependency success/failure/latency.
+- Neon dependency success/failure/latency.
+- Datadog telemetry delivery/drop/failure where available.
+- Vercel deployment/runtime health.
+- application process cold starts where available.
+- function execution duration/resource indicators exposed by the platform.
+- provider/session health for YouTube/Innertube.
+- health endpoint success/failure.
+
+#### 12. Deployment and release health — REQUIRED
+Collect:
+- deployment count.
+- deployment failure count.
+- deployment rollback count.
+- application errors by deployment/version.
+- latency/error-rate comparison by deployed version.
+- time since last successful deployment.
+- health-check status by version/environment.
+
+#### 13. SLO / alerting signals — REQUIRED
+Create derived monitors for:
+- API availability / successful-response rate.
+- p95 and p99 latency by critical endpoint.
+- 5xx rate.
+- 429 surge.
+- upstream failure surge.
+- cache-hit-rate drop.
+- InnerTube/upstream calls per request rising unexpectedly.
+- Redis error/latency surge.
+- Postgres error/latency surge.
+- quota exhaustion surge.
+- paid/free capacity imbalance against the configured allocation.
+- telemetry pipeline failure.
+- deployment regression.
+
+### Canonical metric dimensions
+
+Use a small, bounded dimension set:
+
+`environment`, `service`, `version`, `route`, `operation`,
+`method`, `status_class`, `error_code`, `tier`, `auth_type`,
+`cache_layer`, `cache_result`, `upstream_provider`, `upstream_result`.
+
+Only add a dimension when its value space is demonstrably bounded. Individual
+`user_id`, API key, raw URL, IP address, request ID, video ID, search query,
+transcript text, or other unbounded identifiers belong in sanitized logs/traces
+when needed for investigation, not in high-volume custom metrics.
+
+### Metric ownership / source mapping
+
+| Signal | Primary source |
+|---|---|
+| Total customer-facing edge traffic | Vercel edge/CDN analytics |
+| CDN hit/miss | Vercel edge/CDN analytics |
+| Origin request volume | TubeLens instrumentation / Vercel function telemetry |
+| Request latency / HTTP status | TubeLens instrumentation + Vercel |
+| Cache L0 | TubeLens cache instrumentation |
+| Redis rate-limit health | TubeLens + Upstash metrics |
+| Postgres/usage ledger health | TubeLens + Neon/Postgres |
+| Weighted credits / quota | Postgres usage truth + TubeLens emission |
+| Individual request investigation | Datadog logs/traces |
+| Aggregate operational metrics | Datadog metrics |
+| Deploy/runtime health | Vercel + Datadog |
+
+### Implementation rule
+
+Every metric above must have one of these explicit states before Phase 20 exits:
+`implemented`, `native-source-linked`, or `intentionally-not-applicable`
+with a reason. No "we'll remember later" metrics are allowed.
+
+**Test:** Generate controlled traffic/errors and verify metric increments and
+dimensions are correct. Compare one endpoint against another. Exercise cache-hit
+and cache-miss paths, upstream success/failure, Redis success/failure, quota
+accept/reject, authentication failures, and batch requests. Deploy a deliberately
+isolated test regression and verify the relevant dashboard signal changes. Ensure
+high-cardinality raw identifiers are not used indiscriminately as metric labels.
+Verify edge/CDN traffic is not accidentally inferred from origin function counts.
+
+**Exit:** Datadog answers what is happening across traffic, performance,
+reliability, caching, upstream work, infrastructure health, quota/economics,
+customer usage, security, and deployments without overwhelming itself with
+useless cardinality.
 ## Phase 21 — Reliability and dependency failure policies
 
 **Status:** `[ ]` not started.

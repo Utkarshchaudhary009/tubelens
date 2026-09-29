@@ -3,13 +3,14 @@ import { NextRequest } from "next/server";
 import { buildOpenApiDocument } from "../../app/api/v1/openapi.json/route";
 import { clearCache } from "../cache";
 import { type ContinuationSearch, clearContinuations } from "../continuations";
+import { QUOTA_POLICY_VERSION } from "../quota";
+import { InMemoryQuotaStore } from "../quota-accounting";
 import {
   type BatchDeps,
   buildChannelRss,
   type ChannelRssDeps,
   escapeXml,
   getInstances,
-  getQuotaSnapshot,
   handleBatch,
   handleChannelRss,
   handleInstances,
@@ -20,7 +21,6 @@ import {
   parsePeerInstances,
   parseThumbnailParams,
   RSS_MAX_ITEMS,
-  resetQuotaForTests,
   resolveBatchOrigin,
   thumbnailUrls,
 } from "../utils";
@@ -90,7 +90,6 @@ function restoreEnv(key: string, saved: string | undefined): void {
 beforeEach(() => {
   clearCache();
   clearContinuations();
-  resetQuotaForTests();
   restoreEnv("TUBELENS_PEER_INSTANCES", savedPeers);
   restoreEnv("VERCEL_URL", savedVercelUrl);
   // Batch fan-out pins to a trusted origin (never the request Host): always
@@ -738,34 +737,41 @@ describe("phase 10 batch trusted origin (SSRF pinning)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Quota: stub counters
+// Quota: monthly allowance balance (Phase 14 shape)
 // ---------------------------------------------------------------------------
 
 describe("phase 10 quota", () => {
-  test("reports limit/remaining/reset + windows, private no-store", async () => {
-    const first = await handleQuota(req("http://x/api/v1/quota"));
+  test("reports allowance/used/remaining/reset/windowId/tier/policyVersion, private no-store", async () => {
+    const store = new InMemoryQuotaStore();
+    const nowMs = Date.UTC(2026, 8, 15, 12, 0, 0);
+    const first = await handleQuota(req("http://x/api/v1/quota"), {
+      store,
+      identity: "user:phase10",
+      nowMs,
+    });
     expect(first.status).toBe(200);
     expect(first.headers.get("Cache-Control")).toBe("private, no-store");
     const a = await first.json();
-    expect(a.data.limit).toBe(100);
-    expect(a.data.remaining).toBe(99);
-    expect(typeof a.data.reset).toBe("number");
-    expect(a.data.windows).toHaveLength(1);
-    expect(a.data.windows[0].note).toMatch(/no durable store/);
+    expect(a.data).toEqual({
+      allowance: 10_000,
+      used: 0,
+      remaining: 10_000,
+      reset: Math.floor(Date.UTC(2026, 9, 1) / 1000),
+      windowId: "2026-09",
+      tier: "free",
+      policyVersion: QUOTA_POLICY_VERSION,
+    });
     expect(a.meta.requestId).toBe(first.headers.get("X-Request-Id"));
-    // Body/header parity: the stub headers mirror the snapshot, not statics.
+    // X-RateLimit-* stay the rate-limit stubs (Phase 15 separation: quota
+    // credits and request-rate windows share no header).
     expect(first.headers.get("X-RateLimit-Limit")).toBe("100");
-    expect(first.headers.get("X-RateLimit-Remaining")).toBe("99");
-    expect(first.headers.get("X-RateLimit-Reset")).toBe(String(a.data.reset));
-    const second = await handleQuota(req("http://x/api/v1/quota"));
-    expect((await second.json()).data.remaining).toBe(98);
-    expect(second.headers.get("X-RateLimit-Remaining")).toBe("98");
-  });
-
-  test("window rolls over after 60s", () => {
-    expect(getQuotaSnapshot(1_000_000).used).toBe(1);
-    expect(getQuotaSnapshot(1_000_001).used).toBe(2);
-    expect(getQuotaSnapshot(1_000_000 + 60_000).used).toBe(1);
+    // A balance check never consumes: repeat reads are stable.
+    const second = await handleQuota(req("http://x/api/v1/quota"), {
+      store,
+      identity: "user:phase10",
+      nowMs,
+    });
+    expect((await second.json()).data.remaining).toBe(10_000);
   });
 });
 
