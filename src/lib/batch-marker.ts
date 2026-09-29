@@ -24,11 +24,14 @@
 // Rotation/expiry note: markers deliberately carry no timestamp — they are
 // minted and verified within a single batch fan-out (milliseconds apart)
 // and never leave the server, so there is no replay window to bound and no
-// clock-skew to manage. Rotating the secret is a plain redeploy (all
-// instances read env at request time; in-flight batches span one request,
-// so no cross-version markers ever meet). If markers ever outlive a request
-// (e.g. queued children), bind the monthly quota windowId or calendar day
-// into the payload and reject stale epochs at verify time.
+// clock-skew to manage. Rotation is a two-step redeploy: set the new key
+// as TUBELENS_BATCH_HMAC_KEY and the old one as
+// TUBELENS_BATCH_HMAC_PREVIOUS_KEY (verification accepts both, so a parent
+// admitted pre-redeploy still has its children honored when loopback lands
+// them on a new instance), then drop the previous key once no pre-rotation
+// batch can still be in flight. If markers ever outlive a request (e.g.
+// queued children), bind the monthly quota windowId or calendar day into
+// the payload and reject stale epochs at verify time.
 //
 // Pure and server-only-safe: no `import "server-only"` (unconditionally
 // throws under bun — same rationale as quota.ts/rate-limit.ts); the
@@ -53,17 +56,35 @@ const HMAC_DOMAIN = "tubelens-batch-child:v1";
 type Env = Record<string, string | undefined>;
 
 /**
- * Resolve the marker signing secret. First non-blank value wins (dedicated
- * key, then Clerk fallback — the same alias-resolution rule as config.ts,
- * so a blank dedicated key never shadows a valid fallback); blank/missing
- * → null (children unsigned, normal admission).
+ * All verification secrets: the current dedicated key, the previous
+ * dedicated key (rotation window — a parent admitted pre-redeploy signs
+ * with the old key while its loopback children may land on a new instance
+ * already reading the new one), then the Clerk fallback. First-non-blank
+ * per slot (same alias rule as config.ts); blanks dropped, duplicates
+ * collapsed. Minting always uses element zero.
+ */
+export function getBatchMarkerSecrets(env: Env): string[] {
+  const out: string[] = [];
+  for (const raw of [
+    env.TUBELENS_BATCH_HMAC_KEY,
+    env.TUBELENS_BATCH_HMAC_PREVIOUS_KEY,
+    env.CLERK_SECRET_KEY,
+  ]) {
+    const secret = (raw ?? "").trim();
+    if (secret !== "" && !out.includes(secret)) {
+      out.push(secret);
+    }
+  }
+  return out;
+}
+
+/**
+ * Resolve the marker signing secret (element zero of
+ * {@link getBatchMarkerSecrets}); null when unconfigured (children
+ * unsigned, normal admission).
  */
 export function getBatchMarkerSecret(env: Env): string | null {
-  const secret =
-    [env.TUBELENS_BATCH_HMAC_KEY, env.CLERK_SECRET_KEY]
-      .find((value) => value !== undefined && value.trim() !== "")
-      ?.trim() ?? "";
-  return secret === "" ? null : secret;
+  return getBatchMarkerSecrets(env)[0] ?? null;
 }
 
 function payload(method: string, pathQuery: string): string {

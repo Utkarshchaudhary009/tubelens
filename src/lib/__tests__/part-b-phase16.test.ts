@@ -81,7 +81,10 @@ interface Sut {
   extras: () => Array<Record<string, string>>;
 }
 
-function makeSut(execute?: BatchDeps["execute"]): Sut {
+function makeSut(
+  execute?: BatchDeps["execute"],
+  env?: Record<string, string | undefined>,
+): Sut {
   process.env.TUBELENS_PUBLIC_URL = "http://x";
   const store = new InMemoryQuotaStore();
   const events: UsageEvent[] = [];
@@ -102,8 +105,10 @@ function makeSut(execute?: BatchDeps["execute"]): Sut {
         },
   };
   const run = createBatchHandler(deps, {
-    // Explicit anonymous auth: hermetic regardless of global overrides.
+    // Explicit anonymous auth + empty env: hermetic regardless of global
+    // overrides or host enforcement/secret configuration.
     auth: { resolve: async () => ({ ...anonymousAuthContext }) },
+    env: env ?? {},
     quotaStore: store,
     rateLimit: {
       check: (check: RateLimitCheck) => {
@@ -351,6 +356,7 @@ describe("phase 16 retry and partial semantics", () => {
       },
       {
         auth: { resolve: async () => ({ ...anonymousAuthContext }) },
+        env: {},
         quotaStore: store,
         usage: {
           record: (event: UsageEvent) => {
@@ -401,6 +407,34 @@ describe("phase 16 retry and partial semantics", () => {
     expect(sut.executions()).toBe(1);
     const { windowId } = quotaWindowFor(Date.now());
     expect(await sut.store.get("anonymous", windowId)).toBe(1);
+  });
+
+  test("backslash paths reject as invalid (no normalization bypass)", async () => {
+    // WHATWG URL parsing normalizes `\` to `/`: without this gate the child
+    // below would price as videos.get (1) yet execute as the 4-credit
+    // combined route.
+    const sut = makeSut();
+    const res = await sut.run(
+      postReq({
+        requests: [
+          { method: "GET", path: "/api/v1/videos/abc\\combined" },
+          { method: "GET", path: "/api/v1/health" },
+        ],
+      }),
+    );
+    expect(res.status).toBe(200);
+    const results = await res.json().then((b) => b.data.results);
+    expect(results[0].status).toBe(400);
+    expect(results[0].body.error.code).toBe("batch_invalid_path");
+    expect(results[1].status).toBe(200);
+    // Only the health child executed and priced — the backslash child never
+    // reached pricing or execution.
+    expect(sut.executions()).toBe(1);
+    const { windowId } = quotaWindowFor(Date.now());
+    expect(await sut.store.get("anonymous", windowId)).toBe(1);
+    await flushAccounting();
+    expect(sut.events).toHaveLength(1);
+    expect(sut.events[0]).toMatchObject({ cost: 1, outcome: "partial" });
   });
 });
 
@@ -587,6 +621,37 @@ function childRun(
   );
 }
 
+describe("phase 16 costOverride validation", () => {
+  test("fractional costOverride fails closed with typed 500, limiter untouched", async () => {
+    const limiter: RateLimitCheck[] = [];
+    const run = withRequestContext(
+      async (_r, ctx) =>
+        successResponse({ ok: true }, { requestId: ctx.requestId }),
+      {
+        auth: { resolve: async () => ({ ...anonymousAuthContext }) },
+        env: {},
+        rateLimit: {
+          check: (check: RateLimitCheck) => {
+            limiter.push(check);
+            return {
+              allowed: true,
+              limit: 100,
+              remaining: 99,
+              reset: Math.floor(Date.now() / 1000) + 60,
+            };
+          },
+        },
+      },
+      "search",
+      { costOverride: 1.5 },
+    );
+    const res = await run(new NextRequest("http://x/api/v1/search?q=a"));
+    expect(res.status).toBe(500);
+    expect(await res.json().then((b) => b.error.code)).toBe("internal");
+    expect(limiter).toHaveLength(0);
+  });
+});
+
 describe("phase 16 already-billed marker", () => {
   test("mint/verify round-trip, path+method binding, tamper resistance", () => {
     const marker = mintBatchChildMarker(
@@ -742,10 +807,34 @@ describe("phase 16 already-billed marker", () => {
       expect(await store.get("anonymous", windowId)).toBe(1);
       expect(limiter).toHaveLength(1);
     }
+
+    // Rotation window: a marker minted with the previous key still
+    // verifies when the environment carries current + previous (a parent
+    // admitted pre-redeploy stays honored when loopback lands its children
+    // on a new instance).
+    {
+      const oldMarker = mintBatchChildMarker("old-secret", "GET", pathQuery);
+      const store = new InMemoryQuotaStore();
+      const limiter: RateLimitCheck[] = [];
+      const events: UsageEvent[] = [];
+      const res = await childRun(store, limiter, events, {
+        TUBELENS_BATCH_HMAC_KEY: "new-secret",
+        TUBELENS_BATCH_HMAC_PREVIOUS_KEY: "old-secret",
+      })(
+        new NextRequest(`http://x${pathQuery}`, {
+          headers: { [BATCH_CHILD_HEADER]: oldMarker },
+        }),
+      );
+      expect(res.status).toBe(200);
+      const { windowId } = quotaWindowFor(Date.now());
+      expect(await store.get("anonymous", windowId)).toBe(0);
+      expect(limiter).toHaveLength(0);
+      await flushAccounting();
+      expect(events).toHaveLength(0);
+    }
   });
 
   test("production path: parent summed charge + marked child adds nothing; unmarked child charges", async () => {
-    process.env.TUBELENS_BATCH_HMAC_KEY = MARKER_TEST_SECRET;
     process.env.TUBELENS_PUBLIC_URL = "http://x";
     const store = new InMemoryQuotaStore();
     const parentLimiter: RateLimitCheck[] = [];
@@ -756,6 +845,7 @@ describe("phase 16 already-billed marker", () => {
       },
       {
         auth: { resolve: async () => ({ ...anonymousAuthContext }) },
+        env: { TUBELENS_BATCH_HMAC_KEY: MARKER_TEST_SECRET },
         quotaStore: store,
         rateLimit: {
           check: (check: RateLimitCheck) => {
@@ -816,6 +906,7 @@ describe("phase 16 already-billed marker", () => {
       },
       {
         auth: { resolve: async () => ({ ...anonymousAuthContext }) },
+        env: { TUBELENS_BATCH_HMAC_KEY: MARKER_TEST_SECRET },
         quotaStore: store,
         rateLimit: {
           check: () => ({
@@ -894,7 +985,6 @@ describe("phase 16 already-billed marker", () => {
   });
 
   test("forwarded credentials resolve the caller principal in the child", async () => {
-    process.env.TUBELENS_BATCH_HMAC_KEY = MARKER_TEST_SECRET;
     process.env.TUBELENS_PUBLIC_URL = "http://x";
     const TOKEN = "Bearer user_42_token";
     // Test double for Clerk: this bearer maps to user_42, anything else
@@ -919,7 +1009,11 @@ describe("phase 16 already-billed marker", () => {
           return { status: 200, body: { ok: true } };
         },
       },
-      { auth: mappingAuth, quotaStore: store },
+      {
+        auth: mappingAuth,
+        env: { TUBELENS_BATCH_HMAC_KEY: MARKER_TEST_SECRET },
+        quotaStore: store,
+      },
     );
     const res = await run(
       postReq(

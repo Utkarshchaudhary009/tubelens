@@ -32,7 +32,7 @@ import {
 import {
   BATCH_CHILD_HEADER,
   BATCH_PARTIAL_HEADER,
-  getBatchMarkerSecret,
+  getBatchMarkerSecrets,
   verifyBatchChildMarker,
 } from "./batch-marker";
 import { ConfigError, getConfig } from "./config";
@@ -399,8 +399,7 @@ export function withRequestContext(
     // (like an unpriced label above) and fail closed with a typed 500 —
     // never free, never silently clamped.
     if (options.costOverride !== undefined) {
-      const floored = Math.floor(options.costOverride);
-      if (!Number.isFinite(options.costOverride) || floored < 1) {
+      if (!Number.isInteger(options.costOverride) || options.costOverride < 1) {
         safe(() =>
           observability.captureError(
             scrubError(
@@ -429,7 +428,7 @@ export function withRequestContext(
           origin,
         });
       }
-      operationCost = floored;
+      operationCost = options.costOverride;
     }
     // Phase 16 already-billed batch child: the parent batch was admitted
     // once with the summed child cost, and each child carries a
@@ -443,18 +442,18 @@ export function withRequestContext(
     let batchChildBilled = false;
     const childMarker = req.headers.get(BATCH_CHILD_HEADER);
     if (childMarker) {
-      const secret = getBatchMarkerSecret(providers.env ?? process.env);
-      if (
-        secret &&
+      // Any configured secret verifies (current, rotation-previous, Clerk
+      // fallback) — a redeploy mid-fan-out must not turn valid children
+      // into double charges.
+      const secrets = getBatchMarkerSecrets(providers.env ?? process.env);
+      batchChildBilled = secrets.some((secret) =>
         verifyBatchChildMarker(
           secret,
           req.method,
           req.nextUrl.pathname + req.nextUrl.search,
           childMarker,
-        )
-      ) {
-        batchChildBilled = true;
-      }
+        ),
+      );
     }
     let decision: RateLimitDecision;
     if (options.bypassRateLimit) {

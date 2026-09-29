@@ -33,7 +33,6 @@ import {
   BATCH_MAX_COST,
   type BatchChildCost,
   costForBatch,
-  QUOTA_POLICY_VERSION,
   QuotaPolicyError,
   resolveBatchChildRoute,
 } from "@/lib/quota";
@@ -583,9 +582,12 @@ export interface ParsedBatch {
    * their per-item errors in an admitted 200).
    */
   totalCost: number;
-  /** Priced runnable-child summary for the single batch usage row. */
+  /**
+   * Priced runnable-child summary for the single batch usage row (each
+   * child carries its resolving policy version; the batch needs no
+   * separate copy — the usage row stamps the catalog version itself).
+   */
   children: BatchChildCost[];
-  policyVersion: string;
 }
 
 /** Shared per-item shape for "not batchable" (allowlist AND pricing legs). */
@@ -627,6 +629,22 @@ function validateBatchItem(
     };
   }
   const pathname = path.split("?")[0] as string;
+  // WHATWG URL parsing (fetch, Next routing) normalizes `\` to `/` for
+  // http(s), but the allowlist/pricing above read the RAW string: a child
+  // like `/api/v1/videos/abc\combined` would price as videos.get (1) yet
+  // execute as the 4-credit combined route. Reject backslashes fail-closed
+  // (query strings may still carry them — only the pathname is checked).
+  if (pathname.includes("\\")) {
+    return {
+      kind: "static",
+      result: batchItemError(
+        400,
+        "batch_invalid_path",
+        "Invalid batch path.",
+        "Batch paths must use forward slashes; send the canonical path, e.g. /api/v1/videos/abc123/combined.",
+      ),
+    };
+  }
   if (pathname === "/api/v1/batch" || pathname.startsWith("/api/v1/batch/")) {
     return {
       kind: "static",
@@ -816,7 +834,6 @@ export async function parseBatchRequest(
           tasks: pricedTasks,
           totalCost: priced.cost,
           children: priced.children,
-          policyVersion: priced.policyVersion,
         },
       };
     } catch (err) {
@@ -854,7 +871,6 @@ export async function parseBatchRequest(
       tasks: pricedTasks,
       totalCost: 0,
       children: [],
-      policyVersion: QUOTA_POLICY_VERSION,
     },
   };
 }
