@@ -10,6 +10,7 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { type AuthContext, anonymousAuthContext } from "@/lib/auth";
+import { BATCH_CHILD_HEADER, BATCH_PARTIAL_HEADER } from "@/lib/batch-marker";
 import { cached } from "@/lib/cache";
 import {
   classifyChannelError,
@@ -27,13 +28,21 @@ import {
 import { errorResponse } from "@/lib/errors";
 import { isUpstreamTimeout, textOf } from "@/lib/mappers";
 import type { Tier } from "@/lib/product";
-import { BATCH_MAX_COST, costForBatch, QuotaPolicyError } from "@/lib/quota";
+import {
+  BATCH_MAX_CHILDREN,
+  BATCH_MAX_COST,
+  type BatchChildCost,
+  costForBatch,
+  QuotaPolicyError,
+  resolveBatchChildRoute,
+} from "@/lib/quota";
 import {
   getBalance,
   getQuotaStore,
   type QuotaStore,
   quotaPrincipal,
 } from "@/lib/quota-accounting";
+import { resolveRequestId } from "@/lib/request-context";
 import { isLoopbackHost } from "@/lib/safe-fetch";
 import { isPlausibleVideoId, readBoundedJson } from "@/lib/validate";
 
@@ -446,7 +455,7 @@ const batchItemSchema = z.object({
   path: z.string(),
 });
 const batchBodySchema = z.object({
-  requests: z.array(batchItemSchema).min(1).max(10),
+  requests: z.array(batchItemSchema).min(1).max(BATCH_MAX_CHILDREN),
 });
 
 export interface BatchSubResult {
@@ -461,12 +470,33 @@ export interface BatchDeps {
    * deadline fires so losing sub-fetches stop instead of dangling.
    * Executors that ignore it are still bounded by the race (their late
    * rejections are caught per-item, never unhandled).
+   *
+   * `extraHeaders` carries the parent's caller credentials (authorization +
+   * cookie, so children resolve the caller's principal instead of
+   * anonymous) and the already-billed marker, when the admitted path
+   * minted one. Merged over executor defaults; never logged.
    */
   execute: (
     url: string,
     requestId: string,
     signal?: AbortSignal,
+    extraHeaders?: Record<string, string>,
   ) => Promise<BatchSubResult>;
+}
+
+/**
+ * Per-request child context for the admitted batch path (built by the
+ * route from the parent request — never from client-controlled child
+ * fields). Absent in direct/test executors, which simply send no extras.
+ */
+export interface BatchChildContext {
+  /** Caller credential headers forwarded to same-origin sub-fetches. */
+  forwardedHeaders?: Record<string, string>;
+  /**
+   * Mint an already-billed marker for a child URL; null/undefined leaves
+   * the child unsigned (normal admission — fail toward charging).
+   */
+  signChild?: (childUrl: string) => string | null;
 }
 
 /**
@@ -533,9 +563,42 @@ export interface BatchOptions {
 }
 
 /** Validated item: either a static error or a same-origin URL to execute. */
-type BatchTask =
+export type BatchTask =
   | { kind: "static"; result: BatchSubResult }
   | { kind: "run"; url: string; pathname: string };
+
+/**
+ * Phase 16 preflight result: a batch parsed, validated, and priced BEFORE
+ * any pipeline admission or child execution. The route runs this first and
+ * only admits priced batches into `withRequestContext` — so every reject
+ * below costs zero credits and invokes zero children.
+ */
+export interface ParsedBatch {
+  requestId: string;
+  tasks: BatchTask[];
+  /**
+   * Summed weighted-credit cost of the runnable children (0 when every
+   * item is a static per-item error — such batches skip pricing and keep
+   * their per-item errors in an admitted 200).
+   */
+  totalCost: number;
+  /**
+   * Priced runnable-child summary for the single batch usage row (each
+   * child carries its resolving policy version; the batch needs no
+   * separate copy — the usage row stamps the catalog version itself).
+   */
+  children: BatchChildCost[];
+}
+
+/** Shared per-item shape for "not batchable" (allowlist AND pricing legs). */
+function batchPathNotAllowedError(pathname: string): BatchSubResult {
+  return batchItemError(
+    400,
+    "batch_path_not_allowed",
+    `Path "${pathname}" is not batchable.`,
+    "Batch composes JSON-only v1 reads; binary routes (audio bytes, RSS feed) are excluded — call them directly. See /api/v1/openapi.json for the path list.",
+  );
+}
 
 function validateBatchItem(
   item: { method: string; path: string },
@@ -566,6 +629,22 @@ function validateBatchItem(
     };
   }
   const pathname = path.split("?")[0] as string;
+  // WHATWG URL parsing (fetch, Next routing) normalizes `\` to `/` for
+  // http(s), but the allowlist/pricing above read the RAW string: a child
+  // like `/api/v1/videos/abc\combined` would price as videos.get (1) yet
+  // execute as the 4-credit combined route. Reject backslashes fail-closed
+  // (query strings may still carry them — only the pathname is checked).
+  if (pathname.includes("\\")) {
+    return {
+      kind: "static",
+      result: batchItemError(
+        400,
+        "batch_invalid_path",
+        "Invalid batch path.",
+        "Batch paths must use forward slashes; send the canonical path, e.g. /api/v1/videos/abc123/combined.",
+      ),
+    };
+  }
   if (pathname === "/api/v1/batch" || pathname.startsWith("/api/v1/batch/")) {
     return {
       kind: "static",
@@ -578,17 +657,32 @@ function validateBatchItem(
     };
   }
   if (!BATCH_ALLOWLIST.some((re) => re.test(pathname))) {
-    return {
-      kind: "static",
-      result: batchItemError(
-        400,
-        "batch_path_not_allowed",
-        `Path "${pathname}" is not batchable.`,
-        "Batch composes JSON-only v1 reads; binary routes (audio bytes, RSS feed) are excluded — call them directly. See /api/v1/openapi.json for the path list.",
-      ),
-    };
+    return { kind: "static", result: batchPathNotAllowedError(pathname) };
   }
   return { kind: "run", url: `${origin}${path}`, pathname };
+}
+
+/**
+ * Fail-closed pricing per ITEM, not per batch: a runnable child the cost
+ * catalog cannot price (unreachable past the allowlist today, but the two
+ * lists evolve independently) demotes to a static per-item 400 instead of
+ * failing the whole batch. The remainder still prices and executes.
+ */
+export function demoteUnpriceableBatchTasks(tasks: BatchTask[]): BatchTask[] {
+  return tasks.map((task) => {
+    if (task.kind === "static") {
+      return task;
+    }
+    try {
+      resolveBatchChildRoute(task.pathname);
+      return task;
+    } catch {
+      return {
+        kind: "static",
+        result: batchPathNotAllowedError(task.pathname),
+      };
+    }
+  });
 }
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
@@ -645,26 +739,42 @@ export function resolveBatchOrigin(req: NextRequest): string | null {
   return null;
 }
 
-export async function handleBatch(
+/**
+ * Phase 16 preflight: parse, validate, and price a batch WITHOUT admitting
+ * it or executing children. Rejected preflight is a whole-batch error
+ * response (the caller never enters the pipeline: zero charge, zero child
+ * invocations). Admitted preflight carries the tasks plus the summed cost
+ * the route charges once through `withRequestContext`.
+ */
+export async function parseBatchRequest(
   req: NextRequest,
-  deps: BatchDeps,
-  opts?: BatchOptions,
-): Promise<NextResponse> {
-  const requestId = getRequestId(req);
+): Promise<
+  { ok: true; value: ParsedBatch } | { ok: false; response: NextResponse }
+> {
+  // Validated id (same resolveRequestId the pipeline stamps): an invalid
+  // caller-supplied X-Request-Id mints here instead of echoing raw into
+  // meta/headers — consistent with every pipeline-admitted response.
+  const requestId = resolveRequestId(req);
 
   // Bounded pre-parse: oversized bodies are 413 before JSON.parse ever runs;
   // anything else malformed keeps the legacy invalid_batch shape below.
   const body = await readBoundedJson(req);
   if (!body.ok) {
     if (body.error.code === "body_too_large") {
-      return errorResponse(requestId, { ...body.error });
+      return {
+        ok: false,
+        response: errorResponse(requestId, { ...body.error }),
+      };
     }
-    return errorResponse(requestId, {
-      code: "invalid_batch",
-      message: "Invalid batch body.",
-      hint: 'Send JSON {requests:[{method,path}]}, e.g. {"requests":[{"method":"GET","path":"/api/v1/health"}]}.',
-      status: 400,
-    });
+    return {
+      ok: false,
+      response: errorResponse(requestId, {
+        code: "invalid_batch",
+        message: "Invalid batch body.",
+        hint: 'Send JSON {requests:[{method,path}]}, e.g. {"requests":[{"method":"GET","path":"/api/v1/health"}]}.',
+        status: 400,
+      }),
+    };
   }
   const raw: unknown = body.value;
   const parsed = batchBodySchema.safeParse(raw);
@@ -672,66 +782,114 @@ export async function handleBatch(
     const tooMany = parsed.error.issues.some(
       (i) => i.code === "too_big" && String(i.path).includes("requests"),
     );
-    return errorResponse(requestId, {
-      code: "invalid_batch",
-      message: "Invalid batch body.",
-      hint: tooMany
-        ? "Batch at most 10 requests per call; split larger fan-outs across calls."
-        : 'Send {requests:[{method,path}]} with 1-10 GET-only v1 paths, e.g. {"requests":[{"method":"GET","path":"/api/v1/health"}]}.',
-      status: 400,
-    });
+    return {
+      ok: false,
+      response: errorResponse(requestId, {
+        code: "invalid_batch",
+        message: "Invalid batch body.",
+        hint: tooMany
+          ? `Batch at most ${BATCH_MAX_CHILDREN} requests per call; split larger fan-outs across calls.`
+          : `Send {requests:[{method,path}]} with 1-${BATCH_MAX_CHILDREN} GET-only v1 paths, e.g. {"requests":[{"method":"GET","path":"/api/v1/health"}]}.`,
+        status: 400,
+      }),
+    };
   }
 
   const origin = resolveBatchOrigin(req);
   if (!origin) {
-    return errorResponse(requestId, {
-      code: "batch_not_configured",
-      message: "Batch fan-out origin is not configured.",
-      hint: "Set TUBELENS_PUBLIC_URL to the public base URL so sub-requests dispatch to a trusted origin.",
-      status: 503,
-    });
+    return {
+      ok: false,
+      response: errorResponse(requestId, {
+        code: "batch_not_configured",
+        message: "Batch fan-out origin is not configured.",
+        hint: "Set TUBELENS_PUBLIC_URL to the public base URL so sub-requests dispatch to a trusted origin.",
+        status: 503,
+      }),
+    };
   }
   const tasks = parsed.data.requests.map((item) =>
     validateBatchItem(item, origin),
   );
 
-  // Phase 13 batch economics: total-cost ceiling preflight. Pure — no child
-  // I/O has run yet (validateBatchItem only builds URLs), so an over-cap
-  // batch is rejected before any child work executes. Batches with no
-  // runnable items skip pricing and keep their per-item static errors.
-  // Scope: Phase 13 defines deterministic costs + this ceiling only — no
-  // weighted deduction happens here (the batch route bypasses the pipeline).
-  // Actual credit deduction/accounting lands in Phase 14, full batch
-  // economics in Phase 16 (see PLANS_AND_USAGE.md §6/§9).
-  const runnablePathnames = tasks.flatMap((task) =>
+  // Total-cost ceiling preflight (BATCH_MAX_CHILDREN ships in the zod schema
+  // above; BATCH_MAX_COST via costForBatch). Pure — no child I/O has run yet
+  // (validateBatchItem only builds URLs), so an over-cap batch is rejected
+  // before any child work executes. Unpriceable runnables demote to static
+  // per-item errors first, so pricing sees only priceable children; batches
+  // with no runnable items skip pricing and keep their per-item static
+  // errors. Phase 16: the priced total travels into the pipeline as the
+  // batch's single quota/rate-limit cost (see the batch route); verified
+  // children skip re-admission via the already-billed marker.
+  const pricedTasks = demoteUnpriceableBatchTasks(tasks);
+  const runnablePathnames = pricedTasks.flatMap((task) =>
     task.kind === "run" ? [task.pathname] : [],
   );
   if (runnablePathnames.length > 0) {
     try {
-      costForBatch(runnablePathnames);
+      const priced = costForBatch(runnablePathnames);
+      return {
+        ok: true,
+        value: {
+          requestId,
+          tasks: pricedTasks,
+          totalCost: priced.cost,
+          children: priced.children,
+        },
+      };
     } catch (err) {
       if (
         err instanceof QuotaPolicyError &&
         err.code === "batch_cost_exceeded"
       ) {
-        return errorResponse(requestId, {
-          code: "batch_cost_exceeded",
-          message: "Batch total cost exceeds the ceiling.",
-          hint: `Split the batch so the summed child cost stays within ${BATCH_MAX_COST} credits; expensive operations (transcript, combined) cost more — see /api/v1/openapi.json.`,
-          status: 400,
-        });
+        return {
+          ok: false,
+          response: errorResponse(requestId, {
+            code: "batch_cost_exceeded",
+            message: "Batch total cost exceeds the ceiling.",
+            hint: `Split the batch so the summed child cost stays within ${BATCH_MAX_COST} credits; expensive operations (transcript, combined) cost more — see /api/v1/openapi.json.`,
+            status: 400,
+          }),
+        };
       }
-      // An unpriceable runnable child (unreachable past the allowlist, but
-      // fail closed anyway): no child has executed, so reject the batch.
-      return errorResponse(requestId, {
-        code: "batch_path_not_allowed",
-        message: "Batch contains an unrecognized path.",
-        hint: "Use a same-origin v1 path, e.g. /api/v1/health or /api/v1/search?q=lofi.",
-        status: 400,
-      });
+      // Defensive: every runnable pre-resolved above, so any other pricing
+      // failure is unreachable — fail closed without executing children.
+      return {
+        ok: false,
+        response: errorResponse(requestId, {
+          code: "batch_path_not_allowed",
+          message: "Batch contains an unrecognized path.",
+          hint: "Use a same-origin v1 path, e.g. /api/v1/health or /api/v1/search?q=lofi.",
+          status: 400,
+        }),
+      };
     }
   }
+  return {
+    ok: true,
+    value: {
+      requestId,
+      tasks: pricedTasks,
+      totalCost: 0,
+      children: [],
+    },
+  };
+}
 
+/**
+ * Execute pre-parsed batch tasks under one shared deadline and return the
+ * admitted 200 envelope. Partial-failure semantics are frozen here:
+ * per-item validation/timeout/upstream failures degrade that item to a
+ * typed {status, body} entry — the batch itself is always 200, never a
+ * whole-batch 502. Private, no-store, no L0 write: the composed page is
+ * caller-specific, never CDN-shared.
+ */
+export async function executeBatchTasks(
+  tasks: BatchTask[],
+  deps: BatchDeps,
+  requestId: string,
+  opts?: BatchOptions,
+  childCtx?: BatchChildContext,
+): Promise<NextResponse> {
   // Shared deadline: every runnable item races the same gate, so the whole
   // fan-out settles within overallMs no matter how many items hang. Each
   // timed-out item builds a FRESH error body (never a shared alias), and the
@@ -754,7 +912,23 @@ export async function handleBatch(
         }
         const run = (async (): Promise<BatchSubResult> => {
           try {
-            return await deps.execute(task.url, requestId, controller.signal);
+            // Caller credentials + already-billed marker ride only on real
+            // sub-fetches (static tasks never execute). Unsigned when the
+            // admitted path minted nothing — those children fall through to
+            // normal admission (fail toward charging).
+            const extraHeaders: Record<string, string> = {
+              ...(childCtx?.forwardedHeaders ?? {}),
+            };
+            const marker = childCtx?.signChild?.(task.url);
+            if (marker) {
+              extraHeaders[BATCH_CHILD_HEADER] = marker;
+            }
+            return await deps.execute(
+              task.url,
+              requestId,
+              controller.signal,
+              extraHeaders,
+            );
           } catch (err) {
             // Timeouts are timeouts wherever they fire: the shared-deadline
             // abort AND the per-item fail-fast (AbortSignal.timeout) both
@@ -784,12 +958,47 @@ export async function handleBatch(
   }
 
   // Private: the composed page is caller-specific, never CDN-shared.
-  return successResponse(
+  const response = successResponse(
     { results },
     {
       requestId,
       cacheControl: CACHE_CONTROL.noStore,
     },
+  );
+  // Gated on childCtx: only pipeline-driven executions pass one (the
+  // route always does; the deprecated direct handleBatch never does), so
+  // the internal signal exists exactly where a pipeline wrapper strips it.
+  if (childCtx && results.some((result) => result.status >= 400)) {
+    // Internal partial-success signal for the pipeline's usage row (the
+    // pipeline strips it before serving — never wire contract).
+    response.headers.set(BATCH_PARTIAL_HEADER, "1");
+  }
+  return response;
+}
+
+/**
+ * @deprecated Legacy direct entry point — preflight + fan-out with NO
+ * pipeline admission (no rate-limit, no quota charge, no usage row, no
+ * caller-credential forwarding, no already-billed markers). Kept ONLY for
+ * unit tests exercising pre-pipeline batch semantics; the production POST
+ * (`createBatchHandler` in the batch route) never calls this — it composes
+ * `parseBatchRequest` + `withRequestContext` + `executeBatchTasks` so the
+ * priced total is charged exactly once. Do not add new callers.
+ */
+export async function handleBatch(
+  req: NextRequest,
+  deps: BatchDeps,
+  opts?: BatchOptions,
+): Promise<NextResponse> {
+  const parsed = await parseBatchRequest(req);
+  if (!parsed.ok) {
+    return parsed.response;
+  }
+  return executeBatchTasks(
+    parsed.value.tasks,
+    deps,
+    parsed.value.requestId,
+    opts,
   );
 }
 

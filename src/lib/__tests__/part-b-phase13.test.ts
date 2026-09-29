@@ -511,13 +511,14 @@ describe("phase 13 pipeline integration", () => {
     const wiredLabels = [
       "health",
       "me",
+      "batch",
       "admin.keys.create",
       "admin.keys.list",
       "admin.keys.revoke",
       "admin.users.role",
       "admin.users.tier",
     ];
-    expect(wiredLabels).toHaveLength(7);
+    expect(wiredLabels).toHaveLength(8);
     for (const label of wiredLabels) {
       expect(isKnownOperation(label)).toBe(true);
     }
