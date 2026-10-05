@@ -216,8 +216,9 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
  * Phase 17 abuse signal for batch preflight rejects (oversize bodies,
  * over-count/cost fan-outs, malformed shapes). Best-effort and detached:
  * the rejection is already built, and auth resolution must never delay
- * it. Keying matches the pipeline (user > key > shared anonymous bucket).
- * Never throws.
+ * it. Keying matches the pipeline abuse principal (key-first, never
+ * owner-first — one key's rejects must not pool under the owner's user
+ * identity). Never throws.
  */
 async function noteBatchPreflightReject(
   providers: PipelineProviders,
@@ -226,10 +227,10 @@ async function noteBatchPreflightReject(
   try {
     const auth = await (providers.auth ?? clerkAuthProvider).resolve(req);
     const principal =
-      auth.userId !== undefined && auth.userId !== ""
-        ? `user:${auth.userId}`
-        : auth.keyId !== undefined && auth.keyId !== ""
-          ? `key:${auth.keyId}`
+      auth.keyId !== undefined && auth.keyId !== ""
+        ? `key:${auth.keyId}`
+        : auth.userId !== undefined && auth.userId !== ""
+          ? `user:${auth.userId}`
           : "anonymous";
     noteAbuseOutcome({
       principal,

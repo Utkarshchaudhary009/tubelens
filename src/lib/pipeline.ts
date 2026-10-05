@@ -22,12 +22,16 @@
 // JSON errors (never HTML, never stacks), always carrying X-Request-Id.
 // Observability hooks are best-effort and can never break a response.
 
-import type { NextRequest, NextResponse } from "next/server";
+import type { NextRequest } from "next/server";
+import { NextResponse } from "next/server";
 import {
+  ABUSE_ENFORCE_TIMEOUT_MS,
   type AbuseOutcome,
+  type AbuseVerdict,
   enforceAbuseVerdict,
   noteAbuseOutcome,
 } from "./abuse";
+import type { ApiKeysClient } from "./api-keys";
 import { type AuthContext, type AuthProvider, getAuthProvider } from "./auth";
 import {
   type AuthorizeAction,
@@ -40,6 +44,7 @@ import {
   getBatchMarkerSecrets,
   verifyBatchChildMarker,
 } from "./batch-marker";
+import type { ClerkAdminClient } from "./clerk-admin";
 import { ConfigError, getConfig } from "./config";
 import { errorResponse } from "./errors";
 import { applyCorsHeaders, applySecurityHeaders } from "./http-headers";
@@ -98,6 +103,9 @@ export interface PipelineProviders {
   rateLimit?: RateLimitProvider;
   /** Monthly allowance store (Phase 14); defaults to the shared store. */
   quotaStore?: QuotaStore;
+  /** Phase 17 abuse-enforcement clients (tests); default to live singletons. */
+  abuseClerk?: ClerkAdminClient;
+  abuseKeys?: ApiKeysClient;
   usage?: UsageRecorder;
   observability?: ObservabilityProvider;
   /** Env override for config validation (tests); defaults to process.env. */
@@ -360,9 +368,16 @@ export function withRequestContext(
         defaultRateLimitDecision(),
         origin,
       );
-      // Phase 17: an authorization denial is an auth-failure signal.
-      // Response-neutral — the 401/403 above is already built.
-      observeAbuseOutcome(ctx, route, "auth_failure");
+      // Phase 17: a 401 baseline denial is an auth-failure signal.
+      // Response-neutral — the 401 above is already built. 403
+      // scope/permission denials are NOT credential failures and are never
+      // counted (counting them would revoke callers for permission denials).
+      if (baselineDenied.status === 401) {
+        await observeAbuseOutcome(ctx, route, "auth_failure", {
+          clerk: providers.abuseClerk,
+          keys: providers.abuseKeys,
+        });
+      }
       return baselineDenied;
     }
 
@@ -496,7 +511,7 @@ export function withRequestContext(
     }
     if (!decision.allowed) {
       span.end();
-      const res = errorResponse(ctx.requestId, {
+      let res = errorResponse(ctx.requestId, {
         code: "rate_limited",
         message: "Rate limit exceeded.",
         hint: "Slow down and retry after the time in Retry-After.",
@@ -508,10 +523,20 @@ export function withRequestContext(
       res.headers.set("X-RateLimit-Limit", String(decision.limit));
       res.headers.set("X-RateLimit-Remaining", String(decision.remaining));
       res.headers.set("X-RateLimit-Reset", String(decision.reset));
-      // Phase 17: count the 429 toward abuse controls. Response-neutral —
-      // the 429 above is byte-identical either way; a revoke-level verdict
-      // detaches enforcement (DRY_RUN-aware) without delaying this response.
-      observeAbuseOutcome(ctx, route, "rate_limited");
+      // Phase 17: count the 429 toward abuse controls. The 429 above is
+      // already built; enforcement on a revoke-level verdict is awaited
+      // inside the fail-fast budget (rare — only threshold-crossers pay it),
+      // and a warn stamps Retry-After + warnings[] per the Phase 17 table.
+      const verdict = await observeAbuseOutcome(ctx, route, "rate_limited", {
+        clerk: providers.abuseClerk,
+        keys: providers.abuseKeys,
+      });
+      if (verdict === "warn") {
+        res = await withAbuseWarn(
+          res,
+          "Repeated rate-limit hits flagged by abuse controls; slow down and retry after the time in Retry-After.",
+        );
+      }
       return res;
     }
 
@@ -600,14 +625,24 @@ export function withRequestContext(
         );
         span.end();
         // Phase 17: each quota-exhausted outcome is one empty-window
-        // observation (×3 consecutive → downgrade); response-neutral.
-        observeAbuseOutcome(ctx, route, "quota_exhausted");
+        // observation on the request's monthly window (×3 DISTINCT windows
+        // → downgrade); the 429 below is already shaped.
+        const abuseVerdict = await observeAbuseOutcome(
+          ctx,
+          route,
+          "quota_exhausted",
+          {
+            quotaWindowId: outcome.windowId,
+            clerk: providers.abuseClerk,
+            keys: providers.abuseKeys,
+          },
+        );
         const retryAfter = Math.max(
           1,
           Math.ceil((outcome.resetMs - nowMs) / 1000),
         );
         const resetDay = new Date(outcome.resetMs).toISOString().slice(0, 10);
-        const res = errorResponse(ctx.requestId, {
+        let res = errorResponse(ctx.requestId, {
           code: "quota_exceeded",
           message: "Monthly quota exhausted.",
           hint: `Monthly credit allowance exhausted; new credits on ${resetDay} — reduce usage or wait for reset.`,
@@ -616,6 +651,12 @@ export function withRequestContext(
           origin,
         });
         stampRateLimitHeaders(res, ctx, decision, origin);
+        if (abuseVerdict === "warn") {
+          res = await withAbuseWarn(
+            res,
+            "Repeated quota exhaustion flagged by abuse controls; reduce usage or wait for reset.",
+          );
+        }
         return res;
       }
     }
@@ -634,12 +675,28 @@ export function withRequestContext(
         res.headers.delete(BATCH_PARTIAL_HEADER);
       }
       // Phase 17: feed in-pipeline error/timeout responses back to the
-      // abuse counters. Response-neutral — the response is already built;
-      // counting never throws and enforcement detaches (see
-      // `observeAbuseOutcome`). Batch preflight rejects never reach here
-      // (they return before admission), so the batch route counts those
-      // itself as `batch_rejected`.
-      observeAbuseResponseStatus(ctx, route, res.status);
+      // abuse counters (400 → validation spam, 401 → auth failure, 504 →
+      // timeout churn; 403 scope denials are never counted). The response is
+      // already built; enforcement on a revoke-level verdict is awaited
+      // inside the fail-fast budget, and a warn stamps Retry-After:60 +
+      // warnings[] per the Phase 17 table. Batch preflight rejects never
+      // reach here (they return before admission), so the batch route counts
+      // those itself as `batch_rejected`.
+      const abuseVerdict = await observeAbuseResponseStatus(
+        ctx,
+        route,
+        res.status,
+        {
+          clerk: providers.abuseClerk,
+          keys: providers.abuseKeys,
+        },
+      );
+      if (abuseVerdict === "warn") {
+        res = await withAbuseWarn(
+          res,
+          "Repeated rejected requests flagged by abuse controls; fix the request shape and retry after the time in Retry-After.",
+        );
+      }
     } catch (err) {
       // Phase 17: a fail-fast timeout escaping the handler is timeout
       // churn; any other throw is our own crash, never the caller's abuse
@@ -648,7 +705,10 @@ export function withRequestContext(
         err instanceof Error &&
         (err.name === "TimeoutError" || err.name === "AbortError")
       ) {
-        observeAbuseOutcome(ctx, route, "timeout");
+        await observeAbuseOutcome(ctx, route, "timeout", {
+          clerk: providers.abuseClerk,
+          keys: providers.abuseKeys,
+        });
       }
       safe(() =>
         observability.captureError(scrubError(err), {
@@ -708,9 +768,11 @@ export function withRequestContext(
         };
         // Phase 17: a successful consume proves allowance remains — clear
         // this principal's quota-empty streak (best-effort, never throws).
+        // Keyed on the abuse principal (key-first, like the counting path)
+        // so key-attributed streaks actually reset.
         safe(() =>
           noteAbuseOutcome({
-            principal,
+            principal: abusePrincipal(ctx),
             route,
             outcome: "quota_consumed",
           }),
@@ -962,69 +1024,167 @@ function accountingTimeout(controller: AbortController): Promise<void> {
 }
 
 /**
- * Phase 17 abuse observation: forward an already-computed pipeline outcome
- * to the abuse counters, and detach enforcement on revoke-level verdicts.
- * Fully response-neutral: counting never throws, enforcement runs after
- * this response is built (never awaited), honors DRY_RUN, and a
- * `user:`-principal revoke without a session handle degrades to an
- * audit row for an operator (no handle when the caller is a key or the
- * session shape carried none). Anonymous verdicts are warn-only by
- * construction. `key:` principals carry their subject as `targetUserId`
- * so downgrade can resolve an attributable user.
+ * Phase 17 abuse principal: key-first, never owner-first. An `api_key`
+ * caller carries both `keyId` and a subject `userId`, but its failures must
+ * pool under the KEY identity — pooling under `user:` would attribute one
+ * key's abuse to the owner (punishing their other keys/sessions) and route
+ * revoke at a session the key never had, leaving the abusive key usable.
+ * Key verdicts revoke/suspend the KEY via `apiKeys.revoke`, never the
+ * owner's sessions.
  */
-function observeAbuseOutcome(
+function abusePrincipal(ctx: RequestContext): string {
+  const keyId = ctx.auth.keyId;
+  if (typeof keyId === "string" && keyId !== "") {
+    return `key:${keyId}`;
+  }
+  return ctx.rateLimitIdentity;
+}
+
+interface AbuseObserveDeps {
+  quotaWindowId?: string;
+  clerk?: ClerkAdminClient;
+  keys?: ApiKeysClient;
+}
+
+/**
+ * Phase 17 abuse observation: forward an already-computed pipeline outcome
+ * to the abuse counters and AWAIT enforcement on revoke-level verdicts.
+ * Awaiting (instead of fire-and-forget) keeps enforcement alive on
+ * serverless runtimes that freeze detached work after the response; it
+ * stays p95-safe because only rare threshold-crossing requests perform a
+ * Clerk call (ok/warn verdicts return after in-memory counting only), every
+ * call runs inside the 8s fail-fast budget, and enforcement never throws
+ * (failures degrade to audit + metric). `key:` principals carry their
+ * subject as `targetUserId` so downgrade can resolve an attributable user,
+ * but their revoke path touches only the key — never the owner's sessions.
+ * Returns the verdict so callers can stamp warn signals on the response.
+ */
+async function observeAbuseOutcome(
   ctx: RequestContext,
   route: string | undefined,
   outcome: AbuseOutcome,
-): void {
-  safe(() => {
-    const principal = ctx.rateLimitIdentity;
-    const keySubject =
-      principal.startsWith("key:") &&
-      ctx.auth.userId !== undefined &&
-      ctx.auth.userId !== ""
-        ? ctx.auth.userId
-        : undefined;
-    const verdict = noteAbuseOutcome({
+  deps: AbuseObserveDeps = {},
+): Promise<AbuseVerdict> {
+  const principal = abusePrincipal(ctx);
+  const keySubject =
+    principal.startsWith("key:") &&
+    ctx.auth.userId !== undefined &&
+    ctx.auth.userId !== ""
+      ? ctx.auth.userId
+      : undefined;
+  let verdict: AbuseVerdict = "ok";
+  try {
+    // No `targetUserId` here: warn/ban audit rows must name the key itself
+    // (`key:…`), never the owner's subject — the subject is threaded only
+    // into downgrade enforcement below, where it resolves the user to step.
+    verdict = noteAbuseOutcome({
       principal,
       route,
       outcome,
       requestId: ctx.requestId,
-      ...(keySubject !== undefined ? { targetUserId: keySubject } : {}),
+      ...(deps.quotaWindowId !== undefined
+        ? { quotaWindowId: deps.quotaWindowId }
+        : {}),
     });
-    if (verdict === "revoke" || verdict === "downgrade") {
-      return enforceAbuseVerdict({
+  } catch {
+    return "ok";
+  }
+  if (verdict === "revoke" || verdict === "downgrade") {
+    try {
+      await enforceAbuseVerdict({
         verdict,
         principal,
         requestId: ctx.requestId,
         reason: `abuse:${outcome} threshold reached; automatic ${verdict} per abuse controls.`,
-        ...(ctx.auth.sessionId !== undefined && ctx.auth.sessionId !== ""
+        // Sessions revoke only for `user:` principals; key abuse revokes
+        // the key (see `abusePrincipal`), never the owner's sessions.
+        ...(principal.startsWith("user:") &&
+        ctx.auth.sessionId !== undefined &&
+        ctx.auth.sessionId !== ""
           ? { sessionId: ctx.auth.sessionId }
           : {}),
-        ...(keySubject !== undefined ? { targetUserId: keySubject } : {}),
+        // Subject threading is downgrade-only: a key revoke audits against
+        // the key reference, never the owner's user id.
+        ...(keySubject !== undefined && verdict === "downgrade"
+          ? { targetUserId: keySubject }
+          : {}),
+        ...(deps.clerk !== undefined ? { clerk: deps.clerk } : {}),
+        ...(deps.keys !== undefined ? { keys: deps.keys } : {}),
+        signal: AbortSignal.timeout(ABUSE_ENFORCE_TIMEOUT_MS),
       });
+    } catch {
+      // Intentionally ignored — enforcement must never break a response.
     }
-    return undefined;
-  });
+  }
+  return verdict;
 }
 
 /**
  * Phase 17 status-to-signal mapping for handler-built responses: 400s are
- * validation spam, 401/403s are auth failures, 504s are timeout churn.
+ * validation spam, 401s are auth failures, 504s are timeout churn.
+ * 403s are scope/permission denials — authorization outcomes, NOT
+ * credential failures — and are deliberately never counted (counting them
+ * as `auth_failure` would revoke callers for permission denials).
  * Handler-thrown fail-fast timeouts map separately at the throw site
- * above. Never throws; unknown statuses are ignored.
+ * above. Never throws; unknown statuses resolve `ok`.
  */
-function observeAbuseResponseStatus(
+async function observeAbuseResponseStatus(
   ctx: RequestContext,
   route: string | undefined,
   status: number,
-): void {
+  deps: AbuseObserveDeps = {},
+): Promise<AbuseVerdict> {
   if (status === 400) {
-    observeAbuseOutcome(ctx, route, "validation_error");
-  } else if (status === 401 || status === 403) {
-    observeAbuseOutcome(ctx, route, "auth_failure");
-  } else if (status === 504) {
-    observeAbuseOutcome(ctx, route, "timeout");
+    return observeAbuseOutcome(ctx, route, "validation_error", deps);
+  }
+  if (status === 401) {
+    return observeAbuseOutcome(ctx, route, "auth_failure", deps);
+  }
+  if (status === 504) {
+    return observeAbuseOutcome(ctx, route, "timeout", deps);
+  }
+  return "ok";
+}
+
+/**
+ * Phase 17 warn stamping: a `warn` verdict adds `Retry-After: 60` (when the
+ * response lacks one — 429s already carry their own) plus a `warnings[]`
+ * entry naming the abuse control. Only additive, never throws, and a body
+ * that is not a JSON object (or already carries `warnings`) is returned
+ * untouched — warn changes no decision, it only advises the caller.
+ */
+async function withAbuseWarn(
+  res: NextResponse,
+  message: string,
+): Promise<NextResponse> {
+  try {
+    if (!res.headers.get("Retry-After")) {
+      res.headers.set("Retry-After", "60");
+    }
+    const body: unknown = await res
+      .clone()
+      .text()
+      .then(
+        (text) => JSON.parse(text) as unknown,
+        () => undefined,
+      );
+    if (
+      body === null ||
+      typeof body !== "object" ||
+      Array.isArray(body) ||
+      (body as Record<string, unknown>).warnings !== undefined
+    ) {
+      return res;
+    }
+    return new NextResponse(
+      JSON.stringify({
+        ...(body as Record<string, unknown>),
+        warnings: [{ code: "abuse_warned", message }],
+      }),
+      { status: res.status, headers: res.headers },
+    );
+  } catch {
+    return res;
   }
 }
 

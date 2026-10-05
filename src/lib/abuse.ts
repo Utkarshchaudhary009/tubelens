@@ -120,9 +120,11 @@ export const ABUSE_TIMEOUT_WARN_AT = 10;
 export const ABUSE_TIMEOUT_COOLDOWN_MS = 10 * 60_000;
 
 /**
- * Quota empty ×3 consecutive windows → downgrade one tier, 15min cooldown.
- * Each quota-exhausted outcome counts as one empty-window observation; any
- * successful consume resets the streak.
+ * Quota empty ×3 consecutive DISTINCT windows → downgrade one tier, 15min
+ * cooldown. Repeats inside one exhausted window (same monthly window id)
+ * are a SINGLE observation — N rapid 429s in one window never downgrade;
+ * any successful consume resets the streak, and a downgrade consumes it
+ * (the next rung needs three fresh windows).
  */
 export const ABUSE_QUOTA_EMPTY_WINDOWS = 3;
 export const ABUSE_DOWNGRADE_COOLDOWN_MS = 15 * 60_000;
@@ -232,6 +234,13 @@ interface QuotaEmptyStreak {
    * principals downgrade instead of warning, so only anonymous uses this).
    */
   lastAnonymousWarnAt: number;
+  /**
+   * Monthly window id of the last COUNTED empty observation (`YYYY-MM`,
+   * matching `quotaWindowFor`). Repeats inside the same window are ignored
+   * (one increment per window per principal) — without this, retries in a
+   * single exhausted window would wrongful-downgrade.
+   */
+  lastWindowId?: string;
 }
 
 const counters = new Map<string, AbuseCounter>();
@@ -317,6 +326,14 @@ export interface AbuseCheckInput {
   requestId?: string;
   /** Clerk user id override (key principals whose subject is known). */
   targetUserId?: string;
+  /**
+   * Distinct-window discriminator for `quota_empty` (the monthly
+   * `quotaCheck.windowId`, `YYYY-MM`). Repeats carrying the same window id
+   * as the last counted observation are ignored. Omit only in tests — the
+   * fallback is the calendar month of `nowMs`, which matches
+   * `quotaWindowFor` exactly.
+   */
+  quotaWindowId?: string;
   /** Clock override (tests); defaults to Date.now. */
   nowMs?: number;
 }
@@ -349,6 +366,8 @@ export function noteAbuseOutcome(input: {
   outcome: AbuseOutcome;
   requestId?: string;
   targetUserId?: string;
+  /** Distinct-window discriminator for `quota_exhausted` (see above). */
+  quotaWindowId?: string;
   nowMs?: number;
 }): AbuseVerdict {
   try {
@@ -362,6 +381,9 @@ export function noteAbuseOutcome(input: {
       route: input.route,
       requestId: input.requestId,
       targetUserId: input.targetUserId,
+      ...(input.quotaWindowId !== undefined
+        ? { quotaWindowId: input.quotaWindowId }
+        : {}),
       nowMs: input.nowMs,
     });
   } catch {
@@ -386,6 +408,11 @@ function rememberQuotaStreak(
   streak: QuotaEmptyStreak,
 ): void {
   remember(quotaEmptyStreaks, principal, streak);
+}
+
+/** Calendar-month bucket (`YYYY-MM`) — identical to `quotaWindowFor`. */
+function monthBucket(now: number): string {
+  return new Date(now).toISOString().slice(0, 7);
 }
 
 function evaluateAbuse(input: AbuseCheckInput): AbuseVerdict {
@@ -476,11 +503,20 @@ function evaluateAbuse(input: AbuseCheckInput): AbuseVerdict {
 }
 
 function evaluateQuotaEmpty(input: AbuseCheckInput, now: number): AbuseVerdict {
+  // Distinct-window counting: retries inside one exhausted monthly window
+  // are ONE observation. The fallback derives the calendar month from the
+  // clock (identical to `quotaWindowFor`), so callers that omit the window
+  // still dedupe same-window retries.
+  const windowId = input.quotaWindowId ?? monthBucket(now);
   const prior = quotaEmptyStreaks.get(input.principal);
+  if (prior?.lastWindowId === windowId) {
+    return "ok";
+  }
   const streak: QuotaEmptyStreak = {
     count: (prior?.count ?? 0) + 1,
     lastDowngradeAt: prior?.lastDowngradeAt ?? 0,
     lastAnonymousWarnAt: prior?.lastAnonymousWarnAt ?? 0,
+    lastWindowId: windowId,
   };
   rememberQuotaStreak(input.principal, streak);
   if (streak.count < ABUSE_QUOTA_EMPTY_WINDOWS) {
@@ -681,7 +717,9 @@ async function enforce(input: AbuseEnforceInput): Promise<AbuseEnforceResult> {
   }
   const reason = cleanReason(input.reason);
   if (isAbuseDryRun(input.env ?? process.env)) {
-    // Week-1 monitor mode: structured log + audit row, zero mutations.
+    // Week-1 monitor mode: structured log + audit row, zero mutations. The
+    // audit action is truthfully `abuse.warned` (NOT revoked/downgraded —
+    // nothing was enforced); the reason names the attempted verdict.
     console.info(
       JSON.stringify({
         level: "abuse",
@@ -693,7 +731,7 @@ async function enforce(input: AbuseEnforceInput): Promise<AbuseEnforceResult> {
       }),
     );
     auditAbuse(
-      input.verdict === "revoke" ? "abuse.revoked" : "abuse.downgraded",
+      "abuse.warned",
       {
         principal: input.principal,
         requestId: input.requestId,
@@ -744,13 +782,14 @@ async function enforceRevoke(
     const userId = deriveAbuseTarget(input.principal, input.targetUserId);
     if (!input.sessionId) {
       // No session handle: revoking "the user" wholesale would be a blunt
-      // instrument, so record the decision and leave the session to an
+      // instrument, so record the decision truthfully as a warn (NOT
+      // revoked — nothing was enforced) and leave the session to an
       // operator (Dashboard or admin/users routes).
       auditAbuse(
-        "abuse.revoked",
+        "abuse.warned",
         input,
         Date.now(),
-        `${reason} No session id — operator must revoke via the Clerk Dashboard.`,
+        `${reason} Revoke deferred: no session id — operator must revoke via the Clerk Dashboard.`,
       );
       return {
         enforced: false,
