@@ -174,9 +174,13 @@ export function createBatchHandler(
     if (!preflight.ok) {
       // Phase 17: preflight rejects never enter the pipeline (zero charge,
       // zero children), so the pipeline cannot count them — count the
-      // batch_rejected signal here instead. Detached: principal resolution
-      // is async and must never delay the rejection; never throws.
-      void noteBatchPreflightReject(providers, req);
+      // batch_rejected signal here instead. AWAITED in-request, never
+      // detached: Vercel freezes detached work after the response, so auth
+      // resolves BEFORE the rejection returns; the counting itself is
+      // synchronous (batch rejects are warn-only, never enforced). The extra
+      // resolve costs no more than any admitted request's auth, and the
+      // whole path is best-effort (never throws, never delays past auth).
+      await noteBatchPreflightReject(providers, req);
       return preflight.response;
     }
     const admitted = preflight.value;
@@ -214,11 +218,14 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 
 /**
  * Phase 17 abuse signal for batch preflight rejects (oversize bodies,
- * over-count/cost fan-outs, malformed shapes). Best-effort and detached:
- * the rejection is already built, and auth resolution must never delay
- * it. Keying matches the pipeline abuse principal (key-first, never
- * owner-first — one key's rejects must not pool under the owner's user
- * identity). Never throws.
+ * over-count/cost fan-outs, malformed shapes). Awaited in-request by the
+ * caller (never detached past the response — Vercel freezes that work), and
+ * fully synchronous once auth resolves: `batch_rejected` is warn-only, so no
+ * enforcement await exists on this path. Keying matches the pipeline abuse
+ * principal (key-first, never owner-first — one key's rejects must not pool
+ * under the owner's user identity), and `targetUserId` rides along ONLY for
+ * `user:` principals (a key's row names the key, never the owner's subject
+ * — the pipeline convention). Never throws.
  */
 async function noteBatchPreflightReject(
   providers: PipelineProviders,
@@ -237,7 +244,11 @@ async function noteBatchPreflightReject(
       route: "batch",
       outcome: "batch_rejected",
       requestId: resolveRequestId(req),
-      ...(auth.userId ? { targetUserId: auth.userId } : {}),
+      ...(principal.startsWith("user:") &&
+      auth.userId !== undefined &&
+      auth.userId !== ""
+        ? { targetUserId: auth.userId }
+        : {}),
     });
   } catch {
     // Intentionally ignored — abuse counting must never break a response.

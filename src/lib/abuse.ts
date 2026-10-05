@@ -20,9 +20,15 @@
 //
 // Rules:
 // - Keying is on the rate-limit identity (`user:`/`key:`) — NEVER IP and
-//   never a plaintext secret. Unattributable principals (the shared
-//   `anonymous` bucket) are warn-only: they can never be revoked/downgraded
-//   because one bad actor must not punish every anonymous caller.
+//   never a plaintext secret — EXCEPT `quota_empty`, which keys on the
+//   QUOTA OWNER (the quota principal: `user:` owner for key callers with a
+//   subject) because quota is per-account. Keying quota streaks on `key:`
+//   would splinter one account's drought into per-key streaks and a sibling
+//   key's consume would never reset the streak. Rate/auth abuse stays
+//   key-attributed (one key's failures must not pool under the owner).
+//   Unattributable principals (the shared `anonymous` bucket) are warn-only:
+//   they can never be revoked/downgraded because one bad actor must not
+//   punish every anonymous caller.
 // - `warn` changes no state: the caller already holds a normal 429 with
 //   `Retry-After` + `X-RateLimit-*`; the control only logs, audits, and
 //   emits a metric.
@@ -426,6 +432,10 @@ function evaluateAbuse(input: AbuseCheckInput): AbuseVerdict {
   const policy = SIGNAL_POLICIES[input.signal];
   const key = `${input.principal}::${input.signal}`;
   let bucket = counters.get(key);
+  // Fixed-window counting (standard, same tradeoff as the rate limiter): a
+  // burst straddling the window boundary can reach ~2x the threshold across
+  // two adjacent windows without escalating. Accepted — cooldowns bound the
+  // repeat rate, and a sliding window is not worth the bookkeeping here.
   if (!bucket || now - bucket.windowStart >= policy.windowMs) {
     bucket = {
       count: 0,
@@ -481,7 +491,14 @@ function evaluateAbuse(input: AbuseCheckInput): AbuseVerdict {
       remember(revokeStrikes, input.principal, { count: strikes, at: now });
     }
   }
-  emitAbuseMetric(verdict);
+  // Metrics fire only for decided outcomes: `warn`/`ban-queued` have no
+  // enforcement step, so counting time is their only truthful moment, while
+  // `revoke`/`downgrade` metrics fire at enforcement SUCCESS (see
+  // `enforceRevoke`/`enforceDowngrade`) — never on dry-run sketches or
+  // failed mutations, which dashboards must not count as enforced.
+  if (verdict === "warn" || verdict === "ban-queued") {
+    emitAbuseMetric(verdict);
+  }
   if (verdict === "warn") {
     auditAbuse(
       "abuse.warned",
@@ -544,9 +561,10 @@ function evaluateQuotaEmpty(input: AbuseCheckInput, now: number): AbuseVerdict {
   streak.lastDowngradeAt = now;
   // A downgrade consumes the streak: the next rung needs three FRESH
   // consecutive empty windows, so one long drought cannot fast-walk a
-  // caller down the tier ladder on a single observation run.
+  // caller down the tier ladder on a single observation run. No metric here:
+  // the downgrade metric fires only when enforcement SUCCEEDS (dry-runs and
+  // failed Clerk mutations must not read as downgrades on dashboards).
   streak.count = 0;
-  emitAbuseMetric("downgrade");
   return "downgrade";
 }
 
@@ -719,7 +737,8 @@ async function enforce(input: AbuseEnforceInput): Promise<AbuseEnforceResult> {
   if (isAbuseDryRun(input.env ?? process.env)) {
     // Week-1 monitor mode: structured log + audit row, zero mutations. The
     // audit action is truthfully `abuse.warned` (NOT revoked/downgraded —
-    // nothing was enforced); the reason names the attempted verdict.
+    // nothing was enforced); the reason names the attempted verdict. No
+    // metric fires: dry-run sketches must not read as enforced on dashboards.
     console.info(
       JSON.stringify({
         level: "abuse",
@@ -776,6 +795,7 @@ async function enforceRevoke(
     // The plaintext secret never appears here: only the key reference and
     // the operator reason reach the audit row.
     auditAbuse("abuse.revoked", input, Date.now(), reason);
+    emitAbuseMetric("revoke");
     return { enforced: true, dryRun: false, detail: "API key revoked." };
   }
   if (input.principal.startsWith("user:")) {
@@ -784,13 +804,16 @@ async function enforceRevoke(
       // No session handle: revoking "the user" wholesale would be a blunt
       // instrument, so record the decision truthfully as a warn (NOT
       // revoked — nothing was enforced) and leave the session to an
-      // operator (Dashboard or admin/users routes).
+      // operator (Dashboard or admin/users routes). The warn metric fires
+      // here because this IS the warn decision (counting emitted nothing
+      // for the revoke verdict, by design).
       auditAbuse(
         "abuse.warned",
         input,
         Date.now(),
         `${reason} Revoke deferred: no session id — operator must revoke via the Clerk Dashboard.`,
       );
+      emitAbuseMetric("warn");
       return {
         enforced: false,
         dryRun: false,
@@ -826,6 +849,7 @@ async function enforceRevoke(
     }
     await clerk.revokeSession(input.sessionId, { signal });
     auditAbuse("abuse.revoked", input, Date.now(), reason);
+    emitAbuseMetric("revoke");
     return { enforced: true, dryRun: false, detail: "Session revoked." };
   }
   // Unattributable (anonymous bucket) — warn-only by construction; a
@@ -891,6 +915,9 @@ async function enforceDowngrade(
     oldTier,
     newTier,
   });
+  // Enforced-success metric: counting emitted nothing for the downgrade
+  // verdict, so dashboards count only mutations that actually landed.
+  emitAbuseMetric("downgrade");
   return {
     enforced: true,
     dryRun: false,

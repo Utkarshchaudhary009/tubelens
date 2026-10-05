@@ -700,12 +700,15 @@ export function withRequestContext(
     } catch (err) {
       // Phase 17: a fail-fast timeout escaping the handler is timeout
       // churn; any other throw is our own crash, never the caller's abuse
-      // signal (and is never charged — see below).
+      // signal (and is never charged — see below). The verdict is kept so a
+      // warn stamps Retry-After:60 + warnings[] on the 500 below (same
+      // additive treatment as every other warn path).
+      let timeoutVerdict: AbuseVerdict = "ok";
       if (
         err instanceof Error &&
         (err.name === "TimeoutError" || err.name === "AbortError")
       ) {
-        await observeAbuseOutcome(ctx, route, "timeout", {
+        timeoutVerdict = await observeAbuseOutcome(ctx, route, "timeout", {
           clerk: providers.abuseClerk,
           keys: providers.abuseKeys,
         });
@@ -728,6 +731,12 @@ export function withRequestContext(
       // No consumption on throw: the peek above never writes, and this path
       // returns before the consume step — our crash is never the caller's
       // charge.
+      if (timeoutVerdict === "warn") {
+        return withAbuseWarn(
+          res,
+          "Upstream timeout retries flagged by abuse controls; back off and retry later — this signal never revokes.",
+        );
+      }
       return res;
     }
 
@@ -768,11 +777,12 @@ export function withRequestContext(
         };
         // Phase 17: a successful consume proves allowance remains — clear
         // this principal's quota-empty streak (best-effort, never throws).
-        // Keyed on the abuse principal (key-first, like the counting path)
-        // so key-attributed streaks actually reset.
+        // Keyed on the QUOTA OWNER (identical to the store key above), never
+        // the key-attributed abuse principal — so a sibling key's consume
+        // resets the owner's streak (see `abuseCountingPrincipal`).
         safe(() =>
           noteAbuseOutcome({
-            principal: abusePrincipal(ctx),
+            principal: quotaPrincipal(ctx),
             route,
             outcome: "quota_consumed",
           }),
@@ -1040,6 +1050,27 @@ function abusePrincipal(ctx: RequestContext): string {
   return ctx.rateLimitIdentity;
 }
 
+/**
+ * Phase 17 counting principal: quota outcomes key on the QUOTA OWNER while
+ * everything else stays key-attributed. Quota is per-account — the store
+ * key IS `quotaPrincipal(ctx)` (`user:` owner for key callers carrying a
+ * subject) — so the quota-empty streak and its consume-reset must use that
+ * same owner identity: per-`key:` streaks would splinter one account's
+ * drought (downgrading past a single key's rung while the shared bucket
+ * stays empty) and a sibling key's consume would never reset the streak.
+ * Rate/auth/validation/timeout/batch abuse stays on `abusePrincipal`
+ * (key-first): one key's failures must never pool under the owner's user
+ * identity.
+ */
+function abuseCountingPrincipal(
+  ctx: RequestContext,
+  outcome: AbuseOutcome,
+): string {
+  return outcome === "quota_exhausted" || outcome === "quota_consumed"
+    ? quotaPrincipal(ctx)
+    : abusePrincipal(ctx);
+}
+
 interface AbuseObserveDeps {
   quotaWindowId?: string;
   clerk?: ClerkAdminClient;
@@ -1065,7 +1096,9 @@ async function observeAbuseOutcome(
   outcome: AbuseOutcome,
   deps: AbuseObserveDeps = {},
 ): Promise<AbuseVerdict> {
-  const principal = abusePrincipal(ctx);
+  // Quota outcomes count on the quota owner; everything else on the
+  // key-attributed abuse principal (see `abuseCountingPrincipal`).
+  const principal = abuseCountingPrincipal(ctx, outcome);
   const keySubject =
     principal.startsWith("key:") &&
     ctx.auth.userId !== undefined &&

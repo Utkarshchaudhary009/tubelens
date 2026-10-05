@@ -9,6 +9,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { NextRequest } from "next/server";
+import { createBatchHandler } from "../../app/api/v1/batch/route";
 import {
   ABUSE_AUTH_FAIL_REVOKE_AT,
   ABUSE_BATCH_REJECT_WARN_AT,
@@ -33,6 +34,7 @@ import {
 } from "../audit";
 import type { ClerkAdminClient, ClerkUserRecord } from "../clerk-admin";
 import { contextFromClerkSession } from "../clerk-auth";
+import { successResponse } from "../envelope";
 import { errorResponse } from "../errors";
 import {
   noopObservabilityProvider,
@@ -41,6 +43,7 @@ import {
 } from "../observability";
 import { withRequestContext } from "../pipeline";
 import type { Tier } from "../product";
+import { InMemoryQuotaStore, quotaWindowFor } from "../quota-accounting";
 import type { RateLimitProvider } from "../rate-limit";
 
 const T0 = 1_750_000_000_000;
@@ -240,7 +243,7 @@ describe("abuse thresholds", () => {
 // ---------------------------------------------------------------------------
 
 describe("anonymous shared bucket", () => {
-  test("warn-only no matter the volume or signal", () => {
+  test("warn-only no matter the volume or signal", async () => {
     const verdicts = drive(
       "anonymous",
       "rate_limited",
@@ -276,7 +279,7 @@ describe("anonymous shared bucket", () => {
         quotaWindowId: "w3",
       }),
     ).toBe("warn");
-    expect(
+    await expect(
       enforceAbuseVerdict({
         verdict: "revoke",
         principal: "anonymous",
@@ -1138,6 +1141,228 @@ describe("abuse round-1 fixes", () => {
       warnings: Array<{ code: string }>;
     };
     expect(body.error.code).toBe("invalid_limit");
+    expect(body.warnings[0]?.code).toBe("abuse_warned");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round-2 review fixes: quota-owner streak keying, awaited batch counting
+// with key-attribution, timeout-warn stamping on the 500, and metrics only
+// on enforced success.
+// ---------------------------------------------------------------------------
+
+describe("abuse round-2 fixes", () => {
+  /** api_key caller carrying an owner subject (rate-limit/quota identity). */
+  const keyAuth = (keyId: string, userId: string) => ({
+    resolve: () => ({
+      type: "api_key" as const,
+      authenticated: true,
+      keyId,
+      userId,
+    }),
+  });
+
+  const okHandler = async (_r: NextRequest, ctx: { requestId: string }) =>
+    successResponse({ ok: true }, { requestId: ctx.requestId });
+
+  test("quota-empty streaks key on the quota owner, not the key", async () => {
+    const store = new InMemoryQuotaStore();
+    const { windowId } = quotaWindowFor(Date.now());
+    await store.add("user:owner_1", windowId, 10_000);
+    const run = withRequestContext(
+      okHandler,
+      { auth: keyAuth("key_A", "owner_1"), quotaStore: store },
+      "search",
+    );
+    const res = await run(new NextRequest("http://x/api/v1/search?q=hi"));
+    expect(res.status).toBe(429);
+    // The exhaustion counted on the OWNER: two more distinct windows
+    // downgrade (a per-key streak would still sit at observations 1–2).
+    expect(
+      noteAbuseOutcome({
+        principal: "user:owner_1",
+        outcome: "quota_exhausted",
+        nowMs: T0,
+        quotaWindowId: "w2",
+      }),
+    ).toBe("ok");
+    expect(
+      noteAbuseOutcome({
+        principal: "user:owner_1",
+        outcome: "quota_exhausted",
+        nowMs: T0,
+        quotaWindowId: "w3",
+      }),
+    ).toBe("downgrade");
+    // And the key identity holds no streak of its own: two fresh windows
+    // stay ok (under per-key streaks the pipeline exhaust would seed the
+    // key's streak, and the second window here would already downgrade).
+    for (const quotaWindowId of ["k1", "k2"]) {
+      expect(
+        noteAbuseOutcome({
+          principal: "key:key_A",
+          outcome: "quota_exhausted",
+          nowMs: T0,
+          quotaWindowId,
+        }),
+      ).toBe("ok");
+    }
+  });
+
+  test("a sibling key's consume resets the owner's quota streak", async () => {
+    const { windowId } = quotaWindowFor(Date.now());
+    const exhausted = new InMemoryQuotaStore();
+    await exhausted.add("user:owner_1", windowId, 10_000);
+    const exhaustRun = withRequestContext(
+      okHandler,
+      { auth: keyAuth("key_A", "owner_1"), quotaStore: exhausted },
+      "search",
+    );
+    expect(
+      (await exhaustRun(new NextRequest("http://x/api/v1/search?q=hi"))).status,
+    ).toBe(429);
+    // A DIFFERENT key of the same owner consumes successfully — allowance
+    // remains, so the owner's streak resets (under per-key resets it would
+    // stay at 1 and the w3 observation below would downgrade).
+    const fresh = new InMemoryQuotaStore();
+    const consumeRun = withRequestContext(
+      okHandler,
+      { auth: keyAuth("key_B", "owner_1"), quotaStore: fresh },
+      "search",
+    );
+    expect(
+      (await consumeRun(new NextRequest("http://x/api/v1/search?q=hi"))).status,
+    ).toBe(200);
+    expect(
+      noteAbuseOutcome({
+        principal: "user:owner_1",
+        outcome: "quota_exhausted",
+        nowMs: T0,
+        quotaWindowId: "w2",
+      }),
+    ).toBe("ok");
+    expect(
+      noteAbuseOutcome({
+        principal: "user:owner_1",
+        outcome: "quota_exhausted",
+        nowMs: T0,
+        quotaWindowId: "w3",
+      }),
+    ).toBe("ok");
+  });
+
+  test("batch preflight rejects count awaited on the key, never the owner", async () => {
+    const run = createBatchHandler(undefined, {
+      auth: keyAuth("key_batch", "owner_9"),
+    });
+    const oversize = () =>
+      run(
+        new NextRequest("http://x/api/v1/batch", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            requests: Array.from({ length: 11 }, () => ({
+              method: "GET",
+              path: "/api/v1/health",
+            })),
+          }),
+        }),
+      );
+    for (let i = 0; i < ABUSE_BATCH_REJECT_WARN_AT - 1; i += 1) {
+      expect((await oversize()).status).toBe(400);
+    }
+    // The 5th rejection warns — synchronously visible because counting is
+    // awaited in-request (never detached past the response).
+    expect((await oversize()).status).toBe(400);
+    const warned = abuseRows().filter((row) => row.action === "abuse.warned");
+    expect(warned.length).toBe(1);
+    // Key-attribution: the row names the key, never the owner's subject.
+    expect(warned[0]).toMatchObject({
+      target: "key:key_batch",
+      targetUserId: "key:key_batch",
+    });
+    expect(JSON.stringify(warned[0])).not.toContain("owner_9");
+  });
+
+  test("revoke/downgrade metrics fire only on enforced success", async () => {
+    const increments: string[] = [];
+    setObservabilityProvider({
+      ...noopObservabilityProvider,
+      increment: (name: string) => {
+        increments.push(name);
+      },
+    });
+    // Dry-run sketches emit nothing (visibility lives in audit rows + logs).
+    process.env.DRY_RUN = "1";
+    const { client } = mockKeys();
+    await enforceAbuseVerdict({
+      verdict: "revoke",
+      principal: "key:key_m1",
+      requestId: "req-m1",
+      reason: "monitor mode",
+      keys: client,
+    });
+    delete process.env.DRY_RUN;
+    expect(increments).not.toContain("abuse.revoked");
+    // Failed mutations emit nothing.
+    const broken = mockClerk("pro");
+    broken.failGetUserStatus = 500;
+    await enforceAbuseVerdict({
+      verdict: "downgrade",
+      principal: "user:u_m1",
+      requestId: "req-m2",
+      reason: "quota empty three windows running",
+      clerk: broken,
+      signal: AbortSignal.timeout(8000),
+    });
+    expect(increments).not.toContain("abuse.downgraded");
+    // Enforced mutations emit exactly once each.
+    const clerk = mockClerk("pro");
+    await enforceAbuseVerdict({
+      verdict: "revoke",
+      principal: "user:u_m2",
+      requestId: "req-m3",
+      reason: "credential spraying",
+      sessionId: "sess_m",
+      clerk,
+      signal: AbortSignal.timeout(8000),
+    });
+    await enforceAbuseVerdict({
+      verdict: "downgrade",
+      principal: "user:u_m3",
+      requestId: "req-m4",
+      reason: "quota empty three windows running",
+      clerk,
+      signal: AbortSignal.timeout(8000),
+    });
+    expect(increments.filter((n) => n === "abuse.revoked")).toHaveLength(1);
+    expect(increments.filter((n) => n === "abuse.downgraded")).toHaveLength(1);
+  });
+
+  test("timeout-churn warn stamps Retry-After:60 + warnings[] on the 500", async () => {
+    const run = withRequestContext(
+      async () => {
+        const timeout = new Error("upstream timed out");
+        timeout.name = "TimeoutError";
+        throw timeout;
+      },
+      {},
+      "search",
+    );
+    const req = () => new NextRequest("http://x/api/v1/search?q=hi");
+    for (let i = 0; i < ABUSE_TIMEOUT_WARN_AT - 1; i += 1) {
+      const res = await run(req());
+      expect(res.status).toBe(500);
+      expect(res.headers.get("Retry-After")).toBeNull();
+    }
+    const warned = await run(req());
+    expect(warned.status).toBe(500);
+    expect(warned.headers.get("Retry-After")).toBe("60");
+    const body = (await warned.json()) as {
+      error: { code: string };
+      warnings: Array<{ code: string }>;
+    };
+    expect(body.error.code).toBe("internal");
     expect(body.warnings[0]?.code).toBe("abuse_warned");
   });
 });

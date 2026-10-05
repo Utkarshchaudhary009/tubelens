@@ -66,6 +66,15 @@ export interface ClerkAdminClient {
  * the task even starts (never begin a mutation with a dead budget). On abort
  * the caller sees the signal's reason (a `TimeoutError` DOMException for
  * `AbortSignal.timeout`); on settle the abort listener is removed.
+ *
+ * Fail-safe note: the Clerk SDK accepts no AbortSignal, so this bounds OUR
+ * wait only — a timed-out write may still land server-side. That direction
+ * is safe (a late revoke/downgrade still neutralizes abuse; a late read is
+ * just discarded), and the outcome reconciles on the next authoritative
+ * read (`refetchAfterTimeout` after timed-out writes, or the pre-mutation
+ * `getUser` re-check). True cancellation is impossible here by SDK design,
+ * so no signal pass-through is attempted — do not "fix" this by threading
+ * the signal into SDK calls that ignore it.
  */
 export function withBudget<T>(
   start: () => Promise<T>,
