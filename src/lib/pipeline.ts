@@ -23,6 +23,11 @@
 // Observability hooks are best-effort and can never break a response.
 
 import type { NextRequest, NextResponse } from "next/server";
+import {
+  type AbuseOutcome,
+  enforceAbuseVerdict,
+  noteAbuseOutcome,
+} from "./abuse";
 import { type AuthContext, type AuthProvider, getAuthProvider } from "./auth";
 import {
   type AuthorizeAction,
@@ -500,6 +505,10 @@ export function withRequestContext(
       res.headers.set("X-RateLimit-Limit", String(decision.limit));
       res.headers.set("X-RateLimit-Remaining", String(decision.remaining));
       res.headers.set("X-RateLimit-Reset", String(decision.reset));
+      // Phase 17: count the 429 toward abuse controls. Response-neutral —
+      // the 429 above is byte-identical either way; a revoke-level verdict
+      // detaches enforcement (DRY_RUN-aware) without delaying this response.
+      observeAbuseOutcome(ctx, route, "rate_limited");
       return res;
     }
 
@@ -587,6 +596,9 @@ export function withRequestContext(
           }),
         );
         span.end();
+        // Phase 17: each quota-exhausted outcome is one empty-window
+        // observation (×3 consecutive → downgrade); response-neutral.
+        observeAbuseOutcome(ctx, route, "quota_exhausted");
         const retryAfter = Math.max(
           1,
           Math.ceil((outcome.resetMs - nowMs) / 1000),
@@ -675,6 +687,15 @@ export function withRequestContext(
           policyVersion: operationPolicyVersion,
           tier: ctx.tier,
         };
+        // Phase 17: a successful consume proves allowance remains — clear
+        // this principal's quota-empty streak (best-effort, never throws).
+        safe(() =>
+          noteAbuseOutcome({
+            principal,
+            route,
+            outcome: "quota_consumed",
+          }),
+        );
       } catch (err) {
         safe(() =>
           observability.captureError(scrubError(err), {
@@ -918,6 +939,39 @@ function accountingTimeout(controller: AbortController): Promise<void> {
     if (typeof unrefable.unref === "function") {
       unrefable.unref();
     }
+  });
+}
+
+/**
+ * Phase 17 abuse observation: forward an already-computed pipeline outcome
+ * to the abuse counters, and detach enforcement on revoke-level verdicts.
+ * Fully response-neutral: counting never throws, enforcement runs after
+ * this response is built (never awaited), honors DRY_RUN, and a
+ * `user:`-principal revoke without a session handle degrades to an
+ * audit row for an operator (the pipeline carries no session id — see
+ * `enforceAbuseVerdict`). Anonymous verdicts are warn-only by construction.
+ */
+function observeAbuseOutcome(
+  ctx: RequestContext,
+  route: string | undefined,
+  outcome: AbuseOutcome,
+): void {
+  safe(() => {
+    const verdict = noteAbuseOutcome({
+      principal: ctx.rateLimitIdentity,
+      route,
+      outcome,
+      requestId: ctx.requestId,
+    });
+    if (verdict === "revoke" || verdict === "downgrade") {
+      return enforceAbuseVerdict({
+        verdict,
+        principal: ctx.rateLimitIdentity,
+        requestId: ctx.requestId,
+        reason: `abuse:${outcome} threshold reached; automatic ${verdict} per abuse controls.`,
+      });
+    }
+    return undefined;
   });
 }
 

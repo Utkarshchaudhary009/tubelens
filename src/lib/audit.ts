@@ -23,7 +23,13 @@ export type AuditAction =
   | "user.tier.change_reconciled"
   | "user.role.change_reconciled"
   | "api_key.issued"
-  | "api_key.revoked";
+  | "api_key.revoked"
+  // Phase 17 (Part B): abuse-control decisions. `actor` is always "system";
+  // `ban_queued` never auto-executes — it queues for manual admin approval.
+  | "abuse.warned"
+  | "abuse.revoked"
+  | "abuse.downgraded"
+  | "abuse.ban_queued";
 // Phase 05 (Part B): API-key issuance / revocation / rotation. Rotation is
 // client-driven (create-new + revoke-old), so it appears as one `issued`
 // row plus one `revoked` row sharing the operator reason. Rows carry key
@@ -92,23 +98,63 @@ export interface ApiKeyRevokedEvent extends AuditBase {
   revocationReason?: string;
 }
 
+/**
+ * Phase 17: an abuse-control decision. `actor` is always `"system"`;
+ * `target`/`targetUserId` carry the Clerk user id for `user:` principals,
+ * the key reference for `key:` principals, or `"anonymous"` for the shared
+ * anonymous bucket. `oldTier`/`newTier` are set only on `abuse.downgraded`.
+ * Reasons are scrubbed + truncated like every other free-text audit field —
+ * never secrets, tokens, or raw request bodies.
+ */
+export interface AbuseAuditEvent extends AuditBase {
+  action:
+    | "abuse.warned"
+    | "abuse.revoked"
+    | "abuse.downgraded"
+    | "abuse.ban_queued";
+  oldTier?: Tier;
+  newTier?: Tier;
+}
+
 export type AuditEvent =
   | TierAuditEvent
   | RoleAuditEvent
   | TierReconciledEvent
   | RoleReconciledEvent
   | ApiKeyIssuedEvent
-  | ApiKeyRevokedEvent;
+  | ApiKeyRevokedEvent
+  | AbuseAuditEvent;
 
 // Note: `Omit` over a union collapses to common keys, so the input stays an
 // explicit union — narrowing on `action` keeps old/new tier/role typed.
+export type AbuseAuditInput = Omit<AbuseAuditEvent, "id" | "ts"> & {
+  ts?: string;
+};
+
 export type AuditInput =
   | (Omit<TierAuditEvent, "id" | "ts"> & { ts?: string })
   | (Omit<RoleAuditEvent, "id" | "ts"> & { ts?: string })
   | (Omit<TierReconciledEvent, "id" | "ts"> & { ts?: string })
   | (Omit<RoleReconciledEvent, "id" | "ts"> & { ts?: string })
   | (Omit<ApiKeyIssuedEvent, "id" | "ts"> & { ts?: string })
-  | (Omit<ApiKeyRevokedEvent, "id" | "ts"> & { ts?: string });
+  | (Omit<ApiKeyRevokedEvent, "id" | "ts"> & { ts?: string })
+  | AbuseAuditInput;
+
+/**
+ * Abuse-input guard. A plain `===` chain cannot eliminate the abuse member:
+ * TypeScript narrows members by single-literal discriminants only, so a
+ * member whose `action` is itself a 4-literal union survives every
+ * individual check and poisons the trailing else branches. This explicit
+ * predicate states the narrowing instead.
+ */
+function isAbuseAuditInput(input: AuditInput): input is AbuseAuditInput {
+  return (
+    input.action === "abuse.warned" ||
+    input.action === "abuse.revoked" ||
+    input.action === "abuse.downgraded" ||
+    input.action === "abuse.ban_queued"
+  );
+}
 
 /** Cap for the process-local buffer: warm servers must not grow it forever. */
 const MAX_AUDIT_EVENTS = 1000;
@@ -138,6 +184,30 @@ function cleanFreeText(
   return scrubbed.length > maxChars ? scrubbed.slice(0, maxChars) : scrubbed;
 }
 
+interface AuditRowBase {
+  id: string;
+  actor: string;
+  target: string;
+  targetUserId: string;
+  ts: string;
+  requestId: string;
+  reason?: string;
+}
+
+/** Build one abuse row field-by-field (old/new tier only when set). */
+function abuseRow(
+  base: AuditRowBase,
+  action: AbuseAuditEvent["action"],
+  input: { oldTier?: Tier; newTier?: Tier },
+): AbuseAuditEvent {
+  return {
+    ...base,
+    action,
+    ...(input.oldTier !== undefined ? { oldTier: input.oldTier } : {}),
+    ...(input.newTier !== undefined ? { newTier: input.newTier } : {}),
+  };
+}
+
 /**
  * Append one sanitized audit row and emit a structured log line. Builds the
  * stored row field-by-field (never spreads caller input) so secrets smuggled
@@ -155,44 +225,58 @@ export function recordAuditEvent(input: AuditInput): AuditEvent {
     requestId: input.requestId,
     ...(reason !== undefined ? { reason } : {}),
   };
-  const event: AuditEvent =
-    input.action === "user.tier.changed" ||
-    input.action === "user.tier.change_reconciled"
-      ? {
-          ...base,
-          action: input.action,
-          oldTier: input.oldTier,
-          newTier: input.newTier,
-        }
-      : input.action === "api_key.issued"
+  // The abuse member goes first via its predicate (see
+  // `isAbuseAuditInput`); every remaining member carries a single-literal
+  // action, so the `===` chain below narrows exactly like the original
+  // ternary did.
+  let event: AuditEvent;
+  if (isAbuseAuditInput(input)) {
+    event = abuseRow(base, input.action, input);
+  } else if (input.action === "user.tier.changed") {
+    event = {
+      ...base,
+      action: input.action,
+      oldTier: input.oldTier,
+      newTier: input.newTier,
+    };
+  } else if (input.action === "user.tier.change_reconciled") {
+    event = {
+      ...base,
+      action: input.action,
+      oldTier: input.oldTier,
+      newTier: input.newTier,
+    };
+  } else if (input.action === "api_key.issued") {
+    event = {
+      ...base,
+      action: input.action,
+      keyId: input.keyId,
+      name: cleanFreeText(input.name, MAX_NAME_CHARS) ?? "",
+      scopes: [...input.scopes],
+      tierAtIssuance: input.tierAtIssuance,
+    };
+  } else if (input.action === "api_key.revoked") {
+    event = {
+      ...base,
+      action: input.action,
+      keyId: input.keyId,
+      ...(input.revocationReason !== undefined
         ? {
-            ...base,
-            action: input.action,
-            keyId: input.keyId,
-            name: cleanFreeText(input.name, MAX_NAME_CHARS) ?? "",
-            scopes: [...input.scopes],
-            tierAtIssuance: input.tierAtIssuance,
+            revocationReason: cleanFreeText(
+              input.revocationReason,
+              MAX_REASON_CHARS,
+            ),
           }
-        : input.action === "api_key.revoked"
-          ? {
-              ...base,
-              action: input.action,
-              keyId: input.keyId,
-              ...(input.revocationReason !== undefined
-                ? {
-                    revocationReason: cleanFreeText(
-                      input.revocationReason,
-                      MAX_REASON_CHARS,
-                    ),
-                  }
-                : {}),
-            }
-          : {
-              ...base,
-              action: input.action,
-              oldRole: input.oldRole,
-              newRole: input.newRole,
-            };
+        : {}),
+    };
+  } else {
+    event = {
+      ...base,
+      action: input.action,
+      oldRole: input.oldRole,
+      newRole: input.newRole,
+    };
+  }
   events.push(event);
   // Bounded buffer: drop the oldest row on overflow so a warm process keeps
   // only the last MAX_AUDIT_EVENTS (durable history lands in Postgres,
