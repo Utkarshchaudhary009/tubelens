@@ -1,0 +1,38 @@
+---
+title: "Products: where to start"
+description: "What TubeLens is, the product map, and which routes to reach for first."
+---
+
+# Products: where to start
+
+TubeLens is an API-first YouTube data API: Next.js Route Handlers under `/api/v1`, backed by youtubei.ts. The full contract lives in `openapi.json` (served at `/api/v1/openapi.json`).
+
+## Product map
+
+| Product | Use it for | Primary routes |
+| --- | --- | --- |
+| Watch | One video + everything around it | `/api/v1/videos/[id]`, `/api/v1/videos/[id]/combined`, `/api/v1/videos/[id]/related`, `/api/v1/videos/[id]/comments`, `/api/v1/videos/[id]/transcript`, `/api/v1/videos/[id]/captions` |
+| Channels | Channel profile + uploads, Shorts, live, playlists | `/api/v1/channels/[id]`, `/api/v1/channels/[id]/videos`, `/api/v1/channels/[id]/shorts`, `/api/v1/channels/[id]/streams`, `/api/v1/channels/[id]/playlists` |
+| Playlists | Playlist metadata + paged items | `/api/v1/playlists/[id]`, `/api/v1/playlists/[id]/items` |
+| Music | Music search, charts, artists, mixes | `/api/v1/music/search`, `/api/v1/music/charts`, `/api/v1/artists/[id]`, `/api/v1/mixes/[id]` |
+| Feeds | Trending-style live, gaming, and Shorts shelves | `/api/v1/feed/live`, `/api/v1/feed/gaming`, `/api/v1/feed/shorts` |
+| Enriched | Crowd-sourced context on top of a video | `/api/v1/videos/[id]/sponsors`, `/api/v1/videos/[id]/dearrow`, `/api/v1/videos/[id]/dislikes`, `/api/v1/videos/[id]/radio`, `/api/v1/videos/[id]/lyrics` |
+| Audio | Flag-gated audio derivatives (off by default) | `/api/v1/videos/[id]/audio` |
+| Utils | Resolve URLs, thumbnails, instances, bulk fan-out | `/api/v1/resolve`, `/api/v1/thumbnails`, `/api/v1/instances`, `/api/v1/batch`, `/api/v1/hashtags/[tag]`, `/api/v1/channels/[id]/rss` |
+
+## Route vs filter rule
+
+Pick the **route** that matches the job, then use query params to **filter** it. Don't use search as a universal proxy: channel uploads come from `/api/v1/channels/[id]/videos`, playlist contents from `/api/v1/playlists/[id]/items`, related videos from `/api/v1/videos/[id]/related`.
+
+## Start paths by job
+
+- **Watch page:** call `/api/v1/videos/[id]/combined` first — one call returns the video plus related context. Fall back to `/api/v1/videos/[id]` + `/api/v1/videos/[id]/comments` when you need comments paged separately.
+- **Discovery:** `/api/v1/search?q=lofi&limit=20` for keyword results, then `/api/v1/search/suggestions?q=lof` for typeahead. Resolve pasted URLs with `/api/v1/resolve?url=…` before calling watch/channel routes.
+- **Music:** `/api/v1/music/search?q=…` for tracks, `/api/v1/music/charts` for charts, `/api/v1/artists/[id]` and `/api/v1/mixes/[id]` for artist and mix pages.
+- **Background jobs:** poll `/api/v1/channels/[id]/rss` for new uploads, fan out with `POST /api/v1/batch` (≤ 10 tasks per call), and check spend with `GET /api/v1/quota` before large runs.
+
+## Conventions
+
+Every product follows the same conventions: cursor pagination (`?cursor=&limit=`, empty page is `data: []` + `page.next: null`), envelope shape, `X-Request-Id` + `X-RateLimit-*` headers, and typed errors with hints. Details in [API Overview](/docs/api/overview) and [Errors](/docs/errors).
+
+Next: [How to start (first 5 calls)](/docs/start-building) · [Quickstart](/docs/quickstart).

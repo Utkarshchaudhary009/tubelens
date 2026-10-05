@@ -1,0 +1,53 @@
+---
+title: "How to start (first 5 calls)"
+description: "Base URL, defaults, your first five calls, auth, quota, and error handling."
+---
+
+# How to start (first 5 calls)
+
+Base URL is `/api/v1`. The full contract is `openapi.json` (served at `/api/v1/openapi.json`).
+
+Defaults: `limit` 20 / max 50, `region` US, `lang` en. Paginate every list with `?cursor=&limit=` — an empty page is `data: []` + `page.next: null`, never 404.
+
+## The sequence
+
+```bash
+curl "http://localhost:3000/api/v1/health"
+curl "http://localhost:3000/api/v1/search?q=lofi&limit=5"
+curl "http://localhost:3000/api/v1/videos/dQw4w9WgXcQ"
+curl "http://localhost:3000/api/v1/videos/dQw4w9WgXcQ/combined"
+curl "http://localhost:3000/api/v1/playlists/PLbpi6ZahtOH6Ar_3GenzYGw9q-GehV8J/items?limit=5"
+```
+
+1. **Health** — confirms the API is up.
+2. **Search** — take a `videoId` from the results.
+3. **Video** — baseline metadata for that id.
+4. **Combined** — the watch-page shortcut (video + related context in one call).
+5. **Playlist items** — your first cursor page; follow `page.next` as `?cursor=…` until it is `null`.
+
+Prefer the route that matches the job: channel uploads via `/api/v1/channels/[id]/videos`, related via `/api/v1/videos/[id]/related`, typeahead via `/api/v1/search/suggestions?q=lof`.
+
+## Auth today vs later
+
+Today, public read endpoints need no auth. Later, machine access uses `Authorization: Bearer ak_*` with tiered quotas and credits:
+
+```bash
+curl -H "Authorization: Bearer ak_…" "http://localhost:3000/api/v1/quota"
+curl -H "Authorization: Bearer ak_…" "http://localhost:3000/api/v1/me"
+```
+
+`GET /api/v1/quota` shows your allowance balance (free to call); `GET /api/v1/me` echoes the caller's identity.
+
+## Quota-aware patterns
+
+- **Cheap-first:** resolve and filter with `search`, `rss`, and metadata routes before expensive transcript/comment pages.
+- **Batch ≤ 10:** fan out with `POST /api/v1/batch` (max 10 tasks per call) instead of N sequential round-trips.
+- **Cache:** honor `Cache-Control`; when a stale response serves `meta.cached: true` + `warnings[]`, keep showing it and retry in the background.
+
+## Error handling
+
+Errors look like `{ error: { code, message, hint, status } }` — follow the one-sentence `hint`, never parse stack traces (there are none). Back off on `rate_limited` using `Retry-After`, fix query params on `invalid_params`, and always echo `X-Request-Id` when reporting. Full table in [Errors](/docs/errors).
+
+Note: `/api/v1/videos/[id]/audio` (plus `/radio` and `/lyrics`) is flag-gated and off by default — expect a 503 with a hint until it is enabled. Utilities: `/api/v1/thumbnails` for images, `/api/v1/channels/[id]/rss` for upload polling, `/api/v1/instances` for instance info.
+
+Next: [Products: where to start](/docs/products) · [API Overview](/docs/api/overview).
