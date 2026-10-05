@@ -32,6 +32,8 @@ import {
   getAuditEvents,
 } from "../audit";
 import type { ClerkAdminClient, ClerkUserRecord } from "../clerk-admin";
+import { contextFromClerkSession } from "../clerk-auth";
+import { errorResponse } from "../errors";
 import {
   noopObservabilityProvider,
   resetObservabilityProvider,
@@ -618,5 +620,285 @@ describe("pipeline abuse glue", () => {
       expect(res.status).toBe(429);
     }
     expect(increments).toContain("abuse.warned");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review fixes: rung independence, streak/cooldown behavior, fail-closed
+// enforcement, key-principal downgrade, session threading, status wiring.
+// ---------------------------------------------------------------------------
+
+describe("abuse review fixes", () => {
+  test("warn rung never suppresses the revoke escalation", () => {
+    const verdicts = drive(
+      "user:u_ladder",
+      "rate_limited",
+      ABUSE_RATE_LIMIT_REVOKE_AT,
+    );
+    expect(verdicts[ABUSE_RATE_LIMIT_WARN_AT - 1]).toBe("warn");
+    // Warn repeats cool down, but the revoke rung fires on its own cooldown.
+    expect(verdicts.filter((v) => v === "warn").length).toBe(1);
+    expect(verdicts.at(-1)).toBe("revoke");
+  });
+
+  test("validation and batch warns cool down, then re-fire past the window", () => {
+    drive("user:u_vc", "validation_error", ABUSE_VALIDATION_WARN_AT);
+    expect(
+      noteAbuseOutcome({
+        principal: "user:u_vc",
+        outcome: "validation_error",
+        nowMs: T0,
+      }),
+    ).toBe("ok");
+    // Past the window the count restarts: a fresh full window warns again.
+    expect(
+      drive(
+        "user:u_vc",
+        "validation_error",
+        ABUSE_VALIDATION_WARN_AT,
+        T0 + 6 * MIN,
+      ).at(-1),
+    ).toBe("warn");
+    drive("user:u_bc", "batch_rejected", ABUSE_BATCH_REJECT_WARN_AT);
+    expect(
+      noteAbuseOutcome({
+        principal: "user:u_bc",
+        outcome: "batch_rejected",
+        nowMs: T0,
+      }),
+    ).toBe("ok");
+    expect(
+      drive(
+        "user:u_bc",
+        "batch_rejected",
+        ABUSE_BATCH_REJECT_WARN_AT,
+        T0 + 11 * MIN,
+      ).at(-1),
+    ).toBe("warn");
+  });
+
+  test("downgrade consumes its streak; anonymous quota warns once per cooldown", () => {
+    drive("user:u_dg", "quota_exhausted", 2, T0);
+    expect(
+      noteAbuseOutcome({
+        principal: "user:u_dg",
+        outcome: "quota_exhausted",
+        nowMs: T0,
+      }),
+    ).toBe("downgrade");
+    // Past the cooldown one fresh empty is not enough (streak was
+    // consumed by the downgrade — no fast walk down the ladder).
+    const later = T0 + 16 * MIN;
+    expect(
+      noteAbuseOutcome({
+        principal: "user:u_dg",
+        outcome: "quota_exhausted",
+        nowMs: later,
+      }),
+    ).toBe("ok");
+    expect(
+      noteAbuseOutcome({
+        principal: "user:u_dg",
+        outcome: "quota_exhausted",
+        nowMs: later,
+      }),
+    ).toBe("ok");
+    expect(
+      noteAbuseOutcome({
+        principal: "user:u_dg",
+        outcome: "quota_exhausted",
+        nowMs: later,
+      }),
+    ).toBe("downgrade");
+
+    // Anonymous: warns once, then stays silent inside the cooldown even
+    // under a shared-bucket flood (previously warned every window).
+    clearAbuseState();
+    expect(
+      drive("anonymous", "quota_exhausted", 2).every((v) => v === "ok"),
+    ).toBe(true);
+    expect(
+      noteAbuseOutcome({
+        principal: "anonymous",
+        outcome: "quota_exhausted",
+        nowMs: T0,
+      }),
+    ).toBe("warn");
+    expect(
+      noteAbuseOutcome({
+        principal: "anonymous",
+        outcome: "quota_exhausted",
+        nowMs: T0 + 1,
+      }),
+    ).toBe("ok");
+    expect(
+      noteAbuseOutcome({
+        principal: "anonymous",
+        outcome: "quota_exhausted",
+        nowMs: T0 + 16 * MIN,
+      }),
+    ).toBe("warn");
+  });
+
+  test("revoke strikes expire after a quiet day", () => {
+    const revokeCycle = (at: number): string => {
+      let verdict = "ok";
+      for (let i = 0; i < ABUSE_AUTH_FAIL_REVOKE_AT; i += 1) {
+        verdict = checkAbuse({
+          principal: "user:u_stale",
+          signal: "auth_failure",
+          nowMs: at,
+        });
+      }
+      return verdict;
+    };
+    expect(revokeCycle(T0)).toBe("revoke");
+    // A quiet day wipes the strike: the next cycle revokes (strike 1),
+    // it does not queue for a ban.
+    const dayLater = T0 + 25 * 60 * MIN;
+    expect(revokeCycle(dayLater)).toBe("revoke");
+    // Two quick cycles inside the TTL escalate to ban-queued (strikes 2, 3).
+    expect(revokeCycle(dayLater + 20 * MIN)).toBe("revoke");
+    expect(revokeCycle(dayLater + 40 * MIN)).toBe("ban-queued");
+  });
+
+  test("Clerk 404 and backend failures fail closed without mutation", async () => {
+    const missing = mockClerk("pro");
+    missing.failGetUserStatus = 404;
+    const gone = await enforceAbuseVerdict({
+      verdict: "downgrade",
+      principal: "user:u_gone",
+      requestId: "req-404",
+      reason: "quota empty three windows running",
+      clerk: missing,
+      signal: AbortSignal.timeout(8000),
+    });
+    expect(gone.enforced).toBe(false);
+    expect(missing.metadataUpdates).toEqual([]);
+
+    const broken = mockClerk("pro");
+    broken.failGetUserStatus = 500;
+    const unavailable = await enforceAbuseVerdict({
+      verdict: "downgrade",
+      principal: "user:u_broken",
+      requestId: "req-503",
+      reason: "quota empty three windows running",
+      clerk: broken,
+      signal: AbortSignal.timeout(8000),
+    });
+    expect(unavailable.enforced).toBe(false);
+    expect(broken.metadataUpdates).toEqual([]);
+
+    const revokeMissing = mockClerk("pro");
+    revokeMissing.failGetUserStatus = 404;
+    const noRevoke = await enforceAbuseVerdict({
+      verdict: "revoke",
+      principal: "user:u_gone",
+      requestId: "req-404-r",
+      reason: "credential spraying",
+      sessionId: "sess_gone",
+      clerk: revokeMissing,
+      signal: AbortSignal.timeout(8000),
+    });
+    expect(noRevoke.enforced).toBe(false);
+    expect(revokeMissing.revokedSessions).toEqual([]);
+  });
+
+  test("key-principal downgrade resolves the subject via targetUserId", async () => {
+    const clerk = mockClerk("plus");
+    const result = await enforceAbuseVerdict({
+      verdict: "downgrade",
+      principal: "key:key_1",
+      requestId: "req-k",
+      reason: "quota empty three windows running",
+      targetUserId: "user_subj",
+      clerk,
+      signal: AbortSignal.timeout(8000),
+    });
+    expect(result.enforced).toBe(true);
+    expect(clerk.getUserCalls).toEqual(["user_subj"]);
+    expect(clerk.metadataUpdates).toEqual([
+      { userId: "user_subj", tier: "free" },
+    ]);
+    const rows = abuseRows().filter((row) => row.action === "abuse.downgraded");
+    expect(rows.length).toBe(1);
+    expect(rows[0]).toMatchObject({ oldTier: "plus", newTier: "free" });
+
+    // Without a subject there is no attributable user — refuse, never guess.
+    const noTarget = await enforceAbuseVerdict({
+      verdict: "downgrade",
+      principal: "key:key_2",
+      requestId: "req-k2",
+      reason: "quota empty three windows running",
+      clerk,
+      signal: AbortSignal.timeout(8000),
+    });
+    expect(noTarget.enforced).toBe(false);
+  });
+
+  test("session id threads from the Clerk session into the auth context", () => {
+    expect(
+      contextFromClerkSession({ userId: "u_1", sessionId: "sess_9" }).sessionId,
+    ).toBe("sess_9");
+    expect(
+      contextFromClerkSession({ userId: "u_1" }).sessionId,
+    ).toBeUndefined();
+    expect(
+      contextFromClerkSession({ userId: "u_1", sessionId: 42 }).sessionId,
+    ).toBeUndefined();
+  });
+
+  test("pipeline 400/401/504 responses feed counters without shape change", async () => {
+    const increments: string[] = [];
+    setObservabilityProvider({
+      ...noopObservabilityProvider,
+      increment: (name: string) => {
+        increments.push(name);
+      },
+    });
+    const statusRoute = (status: number, code: string) =>
+      withRequestContext(
+        async () =>
+          errorResponse("pipe-status", {
+            code,
+            message: "shaped",
+            hint: "fix and retry",
+            status,
+          }),
+        {},
+        "search",
+      );
+    const req = () => new NextRequest("http://x/api/v1/search?q=hi");
+    // 400s count validation spam: 19 ok, 20th warns, shape unchanged.
+    for (let i = 0; i < ABUSE_VALIDATION_WARN_AT - 1; i += 1) {
+      expect((await statusRoute(400, "invalid_limit")(req())).status).toBe(400);
+    }
+    const warned = await statusRoute(400, "invalid_limit")(req());
+    expect(warned.status).toBe(400);
+    expect(
+      ((await warned.json()) as { error: { code: string } }).error.code,
+    ).toBe("invalid_limit");
+    expect(increments).toContain("abuse.warned");
+    // 401s count auth failures (5th warns on the shared anonymous bucket).
+    const warnsBefore = abuseRows().filter(
+      (row) => row.action === "abuse.warned",
+    ).length;
+    for (let i = 0; i < 5; i += 1) {
+      expect((await statusRoute(401, "unauthenticated")(req())).status).toBe(
+        401,
+      );
+    }
+    expect(
+      abuseRows().filter((row) => row.action === "abuse.warned").length,
+    ).toBeGreaterThan(warnsBefore);
+    // 504s count timeout churn (10th warns), still plain 504s.
+    for (let i = 0; i < ABUSE_TIMEOUT_WARN_AT - 1; i += 1) {
+      expect((await statusRoute(504, "upstream_timeout")(req())).status).toBe(
+        504,
+      );
+    }
+    expect((await statusRoute(504, "upstream_timeout")(req())).status).toBe(
+      504,
+    );
   });
 });

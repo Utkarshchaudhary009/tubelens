@@ -269,13 +269,20 @@ export function recordAuditEvent(input: AuditInput): AuditEvent {
           }
         : {}),
     };
-  } else {
+  } else if (
+    input.action === "user.role.changed" ||
+    input.action === "user.role.change_reconciled"
+  ) {
     event = {
       ...base,
       action: input.action,
       oldRole: input.oldRole,
       newRole: input.newRole,
     };
+  } else {
+    // Exhaustive: every AuditAction is handled above — unreachable.
+    const unreachable: never = input;
+    throw new Error(`unreachable audit action: ${JSON.stringify(unreachable)}`);
   }
   events.push(event);
   // Bounded buffer: drop the oldest row on overflow so a warm process keeps

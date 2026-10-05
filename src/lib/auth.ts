@@ -43,6 +43,13 @@ export interface AuthContext {
   /** Clerk key reference once Phase 05 lands; never a plaintext secret. */
   keyId?: string;
   /**
+   * Phase 17: Clerk session id for `user:` principals (abuse-control
+   * revoke targets one session, never the whole user). Present only for
+   * interactive session callers; absent for API-key/anonymous principals.
+   * Identity, not a secret — but never logged anyway.
+   */
+  sessionId?: string;
+  /**
    * Key scopes projected from the verified Clerk API key (Phase 07):
    * `resolveApiKeyContext` copies `verified.scopes` here for
    * `requireScope()`. Absent for sessions/anonymous — session scopes are a

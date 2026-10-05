@@ -1,7 +1,9 @@
 import type { NextRequest, NextResponse } from "next/server";
+import { noteAbuseOutcome } from "@/lib/abuse";
 import { getBatchMarkerSecret, mintBatchChildMarker } from "@/lib/batch-marker";
 import { clerkAuthProvider } from "@/lib/clerk-auth";
 import { type PipelineProviders, withRequestContext } from "@/lib/pipeline";
+import { resolveRequestId } from "@/lib/request-context";
 import { SsrfBlockedError, safeFetch } from "@/lib/safe-fetch";
 import {
   type BatchChildContext,
@@ -170,6 +172,11 @@ export function createBatchHandler(
   return async (req: NextRequest) => {
     const preflight = await parseBatchRequest(req);
     if (!preflight.ok) {
+      // Phase 17: preflight rejects never enter the pipeline (zero charge,
+      // zero children), so the pipeline cannot count them — count the
+      // batch_rejected signal here instead. Detached: principal resolution
+      // is async and must never delay the rejection; never throws.
+      void noteBatchPreflightReject(providers, req);
       return preflight.response;
     }
     const admitted = preflight.value;
@@ -203,4 +210,35 @@ export function createBatchHandler(
 
 export async function POST(req: NextRequest): Promise<NextResponse> {
   return createBatchHandler()(req);
+}
+
+/**
+ * Phase 17 abuse signal for batch preflight rejects (oversize bodies,
+ * over-count/cost fan-outs, malformed shapes). Best-effort and detached:
+ * the rejection is already built, and auth resolution must never delay
+ * it. Keying matches the pipeline (user > key > shared anonymous bucket).
+ * Never throws.
+ */
+async function noteBatchPreflightReject(
+  providers: PipelineProviders,
+  req: NextRequest,
+): Promise<void> {
+  try {
+    const auth = await (providers.auth ?? clerkAuthProvider).resolve(req);
+    const principal =
+      auth.userId !== undefined && auth.userId !== ""
+        ? `user:${auth.userId}`
+        : auth.keyId !== undefined && auth.keyId !== ""
+          ? `key:${auth.keyId}`
+          : "anonymous";
+    noteAbuseOutcome({
+      principal,
+      route: "batch",
+      outcome: "batch_rejected",
+      requestId: resolveRequestId(req),
+      ...(auth.userId ? { targetUserId: auth.userId } : {}),
+    });
+  } catch {
+    // Intentionally ignored — abuse counting must never break a response.
+  }
 }

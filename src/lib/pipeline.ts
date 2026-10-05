@@ -360,6 +360,9 @@ export function withRequestContext(
         defaultRateLimitDecision(),
         origin,
       );
+      // Phase 17: an authorization denial is an auth-failure signal.
+      // Response-neutral — the 401/403 above is already built.
+      observeAbuseOutcome(ctx, route, "auth_failure");
       return baselineDenied;
     }
 
@@ -630,7 +633,23 @@ export function withRequestContext(
         batchPartial = true;
         res.headers.delete(BATCH_PARTIAL_HEADER);
       }
+      // Phase 17: feed in-pipeline error/timeout responses back to the
+      // abuse counters. Response-neutral — the response is already built;
+      // counting never throws and enforcement detaches (see
+      // `observeAbuseOutcome`). Batch preflight rejects never reach here
+      // (they return before admission), so the batch route counts those
+      // itself as `batch_rejected`.
+      observeAbuseResponseStatus(ctx, route, res.status);
     } catch (err) {
+      // Phase 17: a fail-fast timeout escaping the handler is timeout
+      // churn; any other throw is our own crash, never the caller's abuse
+      // signal (and is never charged — see below).
+      if (
+        err instanceof Error &&
+        (err.name === "TimeoutError" || err.name === "AbortError")
+      ) {
+        observeAbuseOutcome(ctx, route, "timeout");
+      }
       safe(() =>
         observability.captureError(scrubError(err), {
           requestId: ctx.requestId,
@@ -948,8 +967,10 @@ function accountingTimeout(controller: AbortController): Promise<void> {
  * Fully response-neutral: counting never throws, enforcement runs after
  * this response is built (never awaited), honors DRY_RUN, and a
  * `user:`-principal revoke without a session handle degrades to an
- * audit row for an operator (the pipeline carries no session id — see
- * `enforceAbuseVerdict`). Anonymous verdicts are warn-only by construction.
+ * audit row for an operator (no handle when the caller is a key or the
+ * session shape carried none). Anonymous verdicts are warn-only by
+ * construction. `key:` principals carry their subject as `targetUserId`
+ * so downgrade can resolve an attributable user.
  */
 function observeAbuseOutcome(
   ctx: RequestContext,
@@ -957,22 +978,54 @@ function observeAbuseOutcome(
   outcome: AbuseOutcome,
 ): void {
   safe(() => {
+    const principal = ctx.rateLimitIdentity;
+    const keySubject =
+      principal.startsWith("key:") &&
+      ctx.auth.userId !== undefined &&
+      ctx.auth.userId !== ""
+        ? ctx.auth.userId
+        : undefined;
     const verdict = noteAbuseOutcome({
-      principal: ctx.rateLimitIdentity,
+      principal,
       route,
       outcome,
       requestId: ctx.requestId,
+      ...(keySubject !== undefined ? { targetUserId: keySubject } : {}),
     });
     if (verdict === "revoke" || verdict === "downgrade") {
       return enforceAbuseVerdict({
         verdict,
-        principal: ctx.rateLimitIdentity,
+        principal,
         requestId: ctx.requestId,
         reason: `abuse:${outcome} threshold reached; automatic ${verdict} per abuse controls.`,
+        ...(ctx.auth.sessionId !== undefined && ctx.auth.sessionId !== ""
+          ? { sessionId: ctx.auth.sessionId }
+          : {}),
+        ...(keySubject !== undefined ? { targetUserId: keySubject } : {}),
       });
     }
     return undefined;
   });
+}
+
+/**
+ * Phase 17 status-to-signal mapping for handler-built responses: 400s are
+ * validation spam, 401/403s are auth failures, 504s are timeout churn.
+ * Handler-thrown fail-fast timeouts map separately at the throw site
+ * above. Never throws; unknown statuses are ignored.
+ */
+function observeAbuseResponseStatus(
+  ctx: RequestContext,
+  route: string | undefined,
+  status: number,
+): void {
+  if (status === 400) {
+    observeAbuseOutcome(ctx, route, "validation_error");
+  } else if (status === 401 || status === 403) {
+    observeAbuseOutcome(ctx, route, "auth_failure");
+  } else if (status === 504) {
+    observeAbuseOutcome(ctx, route, "timeout");
+  }
 }
 
 /** Observability is best-effort: hook failures are swallowed, never thrown. */

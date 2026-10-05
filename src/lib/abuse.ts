@@ -49,7 +49,7 @@
 // comes from the import graph (API-only repo, Route Handlers only).
 
 import { type ApiKeysClient, getApiKeysClient } from "./api-keys";
-import { type AuditAction, recordAuditEvent } from "./audit";
+import { type AbuseAuditEvent, recordAuditEvent } from "./audit";
 import {
   type ClerkAdminClient,
   clerkErrorStatus,
@@ -132,6 +132,13 @@ export const ABUSE_DOWNGRADE_COOLDOWN_MS = 15 * 60_000;
  * auto-enforcing and queues for manual admin approval instead.
  */
 export const ABUSE_REVOKE_STRIKES_FOR_BAN_QUEUE = 3;
+
+/**
+ * Revoke-strike memory: strikes older than this stop counting toward the
+ * ban queue (a principal quiet for a day starts clean — stale strikes must
+ * never queue a reformed caller weeks later).
+ */
+export const ABUSE_REVOKE_STRIKE_TTL_MS = 24 * 60 * 60_000;
 
 /** Fail-fast budget for every Clerk enforcement call (repo standard). */
 export const ABUSE_ENFORCE_TIMEOUT_MS = 8000;
@@ -220,11 +227,21 @@ interface AbuseCounter {
 interface QuotaEmptyStreak {
   count: number;
   lastDowngradeAt: number;
+  /**
+   * Last warn emitted for the shared anonymous bucket (attributable
+   * principals downgrade instead of warning, so only anonymous uses this).
+   */
+  lastAnonymousWarnAt: number;
 }
 
 const counters = new Map<string, AbuseCounter>();
 const quotaEmptyStreaks = new Map<string, QuotaEmptyStreak>();
-const revokeStrikes = new Map<string, number>();
+interface RevokeStrikes {
+  count: number;
+  /** Timestamp of the latest strike (tests override via nowMs). */
+  at: number;
+}
+const revokeStrikes = new Map<string, RevokeStrikes>();
 
 /** Clear all abuse state (primarily for tests). */
 export function clearAbuseState(): void {
@@ -423,13 +440,18 @@ function evaluateAbuse(input: AbuseCheckInput): AbuseVerdict {
     bucket.lastWarnAt = now;
   }
   if (verdict === "revoke") {
-    const strikes = (revokeStrikes.get(input.principal) ?? 0) + 1;
+    const prior = revokeStrikes.get(input.principal);
+    const fresh =
+      prior !== undefined && now - prior.at < ABUSE_REVOKE_STRIKE_TTL_MS
+        ? prior.count
+        : 0;
+    const strikes = fresh + 1;
     if (strikes >= ABUSE_REVOKE_STRIKES_FOR_BAN_QUEUE) {
       // Third strike: stop auto-enforcing, queue for a human instead.
-      revokeStrikes.set(input.principal, 0);
+      remember(revokeStrikes, input.principal, { count: 0, at: now });
       verdict = "ban-queued";
     } else {
-      revokeStrikes.set(input.principal, strikes);
+      remember(revokeStrikes, input.principal, { count: strikes, at: now });
     }
   }
   emitAbuseMetric(verdict);
@@ -458,12 +480,19 @@ function evaluateQuotaEmpty(input: AbuseCheckInput, now: number): AbuseVerdict {
   const streak: QuotaEmptyStreak = {
     count: (prior?.count ?? 0) + 1,
     lastDowngradeAt: prior?.lastDowngradeAt ?? 0,
+    lastAnonymousWarnAt: prior?.lastAnonymousWarnAt ?? 0,
   };
   rememberQuotaStreak(input.principal, streak);
   if (streak.count < ABUSE_QUOTA_EMPTY_WINDOWS) {
     return "ok";
   }
   if (!isAttributablePrincipal(input.principal)) {
+    // Shared-bucket flood guard: one warn per cooldown, not one per
+    // exhausted window — every extra warn is metric/audit spam.
+    if (now - streak.lastAnonymousWarnAt < ABUSE_DOWNGRADE_COOLDOWN_MS) {
+      return "ok";
+    }
+    streak.lastAnonymousWarnAt = now;
     emitAbuseMetric("warn");
     auditAbuse(
       "abuse.warned",
@@ -477,6 +506,10 @@ function evaluateQuotaEmpty(input: AbuseCheckInput, now: number): AbuseVerdict {
     return "ok";
   }
   streak.lastDowngradeAt = now;
+  // A downgrade consumes the streak: the next rung needs three FRESH
+  // consecutive empty windows, so one long drought cannot fast-walk a
+  // caller down the tier ladder on a single observation run.
+  streak.count = 0;
   emitAbuseMetric("downgrade");
   return "downgrade";
 }
@@ -556,7 +589,7 @@ interface AbuseAuditIdentity {
 }
 
 function auditAbuse(
-  action: AuditAction,
+  action: AbuseAuditEvent["action"],
   input: AbuseAuditIdentity,
   now: number,
   reason: string,
@@ -565,7 +598,7 @@ function auditAbuse(
   try {
     const target = deriveAbuseTarget(input.principal, input.targetUserId);
     recordAuditEvent({
-      action: action as "abuse.warned",
+      action,
       actor: "system",
       target,
       targetUserId: target,
