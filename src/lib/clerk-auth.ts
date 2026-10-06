@@ -73,6 +73,7 @@ export function contextFromClerkSession(
   session:
     | {
         userId?: unknown;
+        sessionId?: unknown;
         sessionClaims?: unknown;
       }
     | null
@@ -80,12 +81,19 @@ export function contextFromClerkSession(
 ): AuthContext {
   const userId = session?.userId;
   if (typeof userId === "string" && userId !== "") {
+    const sessionId = session?.sessionId;
     return {
       type: "user",
       authenticated: true,
       userId,
       tier: getEffectiveTier(session?.sessionClaims),
       role: getEffectiveRole(session?.sessionClaims),
+      // Phase 17: thread the session handle so abuse-control revoke can
+      // target this session (absent for malformed sessions — enforcement
+      // then degrades to an audit row for an operator).
+      ...(typeof sessionId === "string" && sessionId !== ""
+        ? { sessionId }
+        : {}),
     };
   }
   return { ...anonymousAuthContext };

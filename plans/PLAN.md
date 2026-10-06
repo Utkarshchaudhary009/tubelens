@@ -614,7 +614,7 @@ principal model.
 
 ## Phase 17 — Abuse controls and anomaly detection
 
-**Status:** `[ ]` not started.
+**Status:** `[~]` in progress.
 
 **Build:** Add configurable deny/block controls for obvious abuse: excessive failed authentication, credential spraying, repeated rejected requests, pathological batch patterns, or other high-confidence signals. Controls apply to both `session_token` and `api_key` (Phase 05) principals. Keep automatic blocking conservative and reversible. Store security decisions with enough context for operators without retaining unnecessary sensitive input.
 

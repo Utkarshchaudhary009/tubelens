@@ -42,6 +42,20 @@ export interface ClerkAdminClient {
     params: { publicMetadata: Record<string, string> },
     opts?: ClerkCallOptions,
   ): Promise<ClerkUserRecord>;
+  /**
+   * Phase 17 abuse controls. OPTIONAL so existing test doubles (which only
+   * implement the Phase 04 surface) still satisfy this interface: callers
+   * must check presence and treat absence as "cannot enforce" (audit-only),
+   * never as allow. Every call runs inside the caller's 8s fail-fast budget
+   * via `withBudget`. Clerk takes no reason param on these endpoints — the
+   * reason lives in our own audit row (see `audit.ts`).
+   */
+  /** Revoke one session (`POST /v1/sessions/{id}/revoke`). */
+  revokeSession?(sessionId: string, opts?: ClerkCallOptions): Promise<unknown>;
+  /** Ban a user (`POST /v1/users/{id}/ban`) — manual approval only, never auto-called. */
+  banUser?(userId: string, opts?: ClerkCallOptions): Promise<unknown>;
+  /** Unban a user (`POST /v1/users/{id}/unban`) — manual approval only, never auto-called. */
+  unbanUser?(userId: string, opts?: ClerkCallOptions): Promise<unknown>;
 }
 
 /**
@@ -52,6 +66,15 @@ export interface ClerkAdminClient {
  * the task even starts (never begin a mutation with a dead budget). On abort
  * the caller sees the signal's reason (a `TimeoutError` DOMException for
  * `AbortSignal.timeout`); on settle the abort listener is removed.
+ *
+ * Fail-safe note: the Clerk SDK accepts no AbortSignal, so this bounds OUR
+ * wait only — a timed-out write may still land server-side. That direction
+ * is safe (a late revoke/downgrade still neutralizes abuse; a late read is
+ * just discarded), and the outcome reconciles on the next authoritative
+ * read (`refetchAfterTimeout` after timed-out writes, or the pre-mutation
+ * `getUser` re-check). True cancellation is impossible here by SDK design,
+ * so no signal pass-through is attempted — do not "fix" this by threading
+ * the signal into SDK calls that ignore it.
  */
 export function withBudget<T>(
   start: () => Promise<T>,
@@ -110,6 +133,27 @@ export const liveClerkAdminClient: ClerkAdminClient = {
         userId,
         params,
       )) as ClerkUserRecord;
+    }, opts?.signal);
+  },
+  async revokeSession(sessionId, opts) {
+    return withBudget(async () => {
+      const { clerkClient } = await import("@clerk/nextjs/server");
+      const client = await clerkClient();
+      return await client.sessions.revokeSession(sessionId);
+    }, opts?.signal);
+  },
+  async banUser(userId, opts) {
+    return withBudget(async () => {
+      const { clerkClient } = await import("@clerk/nextjs/server");
+      const client = await clerkClient();
+      return await client.users.banUser(userId);
+    }, opts?.signal);
+  },
+  async unbanUser(userId, opts) {
+    return withBudget(async () => {
+      const { clerkClient } = await import("@clerk/nextjs/server");
+      const client = await clerkClient();
+      return await client.users.unbanUser(userId);
     }, opts?.signal);
   },
 };
