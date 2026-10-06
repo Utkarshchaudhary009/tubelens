@@ -614,7 +614,7 @@ principal model.
 
 ## Phase 17 — Abuse controls and anomaly detection
 
-**Status:** `[~]` in progress.
+**Status:** `[x]` done — shipped via PR #40 (merged 2026-10-06): warn-first in-memory per-principal abuse controls (`checkAbuse` ok/warn/revoke/downgrade/ban-queued; warn/revoke/downgrade auto-enacted with cooldowns, ban manual-queue only, DRY_RUN monitor mode), session_token + api_key principals, sanitized audit rows, 401 + WWW-Authenticate / 403 contract preserved, with 1152 unit tests + e2e PASS on live upstream.
 
 **Build:** Add configurable deny/block controls for obvious abuse: excessive failed authentication, credential spraying, repeated rejected requests, pathological batch patterns, or other high-confidence signals. Controls apply to both `session_token` and `api_key` (Phase 05) principals. Keep automatic blocking conservative and reversible. Store security decisions with enough context for operators without retaining unnecessary sensitive input.
 
