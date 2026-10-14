@@ -2,8 +2,9 @@
 //
 // Thin adapter over `@opentelemetry/api` — no SDK import here, so unit tests
 // and environments without a registered SDK get the global no-op tracer and
-// every method still succeeds. Delivery (Vercel Trace Drain → Datadog) is
-// configured outside code via `src/instrumentation.ts` + Marketplace.
+// every method still succeeds. Delivery is configured outside code via
+// `src/instrumentation.ts`: Vercel Trace Drain on Pro+, direct OTLP/HTTP to
+// the Datadog intake on Hobby ($0) — see `.env.example`.
 //
 // Rules (Phases 18–20):
 // - Best-effort only: every method catches internally and never throws, so a
@@ -11,18 +12,18 @@
 // - Bounded cardinality: span attributes accept only the allowlisted keys
 //   below (`route`, `operation`); everything else is dropped. Never put
 //   `user_id`, API keys, IPs, video IDs, queries, or request IDs in attrs —
-//   those belong in sanitized logs/traces only where needed.
-// - No secrets: values are truncated and free-text errors pass through
-//   `scrubError`; log attrs pass through `redactObject`.
+//   correlation rides on the trace id, not per-request values.
+// - No secrets: free-text messages pass through `scrubString`, errors through
+//   `scrubError`, and structured attrs through `redactObject`.
 
 import type { Span } from "@opentelemetry/api";
-import { SpanStatusCode, trace } from "@opentelemetry/api";
+import { context, SpanStatusCode, trace } from "@opentelemetry/api";
 import {
   noopObservabilityProvider,
   type ObservabilityProvider,
   type SpanHandle,
 } from "./observability";
-import { redactObject, scrubError } from "./redact";
+import { redactObject, scrubError, scrubString } from "./redact";
 
 const TRACER_NAME = "tubelens";
 
@@ -72,11 +73,13 @@ function errorSummary(err: unknown): string {
     }
     if (scrubbed instanceof Error) {
       // scrubError preserves the (scrubbed) message on an Error instance —
-      // stringifying would yield "{}", so read the message explicitly.
-      const name =
+      // stringifying would yield "{}", so read the message explicitly. The
+      // name is scrubbed too: custom names bypass scrubError's message path.
+      const name = scrubString(
         typeof scrubbed.name === "string" && scrubbed.name !== ""
           ? scrubbed.name
-          : "Error";
+          : "Error",
+      );
       return truncate(`${name}: ${scrubbed.message}`, MAX_EVENT_LENGTH);
     }
     return truncate(JSON.stringify(scrubbed), MAX_EVENT_LENGTH);
@@ -106,6 +109,36 @@ function dropRequestIds(
     out[key] = value;
   }
   return out;
+}
+
+/** Handle → live span mapping for context activation. Never leaks: entries
+ * die with their handles, and every method below stays best-effort. */
+const spanByHandle = new WeakMap<object, Span>();
+
+/**
+ * Pure log-event builder: scrubbed + truncated message with redacted,
+ * request-id-free attrs. Exported for contract tests; `log()` below emits
+ * exactly what this returns onto the active span.
+ */
+export function buildLogEvent(
+  level: "debug" | "info" | "warn" | "error",
+  message: string,
+  attrs?: Record<string, string | number | boolean>,
+): {
+  name: string;
+  attributes: Record<string, string | number | boolean>;
+} {
+  const safeAttrs =
+    attrs && typeof attrs === "object"
+      ? dropRequestIds(redactObject({ ...attrs }))
+      : {};
+  return {
+    name: `tubelens.log.${level}`,
+    attributes: {
+      message: truncate(scrubString(String(message)), MAX_EVENT_LENGTH),
+      ...(safeAttrs as Record<string, string | number | boolean>),
+    },
+  };
 }
 
 class OtelSpanHandle implements SpanHandle {
@@ -141,17 +174,20 @@ function noopSpan(): SpanHandle {
  */
 export function resolveActiveTraceId(): string | undefined {
   try {
-    const spanContext = trace.getActiveSpan()?.spanContext();
-    const traceId = spanContext?.traceId;
-    if (
-      typeof traceId === "string" &&
-      /^[0-9a-f]{32}$/.test(traceId) &&
-      traceId !== "00000000000000000000000000000000"
-    ) {
-      return traceId;
-    }
+    return validTraceId(trace.getActiveSpan()?.spanContext()?.traceId);
   } catch {
     // Intentionally ignored — callers fall back to the request id.
+  }
+  return undefined;
+}
+
+function validTraceId(traceId: string | undefined): string | undefined {
+  if (
+    typeof traceId === "string" &&
+    /^[0-9a-f]{32}$/.test(traceId) &&
+    traceId !== "00000000000000000000000000000000"
+  ) {
+    return traceId;
   }
   return undefined;
 }
@@ -167,9 +203,31 @@ export const otelObservabilityProvider: ObservabilityProvider = {
       const span = trace
         .getTracer(TRACER_NAME)
         .startSpan(name, { attributes: sanitizeAttrs(attrs) });
-      return new OtelSpanHandle(span);
+      const handle = new OtelSpanHandle(span);
+      spanByHandle.set(handle, span);
+      return handle;
     } catch {
       return noopSpan();
+    }
+  },
+
+  runInSpanContext<R>(span: SpanHandle, fn: () => R): R {
+    try {
+      const live = spanByHandle.get(span);
+      if (!live) {
+        return fn();
+      }
+      return context.with(trace.setSpan(context.active(), live), fn);
+    } catch {
+      return fn();
+    }
+  },
+
+  traceIdOf(span: SpanHandle): string | undefined {
+    try {
+      return validTraceId(spanByHandle.get(span)?.spanContext().traceId);
+    } catch {
+      return undefined;
     }
   },
 
@@ -179,12 +237,8 @@ export const otelObservabilityProvider: ObservabilityProvider = {
       if (!span) {
         return;
       }
-      const safeAttrs =
-        attrs && typeof attrs === "object" ? redactObject({ ...attrs }) : {};
-      span.addEvent(`tubelens.log.${level}`, {
-        message: truncate(String(message), MAX_EVENT_LENGTH),
-        ...(safeAttrs as Record<string, string | number | boolean>),
-      });
+      const event = buildLogEvent(level, message, attrs);
+      span.addEvent(event.name, event.attributes);
     } catch {
       // Intentionally ignored — telemetry must never break a response.
     }
