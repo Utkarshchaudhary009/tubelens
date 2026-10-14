@@ -41,7 +41,14 @@ export async function register() {
       // Datadog's intake only supports http/protobuf.
       process.env.OTEL_EXPORTER_OTLP_TRACES_PROTOCOL = "http/protobuf";
     }
-    if (!process.env.OTEL_EXPORTER_OTLP_TRACES_HEADERS?.trim()) {
+    // Explicit owner config always wins: only synthesize when neither the
+    // signal-specific nor the generic OTLP headers are set (signal-specific
+    // takes precedence per the OTel spec, so synthesizing blindly would
+    // silently shadow a generic override).
+    if (
+      !process.env.OTEL_EXPORTER_OTLP_TRACES_HEADERS?.trim() &&
+      !process.env.OTEL_EXPORTER_OTLP_HEADERS?.trim()
+    ) {
       const key =
         process.env.DATADOG_API_KEY?.trim() || process.env.DD_API_KEY?.trim();
       if (key) {

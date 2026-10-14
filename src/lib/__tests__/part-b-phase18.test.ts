@@ -327,7 +327,8 @@ describe("Phase 18 tracing foundation", () => {
     );
     const res = await run(req("http://x/api/v1/search?q=x", "rl-deny-1"));
     expect(res.status).toBe(429);
-    expect(typeof res.headers.get("X-Trace-Id")).toBe("string");
+    // No SDK here, so the trace id falls back to the request id exactly.
+    expect(res.headers.get("X-Trace-Id")).toBe("rl-deny-1");
   });
 
   test("noop provider keeps the pipeline byte-identical without an SDK", async () => {
