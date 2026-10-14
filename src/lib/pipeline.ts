@@ -51,6 +51,7 @@ import { applyCorsHeaders, applySecurityHeaders } from "./http-headers";
 import {
   getObservabilityProvider,
   type ObservabilityProvider,
+  type SpanHandle,
 } from "./observability";
 import {
   getProductPolicyProvider,
@@ -245,7 +246,7 @@ export function withRequestContext(
       getObservabilityProvider(),
     );
     const span = safeSpan(() =>
-      observability.startSpan(route ?? "request", {}),
+      observability.startSpan(route ?? "request", route ? { route } : {}),
     );
 
     // Pre-derive the id so even config/auth failures carry request-id
@@ -271,13 +272,18 @@ export function withRequestContext(
       safe(() => observability.captureError(scrubError(err), { requestId }));
       span.recordError(scrubError(err));
       span.end();
-      return errorResponse(requestId, {
-        code: "internal",
-        message: "Service route misconfigured.",
-        hint: "Report the X-Request-Id; operators must remove bypassRateLimit from this route.",
-        status: 500,
-        origin,
-      });
+      return withTraceId(
+        errorResponse(requestId, {
+          code: "internal",
+          message: "Service route misconfigured.",
+          hint: "Report the X-Request-Id; operators must remove bypassRateLimit from this route.",
+          status: 500,
+          origin,
+        }),
+        observability,
+        span,
+        requestId,
+      );
     }
 
     // Config stage: security-critical validation fails safely with a typed
@@ -289,14 +295,23 @@ export function withRequestContext(
         safe(() => observability.captureError(scrubError(err), { requestId }));
         span.recordError(scrubError(err));
         span.end();
-        return errorResponse(requestId, {
-          code: err.code,
-          message: "Service configuration is incomplete.",
-          hint: "Retry shortly; operators must restore the missing security configuration.",
-          status: 503,
-          origin,
-        });
+        return withTraceId(
+          errorResponse(requestId, {
+            code: err.code,
+            message: "Service configuration is incomplete.",
+            hint: "Retry shortly; operators must restore the missing security configuration.",
+            status: 503,
+            origin,
+          }),
+          observability,
+          span,
+          requestId,
+        );
       }
+      // Unknown config faults escape as throws: end the newborn span first
+      // so the trace stays complete even on this path.
+      span.recordError(scrubError(err));
+      span.end();
       throw err;
     }
 
@@ -311,13 +326,18 @@ export function withRequestContext(
       safe(() => observability.captureError(scrubError(err), { requestId }));
       span.recordError(scrubError(err));
       span.end();
-      return errorResponse(requestId, {
-        code: "dependency_unavailable",
-        message: "Authentication service unavailable.",
-        hint: "Retry shortly; the request was rejected rather than served without identity.",
-        status: 503,
-        origin,
-      });
+      return withTraceId(
+        errorResponse(requestId, {
+          code: "dependency_unavailable",
+          message: "Authentication service unavailable.",
+          hint: "Retry shortly; the request was rejected rather than served without identity.",
+          status: 503,
+          origin,
+        }),
+        observability,
+        span,
+        requestId,
+      );
     }
 
     // Policy stage: tier + entitlements. A throwing policy provider is a
@@ -328,17 +348,29 @@ export function withRequestContext(
       const tier = product.resolveTier(auth);
       const entitlements = product.entitlementsFor(tier);
       ctx = buildRequestContext(req, { auth, tier, entitlements, route });
+      // Bind the request to its route span's trace: operators can find the
+      // trace via the X-Trace-Id response header. Falls back to requestId
+      // when the provider has no live span (no SDK / noop default).
+      const spanTraceId = safeTraceId(observability, span.raw);
+      if (spanTraceId !== undefined) {
+        ctx.traceId = spanTraceId;
+      }
     } catch (err) {
       safe(() => observability.captureError(scrubError(err), { requestId }));
       span.recordError(scrubError(err));
       span.end();
-      return errorResponse(requestId, {
-        code: "service_unavailable",
-        message: "Product policy unavailable.",
-        hint: "Retry shortly; the request was rejected rather than served without an entitlement decision.",
-        status: 503,
-        origin,
-      });
+      return withTraceId(
+        errorResponse(requestId, {
+          code: "service_unavailable",
+          message: "Product policy unavailable.",
+          hint: "Retry shortly; the request was rejected rather than served without an entitlement decision.",
+          status: 503,
+          origin,
+        }),
+        observability,
+        span,
+        requestId,
+      );
     }
 
     // Authorization stage (Phase 07): the baseline grant is evaluated
@@ -407,13 +439,18 @@ export function withRequestContext(
         );
         span.recordError(scrubError(err));
         span.end();
-        return errorResponse(ctx.requestId, {
-          code: "internal",
-          message: "Service route misconfigured.",
-          hint: "Report the X-Request-Id; route has no priced operation.",
-          status: 500,
-          origin,
-        });
+        return withTraceId(
+          errorResponse(ctx.requestId, {
+            code: "internal",
+            message: "Service route misconfigured.",
+            hint: "Report the X-Request-Id; route has no priced operation.",
+            status: 500,
+            origin,
+          }),
+          observability,
+          span,
+          ctx.requestId,
+        );
       }
     }
     // Phase 16: a per-request cost override (batch summed total) replaces
@@ -443,13 +480,18 @@ export function withRequestContext(
           ),
         );
         span.end();
-        return errorResponse(ctx.requestId, {
-          code: "internal",
-          message: "Service route misconfigured.",
-          hint: "Report the X-Request-Id; route passed an invalid quota cost.",
-          status: 500,
-          origin,
-        });
+        return withTraceId(
+          errorResponse(ctx.requestId, {
+            code: "internal",
+            message: "Service route misconfigured.",
+            hint: "Report the X-Request-Id; route passed an invalid quota cost.",
+            status: 500,
+            origin,
+          }),
+          observability,
+          span,
+          ctx.requestId,
+        );
       }
       operationCost = options.costOverride;
     }
@@ -500,13 +542,18 @@ export function withRequestContext(
         );
         span.recordError(scrubError(err));
         span.end();
-        return errorResponse(ctx.requestId, {
-          code: "service_unavailable",
-          message: "Rate limiter unavailable.",
-          hint: "Retry shortly; the request was not served without protection.",
-          status: 503,
-          origin,
-        });
+        return withTraceId(
+          errorResponse(ctx.requestId, {
+            code: "service_unavailable",
+            message: "Rate limiter unavailable.",
+            hint: "Retry shortly; the request was not served without protection.",
+            status: 503,
+            origin,
+          }),
+          observability,
+          span,
+          ctx.requestId,
+        );
       }
     }
     if (!decision.allowed) {
@@ -523,6 +570,8 @@ export function withRequestContext(
       res.headers.set("X-RateLimit-Limit", String(decision.limit));
       res.headers.set("X-RateLimit-Remaining", String(decision.remaining));
       res.headers.set("X-RateLimit-Reset", String(decision.reset));
+      // Phase 18: same request-to-trace correlation as the standard stamper.
+      withTraceId(res, observability, span, ctx.requestId);
       // Phase 17: count the 429 toward abuse controls. The 429 above is
       // already built; enforcement on a revoke-level verdict is awaited
       // inside the fail-fast budget (rare — only threshold-crossers pay it),
@@ -590,13 +639,18 @@ export function withRequestContext(
         );
         span.recordError(scrubError(err));
         span.end();
-        return errorResponse(ctx.requestId, {
-          code: "service_unavailable",
-          message: "Quota accounting unavailable.",
-          hint: "Retry shortly; the request was not served without allowance accounting.",
-          status: 503,
-          origin,
-        });
+        return withTraceId(
+          errorResponse(ctx.requestId, {
+            code: "service_unavailable",
+            message: "Quota accounting unavailable.",
+            hint: "Retry shortly; the request was not served without allowance accounting.",
+            status: 503,
+            origin,
+          }),
+          observability,
+          span,
+          ctx.requestId,
+        );
       }
       if (!quotaCheck.allowed) {
         // Rejected WITHOUT consuming: the ledger learns via a `rejected`
@@ -669,7 +723,13 @@ export function withRequestContext(
     // wire contract stays byte-identical.
     let batchPartial = false;
     try {
-      res = await handler(req, ctx);
+      // Run service work inside the route span's context when the provider
+      // supports it, so downstream instrumented calls (fetch, Redis, DB)
+      // become children of this request's span and log/captureError attach
+      // to it. Providers without propagation run the handler directly.
+      res = await runInSpanContext(observability, span, () =>
+        handler(req, ctx),
+      );
       if (res.headers.get(BATCH_PARTIAL_HEADER) === "1") {
         batchPartial = true;
         res.headers.delete(BATCH_PARTIAL_HEADER);
@@ -809,13 +869,18 @@ export function withRequestContext(
         );
         span.recordError(scrubError(err));
         span.end();
-        return errorResponse(ctx.requestId, {
-          code: "service_unavailable",
-          message: "Quota accounting unavailable.",
-          hint: "Retry shortly; the request was not served without allowance accounting.",
-          status: 503,
-          origin,
-        });
+        return withTraceId(
+          errorResponse(ctx.requestId, {
+            code: "service_unavailable",
+            message: "Quota accounting unavailable.",
+            hint: "Retry shortly; the request was not served without allowance accounting.",
+            status: 503,
+            origin,
+          }),
+          observability,
+          span,
+          ctx.requestId,
+        );
       }
     }
 
@@ -900,6 +965,11 @@ function stampRateLimitHeaders(
 ): void {
   if (!res.headers.get("X-Request-Id")) {
     res.headers.set("X-Request-Id", ctx.requestId);
+  }
+  // Phase 18: request-to-trace correlation for operators. Equals requestId
+  // without instrumentation, otherwise the route span's trace id.
+  if (!res.headers.get("X-Trace-Id")) {
+    res.headers.set("X-Trace-Id", ctx.traceId);
   }
   res.headers.set("X-RateLimit-Limit", String(decision.limit));
   res.headers.set("X-RateLimit-Remaining", String(decision.remaining));
@@ -1235,15 +1305,24 @@ function safe(fn: () => unknown): void {
   }
 }
 
-function safeSpan(start: () => { recordError(e: unknown): void; end(): void }) {
+/** Safe span wrapper: hook failures are swallowed, never thrown. */
+interface SafeSpan {
+  recordError(err: unknown): void;
+  end(): void;
+  /** Raw provider handle for context activation; absent when creation threw. */
+  raw?: SpanHandle;
+}
+
+function safeSpan(start: () => SpanHandle): SafeSpan {
   try {
-    const span = start();
+    const raw = start();
     return {
+      raw,
       recordError(err: unknown): void {
-        safe(() => span.recordError(err));
+        safe(() => raw.recordError(err));
       },
       end(): void {
-        safe(() => span.end());
+        safe(() => raw.end());
       },
     };
   } catch {
@@ -1252,4 +1331,68 @@ function safeSpan(start: () => { recordError(e: unknown): void; end(): void }) {
       end(): void {},
     };
   }
+}
+
+/**
+ * Activate `span` for `fn` when the provider supports context propagation.
+ * Exactly-once: a throw from `fn` itself always propagates — it is never
+ * mistaken for an activation failure and `fn` is never retried, so handler
+ * side effects (quota consume, upstream calls) run at most once. Only a
+ * missing hook runs `fn` directly.
+ */
+function runInSpanContext<R>(
+  observability: ObservabilityProvider,
+  span: SafeSpan,
+  fn: () => R,
+): R {
+  const raw = span.raw;
+  const run = observability.runInSpanContext;
+  if (typeof run === "function" && raw !== undefined) {
+    const activate = run as (span: SpanHandle, fn: () => R) => R;
+    return activate.call(observability, raw, fn);
+  }
+  return fn();
+}
+
+/** Route span's trace id for correlation; undefined keeps the fallback. */
+function safeTraceId(
+  observability: ObservabilityProvider,
+  raw: SpanHandle | undefined,
+): string | undefined {
+  try {
+    const get = observability.traceIdOf;
+    if (typeof get === "function" && raw !== undefined) {
+      const id = get.call(observability, raw);
+      if (typeof id === "string" && id !== "") {
+        return id;
+      }
+    }
+  } catch {
+    // Intentionally ignored — caller keeps the request-id fallback.
+  }
+  return undefined;
+}
+
+/**
+ * Stamp request-to-trace correlation on a pipeline error response built
+ * before (or without) the standard header stamper. Uses the route span's
+ * trace id when live, else the request id — never throws, never overwrites.
+ */
+function withTraceId(
+  res: NextResponse,
+  observability: ObservabilityProvider,
+  span: SafeSpan,
+  fallback: string,
+): NextResponse {
+  try {
+    if (!res.headers.get("X-Trace-Id")) {
+      res.headers.set(
+        "X-Trace-Id",
+        safeTraceId(observability, span.raw) ?? fallback,
+      );
+    }
+  } catch {
+    // Intentionally ignored — correlation must never break a response.
+  }
+  return res;
 }
