@@ -278,6 +278,58 @@ describe("Phase 18 tracing foundation", () => {
     expect(finished[0]?.status.message).toBe("Error: upstream gone");
   });
 
+  test("runInSpanContext never re-invokes a throwing fn (exactly-once)", () => {
+    useRecordingTracer();
+    const span = otelObservabilityProvider.startSpan("health", {
+      route: "health",
+    });
+    let calls = 0;
+    expect(() =>
+      otelObservabilityProvider.runInSpanContext?.(span, () => {
+        calls += 1;
+        throw new Error("sync boom");
+      }),
+    ).toThrow("sync boom");
+    expect(calls).toBe(1);
+    span.end();
+  });
+
+  test("pre-admission errors still carry X-Trace-Id", async () => {
+    const run = withRequestContext(
+      async (_r, ctx) =>
+        successResponse({ ok: true }, { requestId: ctx.requestId }),
+      { env: { TUBELENS_AUTH_ENFORCEMENT: "bogus" } },
+      "health",
+    );
+    const res = await run(req("http://x/api/v1/health", "pre-adm-1"));
+    expect(res.status).toBe(503);
+    expect(res.headers.get("X-Request-Id")).toBe("pre-adm-1");
+    expect(res.headers.get("X-Trace-Id")).toBe("pre-adm-1");
+  });
+
+  test("rate-limit deny carries X-Trace-Id", async () => {
+    const run = withRequestContext(
+      async (_r, ctx) =>
+        successResponse({ ok: true }, { requestId: ctx.requestId }),
+      {
+        observability: otelObservabilityProvider,
+        rateLimit: {
+          check: () => ({
+            allowed: false,
+            limit: 1,
+            remaining: 0,
+            reset: 123,
+            retryAfter: 5,
+          }),
+        },
+      },
+      "search",
+    );
+    const res = await run(req("http://x/api/v1/search?q=x", "rl-deny-1"));
+    expect(res.status).toBe(429);
+    expect(typeof res.headers.get("X-Trace-Id")).toBe("string");
+  });
+
   test("noop provider keeps the pipeline byte-identical without an SDK", async () => {
     const run = withRequestContext(
       async (_r, ctx) =>

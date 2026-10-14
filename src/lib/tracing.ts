@@ -16,7 +16,7 @@
 // - No secrets: free-text messages pass through `scrubString`, errors through
 //   `scrubError`, and structured attrs through `redactObject`.
 
-import type { Span } from "@opentelemetry/api";
+import type { Context, Span } from "@opentelemetry/api";
 import { context, SpanStatusCode, trace } from "@opentelemetry/api";
 import {
   noopObservabilityProvider,
@@ -212,15 +212,24 @@ export const otelObservabilityProvider: ObservabilityProvider = {
   },
 
   runInSpanContext<R>(span: SpanHandle, fn: () => R): R {
+    // Exactly-once: only context SETUP is guarded. fn's own throw must
+    // propagate to its caller — retrying here would repeat side effects.
+    let live: Span | undefined;
     try {
-      const live = spanByHandle.get(span);
-      if (!live) {
-        return fn();
-      }
-      return context.with(trace.setSpan(context.active(), live), fn);
+      live = spanByHandle.get(span);
     } catch {
       return fn();
     }
+    if (!live) {
+      return fn();
+    }
+    let ambient: Context | undefined;
+    try {
+      ambient = trace.setSpan(context.active(), live);
+    } catch {
+      return fn();
+    }
+    return context.with(ambient, fn);
   },
 
   traceIdOf(span: SpanHandle): string | undefined {
