@@ -245,7 +245,7 @@ export function withRequestContext(
       getObservabilityProvider(),
     );
     const span = safeSpan(() =>
-      observability.startSpan(route ?? "request", {}),
+      observability.startSpan(route ?? "request", route ? { route } : {}),
     );
 
     // Pre-derive the id so even config/auth failures carry request-id

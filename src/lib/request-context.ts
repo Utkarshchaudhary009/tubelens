@@ -6,11 +6,12 @@
 import type { NextRequest } from "next/server";
 import type { AuthContext } from "./auth";
 import type { EntitlementSnapshot, Tier } from "./product";
+import { resolveActiveTraceId } from "./tracing";
 
 export interface RequestContext {
   /** Echoed X-Request-Id when the caller sends one, otherwise minted. */
   requestId: string;
-  /** Trace correlation id — equals requestId until real tracing (Ph. 18). */
+  /** OTel trace id when a span is active, else the requestId (Phase 18). */
   traceId: string;
   /** Authenticated principal; anonymous by default in Phase 01. */
   auth: AuthContext;
@@ -57,8 +58,9 @@ export function resolveRequestId(req: NextRequest | Request): string {
 /**
  * Build a RequestContext for an incoming request. Pure factory: callers
  * pass the already-resolved auth/tier pieces (see createRequestContext in
- * ./pipeline for the provider-wired version). The traceId defaults to the
- * requestId; span placeholders arrive with real tracing in Phase 18.
+ * ./pipeline for the provider-wired version). The traceId prefers the active
+ * OTel trace id (Phase 18) and falls back to the requestId when no span is
+ * active, so existing behavior is unchanged without instrumentation.
  */
 export function buildRequestContext(
   req: NextRequest | Request,
@@ -66,9 +68,15 @@ export function buildRequestContext(
 ): RequestContext {
   const requestId = resolveRequestId(req);
   const rateLimitIdentity = deriveRateLimitIdentity(inputs.auth);
+  let traceId = requestId;
+  try {
+    traceId = resolveActiveTraceId() ?? requestId;
+  } catch {
+    traceId = requestId;
+  }
   return {
     requestId,
-    traceId: requestId,
+    traceId,
     auth: inputs.auth,
     projectId: inputs.auth.projectId,
     keyId: inputs.auth.keyId,
