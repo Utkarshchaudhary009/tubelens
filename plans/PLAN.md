@@ -666,7 +666,7 @@ principal model.
 
 ## Phase 18 — Datadog tracing foundation
 
-**Status:** `[~]` in progress — `@vercel/otel` + OTel-backed seam provider (`src/lib/tracing.ts`), traceId prefers active OTel trace id. Delivery: Trace Drain on Pro+, direct OTLP/HTTP to Datadog intake on Hobby ($0) — drains are Pro/Enterprise-only per Vercel docs.
+**Status:** `[x]` done — shipped via PR #41 (merged 2026-10-14): `@vercel/otel` registration + OTel-backed seam provider with sanitized span attrs/error summaries, span-context activation (exactly-once), `X-Trace-Id` correlation on every pipeline response, 20 tracing tests, 1183 unit tests + e2e PASS on live upstream (prod build). Delivery: Trace Drain on Pro+, direct OTLP/HTTP to Datadog intake on Hobby ($0); owner sets `OTEL_EXPORTER_OTLP_ENDPOINT` + `DATADOG_API_KEY` to light up prod traces.
 
 **Build:** Integrate Datadog's Node/Next.js tracing path using the current supported configuration. Trace important request, service, database, Redis, cache, and upstream operations where meaningful. Add service/environment/version tags and correlate spans through request/trace IDs. Keep instrumentation isolated from business logic.
 
