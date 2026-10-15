@@ -45,6 +45,11 @@ jobs:
           persist-credentials: true
           token: ${{ secrets.PAT }}
 
+      - name: Ensure latest t3 CLI
+        run: |
+          npm install --global t3@latest
+          t3 --version
+
       - name: Guard - skip if phase-runner or e2e in progress on main
         env:
           GH_TOKEN: ${{ secrets.PAT }}

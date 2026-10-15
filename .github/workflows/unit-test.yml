@@ -36,6 +36,11 @@ jobs:
           git fetch origin "$GITHUB_SHA" --depth 1
           git checkout "$GITHUB_SHA"
 
+      - name: Ensure latest t3 CLI
+        run: |
+          npm install --global t3@latest
+          t3 --version
+
       - name: Static secret scan
         run: |
           set -u
@@ -97,6 +102,11 @@ jobs:
           git clone "https://github.com/${GITHUB_REPOSITORY}.git" .
           git fetch origin "$GITHUB_SHA" --depth 1
           git checkout "$GITHUB_SHA"
+
+      - name: Ensure latest t3 CLI
+        run: |
+          npm install --global t3@latest
+          t3 --version
 
       - uses: oven-sh/setup-bun@v2
 

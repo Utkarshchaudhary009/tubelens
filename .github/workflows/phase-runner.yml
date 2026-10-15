@@ -30,6 +30,11 @@ jobs:
           persist-credentials: true
           token: ${{ secrets.PAT }}
 
+      - name: Ensure latest t3 CLI
+        run: |
+          npm install --global t3@latest
+          t3 --version
+
       - name: Install OpenCode
         run: curl -fsSL https://opencode.ai/install | bash
 

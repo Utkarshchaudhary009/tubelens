@@ -14,6 +14,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Ensure latest t3 CLI
+        run: |
+          npm install --global t3@latest
+          t3 --version
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"

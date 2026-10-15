@@ -26,6 +26,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - name: Ensure latest t3 CLI
+        run: |
+          npm install --global t3@latest
+          t3 --version
+
       - name: Dispatch remote-t3 when idle
         env:
           GH_TOKEN: ${{ secrets.PAT }}

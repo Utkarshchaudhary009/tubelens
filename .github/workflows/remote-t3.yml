@@ -1,11 +1,11 @@
 # remote-t3 — persistent T3 remote-dev behind a free Cloudflare quick tunnel.
 #
 # Trigger: scheduled every 5 hours (UTC) or manually from Actions. The job runs
-# `npx t3 serve`, exposes :3773 via cloudflared, publishes the pairing URL
+# `t3 serve` (global t3 CLI binary), exposes :3773 via cloudflared, publishes the pairing URL
 # once, then idles ~276 min on a plain sleep keepalive so the tunnel and
 # `t3 serve` stay up for already-paired devices (job budget 300 min).
 #
-# CRITICAL OTP catch (live probe): `npx t3 serve` prints
+# CRITICAL OTP catch (live probe): `t3 serve` prints
 #   Connection string: http://127.0.0.1:3773
 #   Token: <16 chars from 23456789ABCDEFGHJKLMNPQRSTUVWXYZ, ~5min TTL>
 #   Pairing URL: http://127.0.0.1:3773/pair#token=<code>
@@ -117,11 +117,16 @@ jobs:
           persist-credentials: true
           token: ${{ secrets.PAT }}
 
-      # T3 remote envs want Node ^22.16 || ^23.11 || >=24.10 for `npx t3 serve`;
+      # T3 remote envs want Node ^22.16 || ^23.11 || >=24.10 for `t3 serve`;
       # agent-browser engines require Node >= 24, so pin 24 to satisfy both.
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
+
+      - name: Ensure latest t3 CLI
+        run: |
+          npm install --global t3@latest
+          t3 --version
 
       # NOTE: t3 worktrees (~/.t3/worktrees/tubelens/t3code-*) are backed up
       # to origin backup/t3code/* branches on every run (save step below)
@@ -383,7 +388,7 @@ jobs:
 
       - name: Start t3 serve (port 3773)
         run: |
-          nohup npx -y t3@latest serve --host 0.0.0.0 --port 3773 > /tmp/t3.log 2>&1 &
+          nohup t3 serve --host 0.0.0.0 --port 3773 > /tmp/t3.log 2>&1 &
           echo "$!" > /tmp/t3.pid
           echo "Waiting for t3 serve on :3773..."
           for i in $(seq 1 60); do
@@ -446,9 +451,9 @@ jobs:
           # below. Prefer a long-TTL mint when `t3 pair --ttl` is supported;
           # fall back to plain `t3 pair`, then to the serve-log URL. Every
           # fallback is fail-open — the serve-log URL is always good enough.
-          LONG_LIVED="$(timeout 60 npx -y t3@latest pair --ttl 5h 2>/dev/null | grep -oE 'http://[^[:space:]/]*:3773/pair#token=[A-Za-z0-9]{8,64}' | head -n 1 || true)"
+          LONG_LIVED="$(timeout 60 t3 pair --ttl 5h 2>/dev/null | grep -oE 'http://[^[:space:]/]*:3773/pair#token=[A-Za-z0-9]{8,64}' | head -n 1 || true)"
           if [ -z "$LONG_LIVED" ]; then
-            LONG_LIVED="$(timeout 60 npx -y t3@latest pair 2>/dev/null | grep -oE 'http://[^[:space:]/]*:3773/pair#token=[A-Za-z0-9]{8,64}' | head -n 1 || true)"
+            LONG_LIVED="$(timeout 60 t3 pair 2>/dev/null | grep -oE 'http://[^[:space:]/]*:3773/pair#token=[A-Za-z0-9]{8,64}' | head -n 1 || true)"
           fi
           if [ -n "$LONG_LIVED" ]; then
             echo "Using freshly minted pairing URL (long-TTL when supported)."
