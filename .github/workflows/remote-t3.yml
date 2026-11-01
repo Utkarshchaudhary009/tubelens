@@ -428,7 +428,18 @@ jobs:
             echo "::add-mask::$LOCAL_PAIRING"
           fi
 
-          if [ -z "$CONNECTION_STRING" ] || ! printf '%s' "$LOCAL_PAIRING" | grep -Eq '^http://[^[:space:]/]+:3773/pair#token=[A-Za-z0-9]{8,64}
+          if [ -z "$CONNECTION_STRING" ] || ! printf '%s' "$LOCAL_PAIRING" | grep -Eq '^http://[^[:space:]/]+:3773/pair#token=[A-Za-z0-9]{8,64}'; then
+            echo "T3 startup markers were present but the pairing details were malformed."
+            exit 1
+          fi
+
+          # Keep the credential-bearing URL only in the intended artifact/
+          # handoff file; never print the raw T3 log or pairing URL to Actions.
+          {
+            printf 'Connection string: %s\n' "$CONNECTION_STRING"
+            printf 'Pairing URL: %s\n' "$LOCAL_PAIRING"
+          } > "$GITHUB_WORKSPACE/t3-url.txt"
+          echo "T3 startup is ready: HTTP listener and pairing details are available (credential masked)."
 
       - name: Install cloudflared
         run: |
