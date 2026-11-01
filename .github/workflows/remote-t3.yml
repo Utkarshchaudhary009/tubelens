@@ -85,12 +85,6 @@
 name: remote-t3
 
 on:
-  # Temporary push trigger to validate this workflow after the readiness fix.
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/remote-t3.yml"
   schedule:
     # Every 5 hours, UTC.
     - cron: "0 */5 * * *"
